@@ -229,7 +229,13 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 	respCh := make(chan *RespFrame, 1)
 	ac.registerWaiter(reqID, respCh)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	// Use longer timeout for potentially streaming responses
+	timeout := 60 * time.Second
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+		strings.Contains(r.Header.Get("Accept"), "text/stream") {
+		timeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	if err := ac.write(ctx, req); err != nil {

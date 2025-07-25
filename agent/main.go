@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -67,7 +68,15 @@ func main() {
 
 	for {
 		if err := runOnce(*server, *local, *id, *secret); err != nil {
-			fmt.Println("agent loop error:", err)
+			fmt.Printf("agent loop error: %v\n", err)
+
+			// Check if it's a websocket close error and handle it gracefully
+			if websocket.CloseStatus(err) == websocket.StatusNormalClosure ||
+				websocket.CloseStatus(err) == websocket.StatusGoingAway {
+				fmt.Println("websocket closed normally, reconnecting...")
+			} else {
+				fmt.Printf("unexpected error: %v, reconnecting...\n", err)
+			}
 		}
 		// backoff
 		time.Sleep(2 * time.Second)
@@ -133,14 +142,77 @@ func forward(local string, rd *ReqFrame) (int, map[string][]string, []byte, erro
 			req.Header.Add(k, v)
 		}
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+
+	// Use a longer timeout for streaming responses
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+
+	// Handle streaming responses (like SSE) differently
+	contentType := resp.Header.Get("Content-Type")
+	if strings.Contains(contentType, "text/event-stream") ||
+		strings.Contains(contentType, "text/stream") ||
+		strings.Contains(contentType, "application/stream") {
+		// For streaming responses, read with a buffer and timeout
+		return handleStreamingResponse(resp)
+	}
+
+	// For regular responses, read all at once
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, resp.Header, nil, err
+	}
 	return resp.StatusCode, resp.Header, b, nil
+}
+
+func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []byte, error) {
+	// Create a buffer to collect the streaming data
+	var buffer bytes.Buffer
+
+	// Create a context with timeout for reading the stream
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Channel to signal completion
+	done := make(chan error, 1)
+
+	go func() {
+		defer close(done)
+
+		// Read the stream in chunks with timeout
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-ctx.Done():
+				done <- ctx.Err()
+				return
+			default:
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					buffer.Write(buf[:n])
+				}
+				if err != nil {
+					if err == io.EOF {
+						done <- nil // Normal end of stream
+						return
+					}
+					done <- err
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for completion or timeout
+	err := <-done
+	if err != nil && err != context.DeadlineExceeded {
+		return resp.StatusCode, resp.Header, buffer.Bytes(), nil // Return what we have
+	}
+
+	return resp.StatusCode, resp.Header, buffer.Bytes(), nil
 }
 
 func register(server string) (*RegisterResp, error) {
