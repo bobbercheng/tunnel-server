@@ -139,6 +139,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close(websocket.StatusInternalError, "server error")
 
+	// Set larger message size limit to match agent (10MB)
+	c.SetReadLimit(10 * 1024 * 1024)
+
 	ac := &agentConn{
 		id:          id,
 		secret:      secret,

@@ -100,7 +100,13 @@ func (a *Agent) runOnce() error {
 	defer cancel()
 
 	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
-	ws, resp, err := websocket.Dial(dialCtx, wsURL, nil)
+
+	// Configure WebSocket options with larger message size limit
+	ws, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+		HTTPClient: &http.Client{
+			Timeout: 60 * time.Second,
+		},
+	})
 	if err != nil {
 		if resp != nil {
 			defer resp.Body.Close()
@@ -113,6 +119,10 @@ func (a *Agent) runOnce() error {
 		return fmt.Errorf("dial error: %w", err)
 	}
 	defer ws.Close(websocket.StatusInternalError, "internal error")
+
+	// Set larger message size limit (10MB instead of default 32KB)
+	ws.SetReadLimit(10 * 1024 * 1024)
+
 	fmt.Println("Connection established successfully.")
 
 	// Create a context that will be cancelled when the connection closes
@@ -121,6 +131,9 @@ func (a *Agent) runOnce() error {
 
 	// Track active request handlers
 	var wg sync.WaitGroup
+
+	// Mutex to protect websocket writes
+	var writeMu sync.Mutex
 
 	// Channel to signal connection closure
 	done := make(chan struct{})
@@ -182,11 +195,31 @@ func (a *Agent) runOnce() error {
 				case <-ctx.Done():
 					return
 				default:
-					// Try to write with a timeout
-					writeCtx, writeCancel := context.WithTimeout(reqCtx, 5*time.Second)
+					// Serialize the response
+					respData := mustJSON(resp)
+
+					// Check if response is too large (leave some room for WebSocket framing)
+					if len(respData) > 9*1024*1024 {
+						// Response too large, send error instead
+						errResp := RespFrame{
+							Type:    "resp",
+							ReqID:   req.ReqID,
+							Status:  http.StatusInsufficientStorage,
+							Headers: map[string][]string{"Content-Type": {"text/plain"}},
+							Body:    []byte("Response too large to send through tunnel"),
+						}
+						respData = mustJSON(errResp)
+					}
+
+					// Try to write with a timeout, using mutex to prevent concurrent writes
+					writeCtx, writeCancel := context.WithTimeout(reqCtx, 10*time.Second)
 					defer writeCancel()
 
-					if err := ws.Write(writeCtx, websocket.MessageText, mustJSON(resp)); err != nil {
+					writeMu.Lock()
+					err := ws.Write(writeCtx, websocket.MessageText, respData)
+					writeMu.Unlock()
+
+					if err != nil {
 						// Only log if it's not due to context cancellation
 						select {
 						case <-ctx.Done():
@@ -253,10 +286,22 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 		return handleStreamingResponse(resp)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	// Read response with size limit
+	limitedReader := io.LimitReader(resp.Body, 8*1024*1024) // 8MB limit
+	b, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return resp.StatusCode, resp.Header, nil, err
 	}
+
+	// Check if we hit the limit
+	if len(b) == 8*1024*1024 {
+		// Try to read one more byte to see if there's more data
+		extra := make([]byte, 1)
+		if n, _ := resp.Body.Read(extra); n > 0 {
+			return resp.StatusCode, resp.Header, nil, fmt.Errorf("response body too large (>8MB)")
+		}
+	}
+
 	return resp.StatusCode, resp.Header, b, nil
 }
 
@@ -269,6 +314,9 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 	go func() {
 		defer close(done)
 		buf := make([]byte, 4096)
+		totalRead := 0
+		maxSize := 8 * 1024 * 1024 // 8MB limit
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -277,7 +325,12 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 			default:
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
+					if totalRead+n > maxSize {
+						done <- fmt.Errorf("streaming response too large (>8MB)")
+						return
+					}
 					buffer.Write(buf[:n])
+					totalRead += n
 				}
 				if err != nil {
 					if err == io.EOF {
