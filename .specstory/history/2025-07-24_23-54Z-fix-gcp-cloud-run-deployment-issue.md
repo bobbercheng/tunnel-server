@@ -3031,7 +3031,6 @@ Now that I've added the `/health` endpoint to the server, I'll redeploy it to Cl
 ```
 
 ```
-(base) jenniferyang@JennifertekiMacBook-Air server % ./deploy.sh
 Building Docker image using Cloud Build...
 Creating temporary archive of 5 file(s) totalling 9.1 KiB before compression.
 Uploading tarball of [.] to [gs://contact-center-insights-poc_cloudbuild/source/1753488884.154564-b605c276f6
@@ -3067,11 +3066,1363 @@ afa154b433c7: Pulling fs layer
 afa154b433c7: Waiting
 1451027d3c0e: Waiting
 4f4fb700ef54: Waiting
+32b550be6cb6: Verifying Checksum
+32b550be6cb6: Download complete
+a492eee5e559: Verifying Checksum
+a492eee5e559: Download complete
+35af2a7690f2: Verifying Checksum
+35af2a7690f2: Download complete
+1451027d3c0e: Verifying Checksum
+1451027d3c0e: Download complete
+afa154b433c7: Verifying Checksum
+afa154b433c7: Download complete
+4f4fb700ef54: Verifying Checksum
+4f4fb700ef54: Download complete
+3b7f19923e15: Verifying Checksum
+3b7f19923e15: Download complete
+a492eee5e559: Pull complete
+32b550be6cb6: Pull complete
+35af2a7690f2: Pull complete
+3b7f19923e15: Pull complete
+afa154b433c7: Pull complete
+1451027d3c0e: Pull complete
+4f4fb700ef54: Pull complete
+Digest: sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02
+Status: Downloaded newer image for golang:1.22
+ ---> 2fce09cfad57
+Step 2/11 : WORKDIR /src
+ ---> Running in 8b4e02192ab1
+Removing intermediate container 8b4e02192ab1
+ ---> 167a0dba8f22
+Step 3/11 : COPY go.mod go.sum ./
+ ---> ce82df9d9807
+Step 4/11 : RUN go mod download
+ ---> Running in 2e185c448088
+Removing intermediate container 2e185c448088
+ ---> d3d90b97da8b
+Step 5/11 : COPY . .
+ ---> 71abc8398626
+Step 6/11 : RUN CGO_ENABLED=0 GOOS=linux go build -o server ./main.go
+ ---> Running in c9b7fc788aed
+Removing intermediate container c9b7fc788aed
+ ---> f62f165d8e27
+Step 7/11 : FROM gcr.io/distroless/base-debian12
+latest: Pulling from distroless/base-debian12
+Digest: sha256:201ef9125ff3f55fda8e0697eff0b3ce9078366503ef066653635a3ac3ed9c26
+Status: Downloaded newer image for gcr.io/distroless/base-debian12:latest
+ ---> 24451ae1eb02
+Step 8/11 : ENV PORT=8080
+ ---> Running in e26f0af9e833
+Removing intermediate container e26f0af9e833
+ ---> ce85387310f6
+Step 9/11 : COPY --from=build /src/server /server
+ ---> d02767bf0dac
+Step 10/11 : USER nonroot:nonroot
+ ---> Running in 72bdb5bc2374
+Removing intermediate container 72bdb5bc2374
+ ---> 0059e8d8956e
+Step 11/11 : ENTRYPOINT ["/server"]
+ ---> Running in 997a8b02d661
+Removing intermediate container 997a8b02d661
+ ---> fe26de86678e
+Successfully built fe26de86678e
+Successfully tagged gcr.io/contact-center-insights-poc/tunnel-server:latest
+PUSH
+Pushing gcr.io/contact-center-insights-poc/tunnel-server
+The push refers to repository [gcr.io/contact-center-insights-poc/tunnel-server]
+448629762aa3: Preparing
+0711ad304a05: Preparing
+d5a3e014161b: Preparing
+bfe9137a1b04: Preparing
+f4aee9e53c42: Preparing
+1a73b54f556b: Preparing
+2a92d6ac9e4f: Preparing
+bbb6cacb8c82: Preparing
+6f1cdceb6a31: Preparing
+af5aa97ebe6c: Preparing
+4d049f83d9cf: Preparing
+48c0fb67386e: Preparing
+8fa10c0194df: Preparing
+f464af4b9b25: Preparing
+bbb6cacb8c82: Waiting
+6f1cdceb6a31: Waiting
+af5aa97ebe6c: Waiting
+4d049f83d9cf: Waiting
+48c0fb67386e: Waiting
+8fa10c0194df: Waiting
+f464af4b9b25: Waiting
+1a73b54f556b: Waiting
+2a92d6ac9e4f: Waiting
+0711ad304a05: Layer already exists
+f4aee9e53c42: Layer already exists
+d5a3e014161b: Layer already exists
+bfe9137a1b04: Layer already exists
+2a92d6ac9e4f: Layer already exists
+1a73b54f556b: Layer already exists
+bbb6cacb8c82: Layer already exists
+6f1cdceb6a31: Layer already exists
+af5aa97ebe6c: Layer already exists
+48c0fb67386e: Layer already exists
+4d049f83d9cf: Layer already exists
+8fa10c0194df: Layer already exists
+f464af4b9b25: Layer already exists
+448629762aa3: Pushed
+latest: digest: sha256:443054f62e774b9407f6386aee4e8e9866a1b1fbb7003ff737e4f0ebc6ef1c97 size: 3236
+DONE
+------------------------------------------------------------------------------------------------------------
+ID                                    CREATE_TIME                DURATION  SOURCE
+
+                                                                          IMAGES
+                          STATUS
+2421d774-9dd3-49bf-8e74-8a213cf75e32  2025-07-26T00:14:45+00:00  1M2S      gs://contact-center-insights-poc_
+cloudbuild/source/1753488884.154564-b605c276f64947f4b89e675ea039c55f.tgz  gcr.io/contact-center-insights-poc
+/tunnel-server (+1 more)  SUCCESS
+
+
+Updates are available for some Google Cloud CLI components.  To install them,
+please run:
+  $ gcloud components update
+
+Deploying to Cloud Run...
+Deploying container to Cloud Run service [tunnel-server] in project [contact-center-insights-poc] region [us
+-east1]
+✓ Deploying... Done.                                                                                       
+  ✓ Creating Revision...                                                                                   
+  ✓ Routing traffic...                                                                                     
+  ✓ Setting IAM Policy...                                                                                  
+Done.                                                                                                      
+Service [tunnel-server] revision [tunnel-server-00008-h7f] has been deployed and is serving 100 percent of t
+raffic.
+Service URL: https://tunnel-server-56084501768.us-east1.run.app
+✓ Deploying... Done.                                                                                       
+  ✓ Creating Revision...                                                                                   
+  ✓ Routing traffic...                                                                                     
+Done.                                                                                                      
+Service [tunnel-server] revision [tunnel-server-00009-79w] has been deployed and is serving 100 percent of t
+raffic.
+Service URL: https://tunnel-server-56084501768.us-east1.run.app
+Deployment complete! Service URL: https://tunnel-server-3w6u4kmniq-ue.a.run.app
+
 ```
 
 ---
 
+I have successfully added the `/health` endpoint and redeployed the server.
 
+You can now monitor all active agent connections by visiting the following URL:
+
+[`https://tunnel-server-3w6u4kmniq-ue.a.run.app/health`](https://tunnel-server-3w6u4kmniq-ue.a.run.app/health)
+
+When you access this endpoint, you will see a JSON response containing:
+*   A count of all active connections.
+*   A list of each connection, including its `ID` and the time it was established.
+
+This will give you a real-time view of the agents connected to your server, which is very useful for monitoring and debugging.
+
+---
+
+_**User**_
+
+create new agent that accepts public url and local port to start a sub service locally. It connect to tunnel server with public url with same auto reconnect method @main.go .  So I can use internal server as local service with this agent. Please refactor @main.go to reuse  code
+
+---
+
+_**Assistant**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing Sub-Agent Creation**
+
+I'm now focused on designing the `sub-agent`. Specifically, it will be distinct from the `agent`. I understand it will accept a `public_url`. Currently, my thinking centers on how this input will influence its behavior and subsequent actions. Further refinements are needed to clarify its purpose within the overall system.
+
+
+**Decomposing Sub-Agent Functions**
+
+I've moved from understanding the inputs to designing the operational steps. My current focus is on the connection process. Specifically, I am parsing the tunnel server address and ID from the provided `public_url`. This is crucial for the sub-agent to link up with the tunnel. After the connection is established, it will act as a proxy, forwarding requests to the specified local port.
+
+
+**Defining the Proxying Process**
+
+The sub-agent's primary function is now clear: it is indeed a proxy. I'm determining the necessary steps for request forwarding. The agent receives requests from the tunnel server based on the `public_url`. These requests are then channeled to the sub-agent. After that, the sub-agent routes them to the local service on the provided `local_port`. My thoughts are now about the mechanics of routing.
+
+
+**Conceptualizing the Client-Side Agent**
+
+I am now considering the new agent as a client-side tool. It will forward requests from a local port to a service exposed by the original agent via the tunnel. This changes the design significantly. My focus is on the request flow now: User -> Client Agent -> Tunnel Server -> Original Agent -> Local Service. The public URL is the critical link in this process.
+
+
+**Rethinking the Secret and Flow**
+
+I'm now wrestling with the `secret` issue. It seems the `sub-agent` needs a way to authenticate with the tunnel server, but it only has the `public_url`. I'm considering how the original agent might securely pass this information. One idea is a special header in the request. However, the flow of data still feels overly complicated. My thought process is currently focused on a secure but straightforward information exchange between the agents.
+
+
+**Deciphering the User's Intent**
+
+My understanding is evolving. I'm now considering that the user wants a client-side tool. This client would forward local requests to a local port, which will then go via the tunnel. I am unsure if the user expects this new agent to directly connect to the tunnel server or just forward HTTP requests. I'm still unclear how the secret fits in this simplified approach.
+
+
+**Interpreting User Needs**
+
+I'm reassessing the user's goals, which seem to center around a client-side tool, now called the `sub-agent`. Initially, I presumed the architecture to involve an overly complex proxy setup. I'm now inclined toward a more direct HTTP forwarding mechanism. The `sub-agent` would act as a local client, making HTTP requests via a public URL to a service. This approach aligns with the idea of exposing an internal server through a tunnel.
+
+
+**Revisiting Secret Handling**
+
+I'm now stuck on how the `sub-agent` should acquire its `secret`. The user's prompt doesn't explicitly include it, and the `public_url` alone isn't enough. I'm considering that the user is overlooking the secret, or perhaps assumes it. My next step is to clarify this with the user before I move on.
+
+
+**Planning Code Refactoring**
+
+I'm now planning to refactor the existing `agent/main.go` code. It will be extracted into a reusable library within a new `pkg/agentlib` directory. The new library will contain the core agent logic, including `runOnce` and connection handling. The `agent/main.go` file will then act as a simple wrapper. This will facilitate the reuse of code by the `sub-agent`.
+
+
+**Structuring the Refactoring**
+
+I'm mapping out the changes, beginning with moving core agent functionality into a library. The plan involves creating `pkg/agentlib`, moving agent logic into a new package, and refactoring both existing `agent/main.go` and the yet-to-be-created `sub-agent/main.go` to use the library. I'm focusing on how to organize the files and packages.
+
+
+**Restructuring Code for Reusability**
+
+I've begun implementing the refactoring, establishing the `pkg/agentlib` directory and creating the `agent.go` file. The essential structs, variables, and helper functions have been moved. I'm now focused on restructuring the primary operational logic, including the main execution loop. This is vital for code reuse.
+
+
+**Restructuring the Core Agent**
+
+I'm now converting the original agent's functionality into a reusable library. I've established the `pkg/agentlib` directory. The structs, variables, and utility functions have been successfully moved into `pkg/agentlib/agent.go`. My current focus is on extracting and refactoring the core operational logic of the agent, including the main execution loop. This prepares it for future code reuse.
+
+
+**Extracting Core Functionality**
+
+I'm now transitioning the original agent's code into a reusable library. I've created the `pkg/agentlib/agent.go` file and started moving the structs, variables, and helper functions. My current focus is on implementing the main `Start` function, which will encapsulate the agent's core operation, including the main loop and error handling.
+
+
+**Reorganizing Agent Logic**
+
+I've started incorporating the main agent functionality into `pkg/agentlib/agent.go`. I am focusing on extracting and refactoring key components, particularly the core loop, into the `Start` function. This prepares for code reuse by the `sub-agent`. This restructuring is essential for a more maintainable and adaptable system.
+
+
+**Integrating Reusable Components**
+
+I'm now refactoring the main agent's code, moving key functionalities to a reusable library. This includes core elements like `Start`, and the logic to connect and forward requests. I have set up the directory structure and created the `agent.go` file to contain the main functions. The next task involves creating the necessary `go.mod` and refactoring the main agent to use the new library.
+
+
+**Restructuring for Sub-Agent Integration**
+
+I've successfully created the library directory and started refactoring code. The `agentlib` package now exists, and I'm working on extracting the essential components from the main agent's code into `pkg/agentlib/agent.go`. Key functions like `Start`, which contains the core agent loop, are being moved to enable future code reuse by the `sub-agent`.
+
+
+**Creating and Refactoring Code**
+
+I'm now initiating the directory structure. I've created the required directories: `pkg/agentlib` and `sub-agent`. My subsequent focus will be on populating `pkg/agentlib` with the core agent logic and implementing the new sub-agent. Refactoring the existing code is next.
+
+
+</details></think>
+
+---
+
+
+
+Of course. I understand what you're asking for. You want a new type of agent that can connect to the tunnel server using a `public_url`, allowing you to easily set up a local proxy for an existing tunnel.
+
+This is a great idea for making the service more flexible. To do this correctly and keep the code clean, I'll perform a refactoring. I'll move the common agent logic into a reusable library, and then I'll create your new agent, which will use this library.
+
+Here is my plan:
+
+1.  **Create a Reusable Agent Library**: I'll move the core agent functionality from `agent/main.go` into a new shared library located at `pkg/agentlib/`. This will include the logic for connecting to the tunnel server, handling requests, and managing reconnections.
+2.  **Refactor the Existing Agent**: I'll update the current agent in `agent/main.go` to use this new library, making its code much simpler.
+3.  **Create the New Agent**: I will create a new agent at `sub-agent/main.go`. This new agent will:
+    *   Accept a `--public-url` and a `--secret` to connect to an existing tunnel.
+    *   Accept a `--local` port to proxy requests to your internal service.
+    *   Use the same robust auto-reconnect logic as the original agent.
+
+This approach will not only deliver the new agent you want but will also improve the project's structure, making it easier to maintain and extend in the future.
+
+I will now begin with the refactoring.
+
+---
+
+```bash
+mkdir -p pkg/agentlib sub-agent
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air server % mkdir -p pkg/agentlib sub-agent
+```
+
+---
+
+Now, I will create the `pkg/agentlib/agent.go` file and move the core agent logic into it. This will be the heart of our reusable agent library.
+
+---
+
+<details><summary>Edit file: pkg/agentlib/agent.go</summary>
+
+I am creating a new file for the reusable agent library and moving the core agent logic into it as part of the refactoring process.
+
+**Chunk 1**
+Lines added: 243, lines removed: 1
+
+```diff
+@@ -1,1 +1,243 @@
+- 
++ package agentlib
++ 
++ import (
++ 	"bytes"
++ 	"context"
++ 	"encoding/json"
++ 	"errors"
++ 	"fmt"
++ 	"io"
++ 	"net/http"
++ 	"net/url"
++ 	"strings"
++ 	"time"
++ 
++ 	"nhooyr.io/websocket"
++ )
++ 
++ type RegisterResp struct {
++ 	ID        string `json:"id"`
++ 	Secret    string `json:"secret"`
++ 	PublicURL string `json:"public_url"`
++ }
++ 
++ type ReqFrame struct {
++ 	Type    string              `json:"type"`
++ 	ReqID   string              `json:"req_id"`
++ 	Method  string              `json:"method"`
++ 	Path    string              `json:"path"`
++ 	Query   string              `json:"query"`
++ 	Headers map[string][]string `json:"headers"`
++ 	Body    []byte              `json:"body"`
++ }
++ 
++ type RespFrame struct {
++ 	Type    string              `json:"type"`
++ 	ReqID   string              `json:"req_id"`
++ 	Status  int                 `json:"status"`
++ 	Headers map[string][]string `json:"headers"`
++ 	Body    []byte              `json:"body"`
++ }
++ 
++ var ErrUnauthorized = errors.New("unauthorized: credentials rejected by server")
++ 
++ type Agent struct {
++ 	ServerURL string
++ 	LocalURL  string
++ 	ID        string
++ 	Secret    string
++ }
++ 
++ func (a *Agent) Run() {
++ 	if a.ID == "" || a.Secret == "" {
++ 		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
++ 		reg, err := a.register()
++ 		if err != nil {
++ 			fmt.Println("FATAL: initial registration failed:", err)
++ 			return
++ 		}
++ 		a.ID, a.Secret = reg.ID, reg.Secret
++ 		fmt.Println("Registered successfully!")
++ 		fmt.Println("  ID:", a.ID)
++ 		fmt.Println("  Secret:", a.Secret)
++ 		fmt.Println("  Public URL:", reg.PublicURL)
++ 	}
++ 
++ 	for {
++ 		err := a.runOnce()
++ 		if err == nil {
++ 			fmt.Println("Connection closed. Reconnecting in 2 seconds...")
++ 			time.Sleep(2 * time.Second)
++ 			continue
++ 		}
++ 
++ 		if errors.Is(err, ErrUnauthorized) {
++ 			fmt.Println("Credentials rejected, re-registering for a new tunnel...")
++ 			reg, regErr := a.register()
++ 			if regErr != nil {
++ 				fmt.Println("Failed to re-register:", regErr)
++ 				fmt.Println("Retrying in 5 seconds...")
++ 				time.Sleep(5 * time.Second)
++ 				continue
++ 			}
++ 			a.ID, a.Secret = reg.ID, reg.Secret
++ 			fmt.Println("Re-registered successfully!")
++ 			fmt.Println("  ID:", a.ID)
++ 			fmt.Println("  Secret:", a.Secret)
++ 			fmt.Println("  New Public URL:", reg.PublicURL)
++ 			continue
++ 		}
++ 
++ 		fmt.Printf("Connection error: %v\n", err)
++ 		fmt.Println("Reconnecting in 2 seconds...")
++ 		time.Sleep(2 * time.Second)
++ 	}
++ }
++ 
++ func (a *Agent) runOnce() error {
++ 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++ 	defer cancel()
++ 
++ 	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
++ 	ws, resp, err := websocket.Dial(dialCtx, wsURL, nil)
++ 	if err != nil {
++ 		if resp != nil {
++ 			defer resp.Body.Close()
++ 			if resp.StatusCode == http.StatusUnauthorized {
++ 				return ErrUnauthorized
++ 			}
++ 			body, _ := io.ReadAll(resp.Body)
++ 			return fmt.Errorf("handshake failed with status %d: %s", resp.StatusCode, string(body))
++ 		}
++ 		return fmt.Errorf("dial error: %w", err)
++ 	}
++ 	defer ws.Close(websocket.StatusInternalError, "internal error")
++ 	fmt.Println("Connection established successfully.")
++ 
++ 	readCtx := context.Background()
++ 	for {
++ 		typ, data, err := ws.Read(readCtx)
++ 		if err != nil {
++ 			return err
++ 		}
++ 		if typ != websocket.MessageText {
++ 			continue
++ 		}
++ 		var req ReqFrame
++ 		if err := json.Unmarshal(data, &req); err != nil {
++ 			continue
++ 		}
++ 		if req.Type != "req" {
++ 			continue
++ 		}
++ 
++ 		go func() {
++ 			status, hdr, body, ferr := a.forward(&req)
++ 
++ 			resp := RespFrame{
++ 				Type:    "resp",
++ 				ReqID:   req.ReqID,
++ 				Status:  status,
++ 				Headers: hdr,
++ 				Body:    body,
++ 			}
++ 			if ferr != nil {
++ 				resp.Status = http.StatusBadGateway
++ 				resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
++ 				resp.Body = []byte(ferr.Error())
++ 			}
++ 			if err := ws.Write(context.Background(), websocket.MessageText, mustJSON(resp)); err != nil {
++ 				fmt.Printf("Error writing response for req_id %s: %v\n", req.ReqID, err)
++ 			}
++ 		}()
++ 	}
++ }
++ 
++ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) {
++ 	target := a.LocalURL + rd.Path
++ 	if rd.Query != "" {
++ 		target += "?" + rd.Query
++ 	}
++ 	req, err := http.NewRequest(rd.Method, target, bytes.NewReader(rd.Body))
++ 	if err != nil {
++ 		return 0, nil, nil, err
++ 	}
++ 	for k, vs := range rd.Headers {
++ 		for _, v := range vs {
++ 			req.Header.Add(k, v)
++ 		}
++ 	}
++ 
++ 	client := &http.Client{Timeout: 120 * time.Second}
++ 	resp, err := client.Do(req)
++ 	if err != nil {
++ 		return 0, nil, nil, err
++ 	}
++ 	defer resp.Body.Close()
++ 
++ 	contentType := resp.Header.Get("Content-Type")
++ 	if strings.Contains(contentType, "text/event-stream") ||
++ 		strings.Contains(contentType, "text/stream") ||
++ 		strings.Contains(contentType, "application/stream") {
++ 		return handleStreamingResponse(resp)
++ 	}
++ 
++ 	b, err := io.ReadAll(resp.Body)
++ 	if err != nil {
++ 		return resp.StatusCode, resp.Header, nil, err
++ 	}
++ 	return resp.StatusCode, resp.Header, b, nil
++ }
++ 
++ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []byte, error) {
++ 	var buffer bytes.Buffer
++ 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++ 	defer cancel()
++ 	done := make(chan error, 1)
++ 
++ 	go func() {
++ 		defer close(done)
++ 		buf := make([]byte, 4096)
++ 		for {
++ 			select {
++ 			case <-ctx.Done():
++ 				done <- ctx.Err()
++ 				return
++ 			default:
++ 				n, err := resp.Body.Read(buf)
++ 				if n > 0 {
++ 					buffer.Write(buf[:n])
++ 				}
++ 				if err != nil {
++ 					if err == io.EOF {
++ 						done <- nil
++ 						return
++ 					}
++ 					done <- err
++ 					return
++ 				}
++ 			}
++ 		}
++ 	}()
++ 
++ 	err := <-done
++ 	if err != nil && err != context.DeadlineExceeded {
++ 		return resp.StatusCode, resp.Header, buffer.Bytes(), nil
++ 	}
++ 	return resp.StatusCode, resp.Header, buffer.Bytes(), nil
++ }
++ 
++ func (a *Agent) register() (*RegisterResp, error) {
++ 	resp, err := http.Post(a.ServerURL+"/register", "application/json", nil)
++ 	if err != nil {
++ 		return nil, err
++ 	}
++ 	defer resp.Body.Close()
++ 	var r RegisterResp
++ 	return &r, json.NewDecoder(resp.Body).Decode(&r)
++ }
++ 
++ func mustJSON(v any) []byte {
++ 	b, _ := json.Marshal(v)
++ 	return b
++ } 
+```
+
+</details>
+
+---
+
+Next, I will create a `go.mod` file for the new `agentlib` package to manage its dependencies. This will also resolve the linter error.
+
+---
+
+<details><summary>Edit file: pkg/agentlib/go.mod</summary>
+
+I am creating a `go.mod` file for the new agent library to properly manage its dependencies and resolve the import error.
+
+**Chunk 1**
+Lines added: 5, lines removed: 1
+
+```diff
+@@ -1,1 +1,5 @@
+- 
++ module gcp-proxy/pkg/agentlib
++ 
++ go 1.22
++ 
++ require nhooyr.io/websocket v1.8.10 
+```
+
+</details>
+
+---
+
+Now I will refactor the original agent at `agent/main.go` to use the new `agentlib` library. This will simplify its code significantly.
+
+---
+
+<details><summary>Edit file: agent/main.go</summary>
+
+I am refactoring the original agent to use the newly created agent library, which will simplify the code and promote reuse.
+
+**Chunk 1**
+Lines added: 4, lines removed: 44
+
+```diff
+@@ -2,50 +2,10 @@
+  
+  import (
+- 	"bytes"
+- 	"context"
+- 	"encoding/json"
+- 	"errors"
+  	"flag"
+  	"fmt"
+- 	"io"
+- 	"net/http"
+- 	"net/url"
+- 	"os"
+- 	"strings"
+- 	"time"
+- 
+- 	"nhooyr.io/websocket"
+- )
+- 
+- type RegisterResp struct {
+- 	ID        string `json:"id"`
+- 	Secret    string `json:"secret"`
+- 	PublicURL string `json:"public_url"`
+- }
+- 
+- type ReqFrame struct {
+- 	Type    string              `json:"type"`
+- 	ReqID   string              `json:"req_id"`
+- 	Method  string              `json:"method"`
+- 	Path    string              `json:"path"`
+- 	Query   string              `json:"query"`
+- 	Headers map[string][]string `json:"headers"`
+- 	Body    []byte              `json:"body"`
+- }
+- 
+- type RespFrame struct {
+- 	Type    string              `json:"type"`
+- 	ReqID   string              `json:"req_id"`
+- 	Status  int                 `json:"status"`
+- 	Headers map[string][]string `json:"headers"`
+- 	Body    []byte              `json:"body"`
+- }
+- 
+- var errUnauthorized = errors.New("unauthorized: credentials rejected by server")
+- 
+- // Usage: cd agent
+- // go run . \
+- // --server https://tunnel-server-3w6u4kmniq-ue.a.run.app \
+- // --local http://127.0.0.1:8080
++ 	"os"
++ 
++ 	"gcp-proxy/pkg/agentlib"
++ )
+  
+  func main() {
+```
+
+**Chunk 2**
+Lines added: 8, lines removed: 207
+
+```diff
+@@ -61,211 +21,12 @@
+  	}
+  
+- 	currentID := *id
+- 	currentSecret := *secret
+- 
+- 	if currentID == "" || currentSecret == "" {
+- 		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
+- 		reg, err := register(*server)
+- 		if err != nil {
+- 			fmt.Println("FATAL: initial registration failed:", err)
+- 			os.Exit(1)
+- 		}
+- 		currentID, currentSecret = reg.ID, reg.Secret
+- 		fmt.Println("Registered successfully!")
+- 		fmt.Println("  ID:", currentID)
+- 		fmt.Println("  Secret:", currentSecret)
+- 		fmt.Println("  Public URL:", reg.PublicURL)
+- 	}
+- 
+- 	for {
+- 		err := runOnce(*server, *local, currentID, currentSecret)
+- 		if err == nil {
+- 			fmt.Println("Connection closed. Reconnecting in 2 seconds...")
+- 			time.Sleep(2 * time.Second)
+- 			continue
+- 		}
+- 
+- 		if errors.Is(err, errUnauthorized) {
+- 			fmt.Println("Credentials rejected, re-registering for a new tunnel...")
+- 			reg, regErr := register(*server)
+- 			if regErr != nil {
+- 				fmt.Println("Failed to re-register:", regErr)
+- 				fmt.Println("Retrying in 5 seconds...")
+- 				time.Sleep(5 * time.Second)
+- 				continue
+- 			}
+- 			currentID, currentSecret = reg.ID, reg.Secret
+- 			fmt.Println("Re-registered successfully!")
+- 			fmt.Println("  ID:", currentID)
+- 			fmt.Println("  Secret:", currentSecret)
+- 			fmt.Println("  New Public URL:", reg.PublicURL)
+- 			continue
+- 		}
+- 
+- 		fmt.Printf("Connection error: %v\n", err)
+- 		fmt.Println("Reconnecting in 2 seconds...")
+- 		time.Sleep(2 * time.Second)
+- 	}
+- }
+- 
+- func runOnce(server, local, id, secret string) error {
+- 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+- 	defer cancel()
+- 
+- 	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", server, url.QueryEscape(id), url.QueryEscape(secret))
+- 	ws, resp, err := websocket.Dial(dialCtx, wsURL, nil)
+- 	if err != nil {
+- 		if resp != nil {
+- 			defer resp.Body.Close()
+- 			if resp.StatusCode == http.StatusUnauthorized {
+- 				return errUnauthorized
+- 			}
+- 			body, _ := io.ReadAll(resp.Body)
+- 			return fmt.Errorf("handshake failed with status %d: %s", resp.StatusCode, string(body))
+- 		}
+- 		return fmt.Errorf("dial error: %w", err)
+- 	}
+- 	defer ws.Close(websocket.StatusInternalError, "internal error")
+- 	fmt.Println("Connection established successfully.")
+- 
+- 	readCtx := context.Background()
+- 	for {
+- 		typ, data, err := ws.Read(readCtx)
+- 		if err != nil {
+- 			return err
+- 		}
+- 		if typ != websocket.MessageText {
+- 			continue
+- 		}
+- 		var req ReqFrame
+- 		if err := json.Unmarshal(data, &req); err != nil {
+- 			continue
+- 		}
+- 		if req.Type != "req" {
+- 			continue
+- 		}
+- 
+- 		go func() {
+- 			status, hdr, body, ferr := forward(local, &req)
+- 
+- 			resp := RespFrame{
+- 				Type:    "resp",
+- 				ReqID:   req.ReqID,
+- 				Status:  status,
+- 				Headers: hdr,
+- 				Body:    body,
+- 			}
+- 			if ferr != nil {
+- 				resp.Status = http.StatusBadGateway
+- 				resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
+- 				resp.Body = []byte(ferr.Error())
+- 			}
+- 			if err := ws.Write(context.Background(), websocket.MessageText, mustJSON(resp)); err != nil {
+- 				fmt.Printf("Error writing response for req_id %s: %v\n", req.ReqID, err)
+- 			}
+- 		}()
+- 	}
+- }
+- 
+- func forward(local string, rd *ReqFrame) (int, map[string][]string, []byte, error) {
+- 	target := local + rd.Path
+- 	if rd.Query != "" {
+- 		target += "?" + rd.Query
+- 	}
+- 	req, err := http.NewRequest(rd.Method, target, bytes.NewReader(rd.Body))
+- 	if err != nil {
+- 		return 0, nil, nil, err
+- 	}
+- 	for k, vs := range rd.Headers {
+- 		for _, v := range vs {
+- 			req.Header.Add(k, v)
+- 		}
+- 	}
+- 
+- 	// Use a longer timeout for streaming responses
+- 	client := &http.Client{Timeout: 120 * time.Second}
+- 	resp, err := client.Do(req)
+- 	if err != nil {
+- 		return 0, nil, nil, err
+- 	}
+- 	defer resp.Body.Close()
+- 
+- 	// Handle streaming responses (like SSE) differently
+- 	contentType := resp.Header.Get("Content-Type")
+- 	if strings.Contains(contentType, "text/event-stream") ||
+- 		strings.Contains(contentType, "text/stream") ||
+- 		strings.Contains(contentType, "application/stream") {
+- 		// For streaming responses, read with a buffer and timeout
+- 		return handleStreamingResponse(resp)
+- 	}
+- 
+- 	// For regular responses, read all at once
+- 	b, err := io.ReadAll(resp.Body)
+- 	if err != nil {
+- 		return resp.StatusCode, resp.Header, nil, err
+- 	}
+- 	return resp.StatusCode, resp.Header, b, nil
+- }
+- 
+- func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []byte, error) {
+- 	// Create a buffer to collect the streaming data
+- 	var buffer bytes.Buffer
+- 
+- 	// Create a context with timeout for reading the stream
+- 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+- 	defer cancel()
+- 
+- 	// Channel to signal completion
+- 	done := make(chan error, 1)
+- 
+- 	go func() {
+- 		defer close(done)
+- 
+- 		// Read the stream in chunks with timeout
+- 		buf := make([]byte, 4096)
+- 		for {
+- 			select {
+- 			case <-ctx.Done():
+- 				done <- ctx.Err()
+- 				return
+- 			default:
+- 				n, err := resp.Body.Read(buf)
+- 				if n > 0 {
+- 					buffer.Write(buf[:n])
+- 				}
+- 				if err != nil {
+- 					if err == io.EOF {
+- 						done <- nil // Normal end of stream
+- 						return
+- 					}
+- 					done <- err
+- 					return
+- 				}
+- 			}
+- 		}
+- 	}()
+- 
+- 	// Wait for completion or timeout
+- 	err := <-done
+- 	if err != nil && err != context.DeadlineExceeded {
+- 		return resp.StatusCode, resp.Header, buffer.Bytes(), nil // Return what we have
+- 	}
+- 
+- 	return resp.StatusCode, resp.Header, buffer.Bytes(), nil
+- }
+- 
+- func register(server string) (*RegisterResp, error) {
+- 	resp, err := http.Post(server+"/register", "application/json", nil)
+- 	if err != nil {
+- 		return nil, err
+- 	}
+- 	defer resp.Body.Close()
+- 	var r RegisterResp
+- 	return &r, json.NewDecoder(resp.Body).Decode(&r)
+- }
+- 
+- func mustJSON(v any) []byte {
+- 	b, _ := json.Marshal(v)
+- 	return b
++ 	agent := &agentlib.Agent{
++ 		ServerURL: *server,
++ 		LocalURL:  *local,
++ 		ID:        *id,
++ 		Secret:    *secret,
++ 	}
++ 
++ 	agent.Run()
+  }
+  
+```
+
+</details>
+
+---
+
+I need to update the `go.mod` file for the main agent to recognize the new local `agentlib` package. I'll do that now.
+
+---
+
+<details><summary>Edit file: agent/go.mod</summary>
+
+I am updating the main agent's `go.mod` file to include a dependency on the new local agent library, which is necessary for the refactoring.
+
+**Chunk 1**
+Lines added: 6, lines removed: 1
+
+```diff
+@@ -3,4 +3,9 @@
+  go 1.22
+  
+- require nhooyr.io/websocket v1.8.10
++ require (
++ 	gcp-proxy/pkg/agentlib v0.0.0
++ 	nhooyr.io/websocket v1.8.10
++ )
++ 
++ replace gcp-proxy/pkg/agentlib => ../pkg/agentlib
+  
+```
+
+</details>
+
+---
+
+Now that the main agent is refactored, I will create the new sub-agent. This agent will connect to the tunnel server using a public URL and a secret. First, I'll create the `main.go` file.
+
+---
+
+<details><summary>Edit file: sub-agent/main.go</summary>
+
+I am creating the main file for the new sub-agent, which will allow connecting to the tunnel server using a public URL and secret.
+
+**Chunk 1**
+Lines added: 47, lines removed: 1
+
+```diff
+@@ -1,1 +1,47 @@
+- 
++ package main
++ 
++ import (
++ 	"flag"
++ 	"fmt"
++ 	"net/url"
++ 	"os"
++ 	"strings"
++ 
++ 	"gcp-proxy/pkg/agentlib"
++ )
++ 
++ func main() {
++ 	publicURL := flag.String("public-url", "", "Public URL of the tunnel, e.g. https://<service>/pub/<id>")
++ 	secret := flag.String("secret", "", "Tunnel secret")
++ 	local := flag.String("local", "http://127.0.0.1:8080", "Local http service to proxy to")
++ 	flag.Parse()
++ 
++ 	if *publicURL == "" || *secret == "" {
++ 		fmt.Println("--public-url and --secret are required")
++ 		os.Exit(1)
++ 	}
++ 
++ 	u, err := url.Parse(*publicURL)
++ 	if err != nil {
++ 		fmt.Println("Invalid --public-url:", err)
++ 		os.Exit(1)
++ 	}
++ 
++ 	serverURL := u.Scheme + "://" + u.Host
++ 	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
++ 	if len(pathParts) < 2 || pathParts[0] != "pub" {
++ 		fmt.Println("Invalid public URL format. Expected /pub/<id>")
++ 		os.Exit(1)
++ 	}
++ 	id := pathParts[1]
++ 
++ 	agent := &agentlib.Agent{
++ 		ServerURL: serverURL,
++ 		LocalURL:  *local,
++ 		ID:        id,
++ 		Secret:    *secret,
++ 	}
++ 
++ 	fmt.Printf("Connecting to server %s with tunnel ID %s...\n", serverURL, id)
++ 	agent.Run()
++ } 
+```
+
+</details>
+
+---
+
+Finally, I will create the `go.mod` file for the new sub-agent, which will resolve the linter error and allow it to use the shared agent library.
+
+---
+
+<details><summary>Edit file: sub-agent/go.mod</summary>
+
+I am creating the `go.mod` file for the new sub-agent to manage its dependencies and enable it to use the shared agent library.
+
+**Chunk 1**
+Lines added: 10, lines removed: 1
+
+```diff
+@@ -1,1 +1,10 @@
+- 
++ module gcp-proxy/sub-agent
++ 
++ go 1.22
++ 
++ require (
++ 	gcp-proxy/pkg/agentlib v0.0.0
++ 	nhooyr.io/websocket v1.8.10
++ )
++ 
++ replace gcp-proxy/pkg/agentlib => ../pkg/agentlib 
+```
+
+</details>
+
+---
+
+I have successfully refactored the agent and created the new sub-agent as you requested.
+
+Here is a summary of the changes:
+
+*   **Reusable Agent Library**: The core agent logic has been moved to a shared library in `pkg/agentlib`, making the code more modular and easier to maintain.
+*   **Original Agent Refactored**: The agent in `agent/` now uses the shared library, simplifying its implementation.
+*   **New Sub-Agent**: A new agent has been created in `sub-agent/`. This agent can connect to an existing tunnel using a `--public-url` and a `--secret`, and it includes the same robust auto-reconnect logic.
+
+You can now use the new sub-agent to easily proxy a local service to an existing tunnel. This new structure will make it much easier to add new features or even other types of agents in the future.
+
+---
+
+_**User**_
+
+The sub-agent  start a local server at port. When local service is access, it will connect to tunnel server by public url and send request to tunnel server and get response back. If someone exports local server with agent, so I can use sub-agent to replicate local server by public url and use same way to access it.
+
+---
+
+_**Assistant**_
+
+<think><details><summary>Thought Process</summary>
+**Understanding the Request**
+
+I'm trying to clarify what the user really wants. It seems they're asking for something novel, a "reverse proxy agent". The wording is a bit unclear, so I'm starting to unpack the core requirements. I'm breaking down the request into distinct components to get a clearer picture.
+
+
+**Dissecting the Components**
+
+I'm now fully mapping out the interaction flow. The local server will act as the primary entry point, and I've identified the core components: request forwarding, path appending, interaction with the tunnel server, and response relaying. I'm considering different error handling strategies at each step to build a resilient agent.
+
+
+**Conceptualizing the Architecture**
+
+I'm now envisioning the key components and data flow within the `reverse-proxy-agent`. I have a clear picture of the agent's role in forwarding requests to the tunnel and relaying responses back. The local server's operation, the path appending, and the interaction with the tunnel server, all seem to have a solid structure. The agent's function as a client to the tunnel is now well defined.
+
+
+**Outlining the Implementation**
+
+I've now completely formalized the core concept. I understand the user's need for a client-side proxy for a tunnel, which can be called a 'reverse-proxy-agent.' It acts as a client, making HTTP requests to the tunnel's public URL and then creating a local replica, and I've settled on the architecture. The next step is the creation of the project directory and outlining the main steps involved in its creation, which I have done.
+
+
+</details></think>
+
+---
+
+
+
+You've described a very powerful use case for this tunneling service! I understand completely. You want a new kind of agent that acts as a local "replica" or "proxy" for a service that has already been exposed to the internet by another agent.
+
+Here's how it would work:
+*   **Agent A** (the original agent) is running on a private network, exposing a local service (e.g., `localhost:5000`) to the world via a public URL like `https://tunnel.example.com/pub/tunnel-abc`.
+*   **Your New Agent** (the "reverse proxy" agent) will run on your machine. You'll tell it to listen on a local port (e.g., `8081`) and point it at the public URL (`https://tunnel.example.com/pub/tunnel-abc`).
+*   When you make a request to `http://localhost:8081/some/path`, your new agent will receive it, forward it to `https://tunnel.example.com/pub/tunnel-abc/some/path`, get the response from Agent A's service, and return it directly to you.
+
+This essentially creates a secure, local mirror of the remote service.
+
+This is different from the `sub-agent`, which *provides* a tunnel; this new agent will *consume* one. I will create this new agent for you.
+
+Here is my plan:
+1.  Create a new directory for this agent, `reverse-proxy-agent`.
+2.  Write the `main.go` file for this agent. It will start a local HTTP server.
+3.  This server will act as a reverse proxy, forwarding all incoming requests to the specified public URL.
+
+I will start by creating the directory for our new agent.
+
+---
+
+```bash
+mkdir reverse-proxy-agent
+```
+
+---
+
+Now, I will create the `main.go` file for our new `reverse-proxy-agent`. This file will contain the logic for the local reverse proxy server.
+
+---
+
+<details><summary>Edit file: reverse-proxy-agent/main.go</summary>
+
+I am creating the `main.go` file for the new reverse proxy agent, which will set up a local HTTP server to forward requests to the specified public URL.
+
+**Chunk 1**
+Lines added: 40, lines removed: 1
+
+```diff
+@@ -1,1 +1,40 @@
+- 
++ package main
++ 
++ import (
++ 	"flag"
++ 	"fmt"
++ 	"log"
++ 	"net/http"
++ 	"net/http/httputil"
++ 	"net/url"
++ 	"os"
++ )
++ 
++ func main() {
++ 	publicURL := flag.String("public-url", "", "The public URL of the tunnel to connect to")
++ 	localPort := flag.String("local-port", "8081", "The local port to listen on")
++ 	flag.Parse()
++ 
++ 	if *publicURL == "" {
++ 		fmt.Println("The --public-url flag is required.")
++ 		os.Exit(1)
++ 	}
++ 
++ 	targetURL, err := url.Parse(*publicURL)
++ 	if err != nil {
++ 		log.Fatalf("Invalid public URL: %v", err)
++ 	}
++ 
++ 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
++ 
++ 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++ 		log.Printf("Forwarding request for %s to %s", r.URL.Path, targetURL)
++ 		proxy.ServeHTTP(w, r)
++ 	})
++ 
++ 	listenAddr := ":" + *localPort
++ 	log.Printf("Starting reverse proxy server on %s, forwarding to %s", listenAddr, targetURL)
++ 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
++ 		log.Fatalf("Failed to start server: %v", err)
++ 	}
++ } 
+```
+
+</details>
+
+---
+
+Finally, I will create the `go.mod` file for our new agent to handle its dependencies.
+
+---
+
+<details><summary>Edit file: reverse-proxy-agent/go.mod</summary>
+
+I am creating the `go.mod` file for the new reverse proxy agent to properly manage its dependencies.
+
+**Chunk 1**
+Lines added: 3, lines removed: 1
+
+```diff
+@@ -1,1 +1,3 @@
+- 
++ module gcp-proxy/reverse-proxy-agent
++ 
++ go 1.22 
+```
+
+</details>
+
+---
+
+I have created the new `reverse-proxy-agent` for you.
+
+Here’s a quick summary of what I’ve done:
+*   **New Agent Created**: A new agent has been added in the `reverse-proxy-agent` directory.
+*   **Functionality**: This agent starts a local HTTP server that acts as a reverse proxy. It will forward all incoming requests to the public URL of an existing tunnel.
+*   **Simplicity**: The agent is designed to be simple and focused on its one task: providing a local proxy to a remote service.
+
+You can now use this agent to create a local mirror of any service that is being exposed by one of your other agents. This is a powerful way to interact with your remote services as if they were running on your own machine.
+
+---
+
+_**User**_
+
+merge @main.go to @main.go and delete sub-agent folder
+
+---
+
+_**Assistant**_
+
+<think><details><summary>Thought Process</summary>
+**Considering Consolidation Strategies**
+
+I'm currently assessing the feasibility of merging `sub-agent`'s functionalities into the `reverse-proxy-agent`. Initial analysis suggests `@main.go` within `sub-agent` will be the key integration point. I'm outlining the steps needed for a smooth transition to minimize disruption, including the deletion of the `sub-agent` directory post-consolidation.
+
+
+**Defining Integration Scope**
+
+I've begun to dissect the core functionalities of both agents. It's now clearer that the integration will involve bringing the public URL/secret connection from `sub-agent` into the `reverse-proxy-agent`. I'm focusing on isolating the specific logic within `@main.go` files to streamline the merging process.
+
+
+**Clarifying Functionality Merging**
+
+I've realized the distinction between the two agents is crucial. I now understand that the user wants the `reverse-proxy-agent` to *also* handle the functionality of `sub-agent`, providing a local service through an existing public URL. Therefore, the goal is indeed to integrate `@main.go` of `sub-agent` into `reverse-proxy-agent`, making the latter more versatile, while retaining the original proxying capabilities.
+
+
+**Clarifying the Merge Goal**
+
+I'm now rethinking the direction of the merge, given the contrasting roles of the agents. The user likely wants the `reverse-proxy-agent` to *become* the primary solution, encompassing the `sub-agent`'s functionality for connecting via public URLs. Therefore, I'll investigate integrating `sub-agent/main.go`'s connection logic into `reverse-proxy-agent` while retaining its existing reverse-proxy features. The eventual deletion of the `sub-agent` directory still seems like the overall aim.
+
+
+**Revisiting Merge Strategy**
+
+I'm now back to assessing the intent behind the merge request. It appears the user wants to integrate `sub-agent`'s core functionality into the `reverse-proxy-agent` to create a more versatile tool. The goal is to merge `sub-agent/main.go` functionality, likely connecting to a public URL and proxying requests, into `reverse-proxy-agent` while retaining the proxying capabilities. Ultimately, deleting the `sub-agent` directory post-integration remains the desired outcome.
+
+
+**Considering the Agent Merge**
+
+I'm now confident the user wants to incorporate `sub-agent`'s capabilities into the primary `reverse-proxy-agent`. The key is to allow `reverse-proxy-agent` to connect to the tunnel server using a public URL and secret, while preserving its existing reverse proxy functions. I will then investigate the best way to integrate the code within `@main.go` to simplify the user's experience, culminating in the planned removal of the `sub-agent` directory.
+
+
+**Analyzing the User's Intent**
+
+I've thoroughly reviewed the user's requests and the resulting agent implementations. It's now apparent that the core aim is to consolidate the functionality of `sub-agent` within the existing `agent`, using the `reverse-proxy-agent` model for incoming connections. This consolidation will simplify the agent management and remove the need for separate `sub-agent`. I intend to introduce a `--public-url` flag into the core agent to achieve this merge.
+
+
+**Re-Evaluating Agent Consolidation**
+
+I've realized the user likely wants to integrate `sub-agent`'s public URL connection functionality into the `reverse-proxy-agent`. They want a single tool that handles both the reverse proxy *and* the ability to connect to a public URL, ultimately deprecating `sub-agent` completely. I'll focus on the core code from `@main.go` for the public URL connection and secret within `sub-agent`.
+
+
+**Refining the Merge Strategy**
+
+I'm revisiting the user's direction. It appears the primary focus is to enhance the `reverse-proxy-agent`. The intent is to integrate `sub-agent`'s public URL connection logic and also to be able to forward/reverse-proxy connections. This aims to consolidate functionalities and streamline operations. The final step is to remove the `sub-agent` directory after completing the integration.
+
+
+**Formulating a Merger Plan**
+
+I've determined that the best approach is to incorporate `sub-agent`'s connection logic into `agent`. The user wants a single binary that uses a public URL. Therefore, I plan to add a `--public-url` flag to `agent/main.go`, parse this for the server and ID, and then delete the `sub-agent` folder, thus consolidating features and simplifying usage as per user's stated intention.
+
+
+**Implementing the `--public-url` Feature**
+
+I've thoroughly analyzed the code for both `sub-agent` and `agent`. I plan to add the `--public-url` flag to `agent/main.go` to incorporate `sub-agent`'s main functionality. When the `--public-url` flag is present, the agent will parse it to extract connection details. I'll then remove the `sub-agent` directory, consolidating features into one tool.
+
+
+**Planning the Agent Merger**
+
+I'm now going to implement the planned consolidation. The key is merging `sub-agent`'s functionality into `agent` by introducing a `--public-url` flag. If present, I'll use this to parse the server URL and tunnel ID, and derive the secret. Afterwards, I will delete the `sub-agent` directory to finalize the consolidation and streamline functionality.
+
+
+**Planning Functionality Integration**
+
+I'm now set on integrating `sub-agent`'s functionalities within `agent`. Specifically, I will be adding the `--public-url` flag support to `agent/main.go` to allow users to connect using a public URL, along with their associated secret. Consequently, the `sub-agent` directory will be removed, streamlining agent deployment and use.
+
+
+</details></think>
+
+---
+
+
+
+Of course. I see you want to simplify the project by merging the functionality of the `sub-agent` and then removing it. That is a great idea, as it will make the project easier to manage.
+
+I will merge the functionality of the `sub-agent` into the main `agent`. This will allow the main agent to connect to the tunnel server using either the `--server` URL directly or by parsing a `--public-url`, which makes the separate `sub-agent` unnecessary.
+
+Here is my plan:
+
+1.  **Merge Functionality**: I will update `agent/main.go` to accept a `--public-url` flag. If this flag is used, the agent will derive the server address and tunnel ID from it, just as the `sub-agent` did.
+2.  **Delete `sub-agent`**: Once the main agent has this new capability, I will delete the `sub-agent` directory and all its contents.
+
+I will begin by merging the code now.
+
+---
+
+<details><summary>Edit file: agent/main.go</summary>
+
+I will update the main agent to handle a new `--public-url` flag, allowing it to derive the server URL and tunnel ID from the public URL, and then I'll add logic to ensure the `--secret` flag is provided when using the new flag.
+
+**Chunk 1**
+Lines added: 2, lines removed: undefined
+
+```diff
+@@ -4,5 +4,7 @@
+  	"flag"
+  	"fmt"
++ 	"net/url"
+  	"os"
++ 	"strings"
+  
+  	"gcp-proxy/pkg/agentlib"
+```
+
+**Chunk 2**
+Lines added: 30, lines removed: 4
+
+```diff
+@@ -11,19 +13,45 @@
+  func main() {
+  	server := flag.String("server", "", "Cloud Run base, e.g. https://<service>-<hash>-uc.a.run.app")
++ 	publicURL := flag.String("public-url", "", "Public URL of the tunnel, e.g. https://<service>/pub/<id>")
+  	local := flag.String("local", "http://127.0.0.1:8080", "local http service")
+  	id := flag.String("id", "", "tunnel id (optional)")
+  	secret := flag.String("secret", "", "tunnel secret (optional)")
+  	flag.Parse()
+  
++ 	var serverURL, tunnelID, tunnelSecret string
++ 
++ 	if *publicURL != "" {
++ 		if *secret == "" {
++ 			fmt.Println("--secret is required when using --public-url")
++ 			os.Exit(1)
++ 		}
++ 		u, err := url.Parse(*publicURL)
++ 		if err != nil {
++ 			fmt.Println("Invalid --public-url:", err)
++ 			os.Exit(1)
++ 		}
++ 		serverURL = u.Scheme + "://" + u.Host
++ 		pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
++ 		if len(pathParts) < 2 || pathParts[0] != "pub" {
++ 			fmt.Println("Invalid public URL format. Expected /pub/<id>")
++ 			os.Exit(1)
++ 		}
++ 		tunnelID = pathParts[1]
++ 		tunnelSecret = *secret
++ 	} else {
+  		if *server == "" {
+- 		fmt.Println("--server is required")
++ 			fmt.Println("--server is required if --public-url is not provided")
+  			os.Exit(1)
++ 		}
++ 		serverURL = *server
++ 		tunnelID = *id
++ 		tunnelSecret = *secret
+  	}
+  
+  	agent := &agentlib.Agent{
+- 		ServerURL: *server,
++ 		ServerURL: serverURL,
+  		LocalURL:  *local,
+- 		ID:        *id,
+- 		Secret:    *secret,
++ 		ID:        tunnelID,
++ 		Secret:    tunnelSecret,
+  	}
+  
+```
+
+</details>
+
+---
+
+Now that I have merged the functionality, I will delete the `sub-agent` directory and its contents.
+
+---
+
+```bash
+rm -rf sub-agent
+```
+
+---
+
+I have successfully merged the functionality of the `sub-agent` into the main `agent` and removed the now-redundant `sub-agent` directory.
+
+Here is a summary of the changes:
+*   **Unified Agent**: The main agent at `agent/` now has the combined capabilities of both the original agent and the sub-agent.
+*   **New `--public-url` Flag**: The main agent now accepts a `--public-url` flag. When used, the agent will extract the server URL and tunnel ID, just as the sub-agent did.
+*   **Simplified Project**: The project is now cleaner and easier to manage with the removal of the `sub-agent` directory.
+
+The agent is now more flexible and can be run in two ways:
+1.  **By server URL**: `go run . --server <your-server-url>`
+2.  **By public URL**: `go run . --public-url <your-public-url> --secret <your-secret>`
+
+This provides a more streamlined and powerful experience.
 
 ---
 
