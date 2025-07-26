@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -66,7 +67,7 @@ func (a *Agent) Run() {
 	for {
 		err := a.runOnce()
 		if err == nil {
-			fmt.Println("Connection closed. Reconnecting in 2 seconds...")
+			fmt.Println("Connection closed normally. Reconnecting in 2 seconds...")
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -114,43 +115,113 @@ func (a *Agent) runOnce() error {
 	defer ws.Close(websocket.StatusInternalError, "internal error")
 	fmt.Println("Connection established successfully.")
 
-	readCtx := context.Background()
-	for {
-		typ, data, err := ws.Read(readCtx)
-		if err != nil {
-			return err
-		}
-		if typ != websocket.MessageText {
-			continue
-		}
-		var req ReqFrame
-		if err := json.Unmarshal(data, &req); err != nil {
-			continue
-		}
-		if req.Type != "req" {
-			continue
-		}
+	// Create a context that will be cancelled when the connection closes
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
 
-		go func() {
-			status, hdr, body, ferr := a.forward(&req)
+	// Track active request handlers
+	var wg sync.WaitGroup
 
-			resp := RespFrame{
-				Type:    "resp",
-				ReqID:   req.ReqID,
-				Status:  status,
-				Headers: hdr,
-				Body:    body,
+	// Channel to signal connection closure
+	done := make(chan struct{})
+
+	// Start a goroutine to read messages
+	go func() {
+		defer close(done)
+		for {
+			typ, data, err := ws.Read(ctx)
+			if err != nil {
+				// Connection closed, cancel context to stop all handlers
+				cancelCtx()
+				return
 			}
-			if ferr != nil {
-				resp.Status = http.StatusBadGateway
-				resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
-				resp.Body = []byte(ferr.Error())
+			if typ != websocket.MessageText {
+				continue
 			}
-			if err := ws.Write(context.Background(), websocket.MessageText, mustJSON(resp)); err != nil {
-				fmt.Printf("Error writing response for req_id %s: %v\n", req.ReqID, err)
+			var req ReqFrame
+			if err := json.Unmarshal(data, &req); err != nil {
+				continue
 			}
-		}()
+			if req.Type != "req" {
+				continue
+			}
+
+			// Handle request in a goroutine with proper lifecycle management
+			wg.Add(1)
+			go func(req ReqFrame) {
+				defer wg.Done()
+
+				// Create a context for this specific request
+				reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Second)
+				defer reqCancel()
+
+				// Check if connection is still alive before processing
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				status, hdr, body, ferr := a.forward(&req)
+
+				resp := RespFrame{
+					Type:    "resp",
+					ReqID:   req.ReqID,
+					Status:  status,
+					Headers: hdr,
+					Body:    body,
+				}
+				if ferr != nil {
+					resp.Status = http.StatusBadGateway
+					resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
+					resp.Body = []byte(ferr.Error())
+				}
+
+				// Check if connection is still alive before writing
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// Try to write with a timeout
+					writeCtx, writeCancel := context.WithTimeout(reqCtx, 5*time.Second)
+					defer writeCancel()
+
+					if err := ws.Write(writeCtx, websocket.MessageText, mustJSON(resp)); err != nil {
+						// Only log if it's not due to context cancellation
+						select {
+						case <-ctx.Done():
+							// Connection was closed, this is expected
+						default:
+							fmt.Printf("Error writing response for req_id %s: %v\n", req.ReqID, err)
+						}
+					}
+				}
+			}(req)
+		}
+	}()
+
+	// Wait for connection to close
+	<-done
+
+	// Cancel context to stop all handlers
+	cancelCtx()
+
+	// Wait for all request handlers to finish with a timeout
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		// All handlers finished gracefully
+	case <-time.After(5 * time.Second):
+		// Timeout waiting for handlers
+		fmt.Println("Warning: some request handlers did not finish in time")
 	}
+
+	return nil
 }
 
 func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) {
