@@ -8,6 +8,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -25,15 +26,41 @@ func main() {
 		log.Fatalf("Invalid public URL: %v", err)
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	// Extract the base URL and tunnel path
+	baseURL := &url.URL{
+		Scheme: targetURL.Scheme,
+		Host:   targetURL.Host,
+	}
+	tunnelPath := targetURL.Path // This should be /pub/{id}
+
+	proxy := httputil.NewSingleHostReverseProxy(baseURL)
+
+	// Modify the director to preserve the tunnel path
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = baseURL.Scheme
+		req.URL.Host = baseURL.Host
+		// Prepend the tunnel path to the request path
+		req.URL.Path = strings.TrimSuffix(tunnelPath, "/") + req.URL.Path
+		req.Host = baseURL.Host
+
+		log.Printf("Forwarding %s %s to %s%s", req.Method, req.URL.Path, baseURL, req.URL.Path)
+	}
+
+	// Handle errors
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("Proxy error: %v", err)
+		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Forwarding request for %s to %s", r.URL.Path, targetURL)
 		proxy.ServeHTTP(w, r)
 	})
 
 	listenAddr := ":" + *localPort
-	log.Printf("Starting reverse proxy server on %s, forwarding to %s", listenAddr, targetURL)
+	log.Printf("Starting reverse proxy server on %s", listenAddr)
+	log.Printf("Forwarding requests to %s", *publicURL)
+	log.Printf("Make sure the agent for this tunnel is connected to the server!")
+
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

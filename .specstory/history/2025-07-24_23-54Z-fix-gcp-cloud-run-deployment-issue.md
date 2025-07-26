@@ -4426,3 +4426,768 @@ This provides a more streamlined and powerful experience.
 
 ---
 
+_**User**_
+
+local service http://localhost:3001/ can be accessed by user a. When user b use reverse-proxy as:
+```
+go run . --public-url https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9 --local-port 3001
+2025/07/25 21:10:05 Starting reverse proxy server on :3001, forwarding to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:10:52 Forwarding request for / to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:10:52 Forwarding request for /favicon.ico to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:11:23 Forwarding request for /.well-known/appspecific/com.chrome.devtools.json to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:11:30 Forwarding request for / to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:11:30 Forwarding request for /favicon.ico to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+2025/07/25 21:11:30 Forwarding request for /.well-known/appspecific/com.chrome.devtools.json to https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9
+```
+He cannot access http://localhost:3001/  and get google 401 unauthorized error. Please investigate it and understand the cause then fix it
+
+---
+
+_**Assistant**_
+
+I see the issue. The reverse proxy is getting a 401 Unauthorized error when trying to access the tunnel URL. This is happening because the tunnel server requires authentication (the tunnel ID and secret) to access the tunnel, but the `reverse-proxy-agent` is just making plain HTTP requests without any authentication.
+
+Let me investigate the issue more thoroughly and fix it.
+
+---
+
+Read file: reverse-proxy-agent/main.go
+
+---
+
+Now I understand the issue. The `reverse-proxy-agent` is trying to access the public tunnel URL directly, but it's not using the WebSocket connection with authentication like the regular agent does. The tunnel's public URL (`/pub/{id}`) is meant to be accessed by external clients, not by another agent.
+
+What user B actually needs is not a simple HTTP reverse proxy, but rather an agent that:
+1. Connects to the tunnel server via WebSocket (with authentication)
+2. Starts a local HTTP server
+3. When requests come to the local server, it forwards them through the WebSocket to the tunnel server
+
+This is actually what the original design you asked for should have been. Let me fix the `reverse-proxy-agent` to work correctly with the tunnel protocol.
+
+---
+
+<details><summary>Edit file: reverse-proxy-agent/main.go</summary>
+
+I'll completely rewrite the reverse-proxy-agent to use the WebSocket tunnel protocol instead of simple HTTP forwarding. It will start a local HTTP server and use the agent library to connect to the tunnel.
+
+**Chunk 1**
+Lines added: 35, lines removed: 1
+
+```diff
+@@ -2,11 +2,45 @@
+  
+  import (
++ 	"bytes"
++ 	"encoding/json"
+  	"flag"
+  	"fmt"
++ 	"io"
+  	"log"
+  	"net/http"
+- 	"net/http/httputil"
+  	"net/url"
+  	"os"
++ 	"strings"
++ 	"sync"
++ 	"time"
++ 
++ 	"github.com/google/uuid"
++ )
++ 
++ type ReqFrame struct {
++ 	Type    string              `json:"type"`
++ 	ReqID   string              `json:"req_id"`
++ 	Method  string              `json:"method"`
++ 	Path    string              `json:"path"`
++ 	Query   string              `json:"query"`
++ 	Headers map[string][]string `json:"headers"`
++ 	Body    []byte              `json:"body"`
++ }
++ 
++ type RespFrame struct {
++ 	Type    string              `json:"type"`
++ 	ReqID   string              `json:"req_id"`
++ 	Status  int                 `json:"status"`
++ 	Headers map[string][]string `json:"headers"`
++ 	Body    []byte              `json:"body"`
++ }
++ 
++ type pendingRequest struct {
++ 	resp chan *RespFrame
++ }
++ 
++ var (
++ 	pendingRequests   = make(map[string]*pendingRequest)
++ 	pendingRequestsMu sync.Mutex
+  )
+  
+```
+
+**Chunk 2**
+Lines added: 88, lines removed: 6
+
+```diff
+@@ -21,21 +55,103 @@
+  	}
+  
+- 	targetURL, err := url.Parse(*publicURL)
++ 	// Parse the public URL to extract base URL and tunnel ID
++ 	u, err := url.Parse(*publicURL)
+  	if err != nil {
+  		log.Fatalf("Invalid public URL: %v", err)
+  	}
+  
+- 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
++ 	baseURL := u.Scheme + "://" + u.Host
++ 	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
++ 	if len(pathParts) < 2 || pathParts[0] != "pub" {
++ 		log.Fatalf("Invalid public URL format. Expected /pub/<id>")
++ 	}
++ 	tunnelID := pathParts[1]
++ 
++ 	// Start the local HTTP server
++ 	listenAddr := ":" + *localPort
++ 	log.Printf("Starting local server on %s, will forward requests to %s", listenAddr, *publicURL)
+  	
+  	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+- 		log.Printf("Forwarding request for %s to %s", r.URL.Path, targetURL)
+- 		proxy.ServeHTTP(w, r)
++ 		handleLocalRequest(w, r, baseURL, tunnelID)
+  	})
+  
+- 	listenAddr := ":" + *localPort
+- 	log.Printf("Starting reverse proxy server on %s, forwarding to %s", listenAddr, targetURL)
+  	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+  		log.Fatalf("Failed to start server: %v", err)
+  	}
+  }
++ 
++ func handleLocalRequest(w http.ResponseWriter, r *http.Request, baseURL, tunnelID string) {
++ 	// Read the request body
++ 	body, err := io.ReadAll(r.Body)
++ 	if err != nil {
++ 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
++ 		return
++ 	}
++ 	defer r.Body.Close()
++ 
++ 	// Create a request frame
++ 	reqID := uuid.New().String()
++ 	reqFrame := &ReqFrame{
++ 		Type:    "req",
++ 		ReqID:   reqID,
++ 		Method:  r.Method,
++ 		Path:    r.URL.Path,
++ 		Query:   r.URL.RawQuery,
++ 		Headers: r.Header,
++ 		Body:    body,
++ 	}
++ 
++ 	// Convert to JSON
++ 	reqData, err := json.Marshal(reqFrame)
++ 	if err != nil {
++ 		http.Error(w, "Failed to marshal request", http.StatusInternalServerError)
++ 		return
++ 	}
++ 
++ 	// Make HTTP request to tunnel server's public endpoint
++ 	tunnelURL := fmt.Sprintf("%s/pub/%s%s", baseURL, tunnelID, r.URL.Path)
++ 	if r.URL.RawQuery != "" {
++ 		tunnelURL += "?" + r.URL.RawQuery
++ 	}
++ 
++ 	req, err := http.NewRequest(r.Method, tunnelURL, bytes.NewReader(body))
++ 	if err != nil {
++ 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
++ 		return
++ 	}
++ 
++ 	// Copy headers
++ 	for k, vs := range r.Header {
++ 		for _, v := range vs {
++ 			req.Header.Add(k, v)
++ 		}
++ 	}
++ 
++ 	// Make the request
++ 	client := &http.Client{Timeout: 30 * time.Second}
++ 	resp, err := client.Do(req)
++ 	if err != nil {
++ 		http.Error(w, fmt.Sprintf("Failed to forward request: %v", err), http.StatusBadGateway)
++ 		return
++ 	}
++ 	defer resp.Body.Close()
++ 
++ 	// Copy response headers
++ 	for k, vs := range resp.Header {
++ 		for _, v := range vs {
++ 			w.Header().Add(k, v)
++ 		}
++ 	}
++ 
++ 	// Set status code
++ 	w.WriteHeader(resp.StatusCode)
++ 
++ 	// Copy response body
++ 	_, err = io.Copy(w, resp.Body)
++ 	if err != nil {
++ 		log.Printf("Error copying response body: %v", err)
++ 	}
++ 
++ 	log.Printf("Forwarded %s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
++ }
+  
+```
+
+</details>
+
+---
+
+Wait, I realize I'm making this more complicated than needed. The issue is that the tunnel's public URLs are meant to be accessed directly - they don't require authentication. The 401 error is likely coming from Google Cloud Run itself, not from the tunnel authentication.
+
+Let me check the server code to understand how the public endpoint works:
+
+---
+
+Read file: server/main.go
+
+---
+
+Read file: server/main.go
+
+---
+
+I see! The public endpoint doesn't require authentication. The 401 error that user B is seeing is likely because:
+
+1. The agent with that tunnel ID is not currently connected to the server
+2. OR the tunnel server deployment might have been updated and lost the in-memory state
+
+The simple HTTP reverse proxy approach should actually work. Let me revert to the simpler implementation and update the go.mod file:
+
+---
+
+<details><summary>Edit file: reverse-proxy-agent/main.go</summary>
+
+I'll revert back to the simple HTTP reverse proxy implementation since the public endpoints don't require authentication
+
+**Chunk 1**
+Lines added: 1, lines removed: 35
+
+```diff
+@@ -2,45 +2,11 @@
+  
+  import (
+- 	"bytes"
+- 	"encoding/json"
+  	"flag"
+  	"fmt"
+- 	"io"
+  	"log"
+  	"net/http"
++ 	"net/http/httputil"
+  	"net/url"
+  	"os"
+- 	"strings"
+- 	"sync"
+- 	"time"
+- 
+- 	"github.com/google/uuid"
+- )
+- 
+- type ReqFrame struct {
+- 	Type    string              `json:"type"`
+- 	ReqID   string              `json:"req_id"`
+- 	Method  string              `json:"method"`
+- 	Path    string              `json:"path"`
+- 	Query   string              `json:"query"`
+- 	Headers map[string][]string `json:"headers"`
+- 	Body    []byte              `json:"body"`
+- }
+- 
+- type RespFrame struct {
+- 	Type    string              `json:"type"`
+- 	ReqID   string              `json:"req_id"`
+- 	Status  int                 `json:"status"`
+- 	Headers map[string][]string `json:"headers"`
+- 	Body    []byte              `json:"body"`
+- }
+- 
+- type pendingRequest struct {
+- 	resp chan *RespFrame
+- }
+- 
+- var (
+- 	pendingRequests   = make(map[string]*pendingRequest)
+- 	pendingRequestsMu sync.Mutex
+  )
+  
+```
+
+**Chunk 2**
+Lines added: 20, lines removed: 88
+
+```diff
+@@ -55,103 +21,35 @@
+  	}
+  
+- 	// Parse the public URL to extract base URL and tunnel ID
+- 	u, err := url.Parse(*publicURL)
++ 	targetURL, err := url.Parse(*publicURL)
+  	if err != nil {
+  		log.Fatalf("Invalid public URL: %v", err)
+  	}
+  
+- 	baseURL := u.Scheme + "://" + u.Host
+- 	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
+- 	if len(pathParts) < 2 || pathParts[0] != "pub" {
+- 		log.Fatalf("Invalid public URL format. Expected /pub/<id>")
+- 	}
+- 	tunnelID := pathParts[1]
+- 
+- 	// Start the local HTTP server
+- 	listenAddr := ":" + *localPort
+- 	log.Printf("Starting local server on %s, will forward requests to %s", listenAddr, *publicURL)
++ 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
++ 	
++ 	// Modify the director to ensure proper forwarding
++ 	originalDirector := proxy.Director
++ 	proxy.Director = func(req *http.Request) {
++ 		originalDirector(req)
++ 		log.Printf("Forwarding %s %s to %s", req.Method, req.URL.Path, targetURL)
++ 	}
++ 
++ 	// Handle errors
++ 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
++ 		log.Printf("Proxy error: %v", err)
++ 		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
++ 	}
+  
+  	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+- 		handleLocalRequest(w, r, baseURL, tunnelID)
++ 		proxy.ServeHTTP(w, r)
+  	})
++ 
++ 	listenAddr := ":" + *localPort
++ 	log.Printf("Starting reverse proxy server on %s, forwarding to %s", listenAddr, targetURL)
++ 	log.Printf("Make sure the agent for tunnel ID is connected to the server!")
+  	
+  	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+  		log.Fatalf("Failed to start server: %v", err)
+  	}
+  }
+- 
+- func handleLocalRequest(w http.ResponseWriter, r *http.Request, baseURL, tunnelID string) {
+- 	// Read the request body
+- 	body, err := io.ReadAll(r.Body)
+- 	if err != nil {
+- 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+- 		return
+- 	}
+- 	defer r.Body.Close()
+- 
+- 	// Create a request frame
+- 	reqID := uuid.New().String()
+- 	reqFrame := &ReqFrame{
+- 		Type:    "req",
+- 		ReqID:   reqID,
+- 		Method:  r.Method,
+- 		Path:    r.URL.Path,
+- 		Query:   r.URL.RawQuery,
+- 		Headers: r.Header,
+- 		Body:    body,
+- 	}
+- 
+- 	// Convert to JSON
+- 	reqData, err := json.Marshal(reqFrame)
+- 	if err != nil {
+- 		http.Error(w, "Failed to marshal request", http.StatusInternalServerError)
+- 		return
+- 	}
+- 
+- 	// Make HTTP request to tunnel server's public endpoint
+- 	tunnelURL := fmt.Sprintf("%s/pub/%s%s", baseURL, tunnelID, r.URL.Path)
+- 	if r.URL.RawQuery != "" {
+- 		tunnelURL += "?" + r.URL.RawQuery
+- 	}
+- 
+- 	req, err := http.NewRequest(r.Method, tunnelURL, bytes.NewReader(body))
+- 	if err != nil {
+- 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+- 		return
+- 	}
+- 
+- 	// Copy headers
+- 	for k, vs := range r.Header {
+- 		for _, v := range vs {
+- 			req.Header.Add(k, v)
+- 		}
+- 	}
+- 
+- 	// Make the request
+- 	client := &http.Client{Timeout: 30 * time.Second}
+- 	resp, err := client.Do(req)
+- 	if err != nil {
+- 		http.Error(w, fmt.Sprintf("Failed to forward request: %v", err), http.StatusBadGateway)
+- 		return
+- 	}
+- 	defer resp.Body.Close()
+- 
+- 	// Copy response headers
+- 	for k, vs := range resp.Header {
+- 		for _, v := range vs {
+- 			w.Header().Add(k, v)
+- 		}
+- 	}
+- 
+- 	// Set status code
+- 	w.WriteHeader(resp.StatusCode)
+- 
+- 	// Copy response body
+- 	_, err = io.Copy(w, resp.Body)
+- 	if err != nil {
+- 		log.Printf("Error copying response body: %v", err)
+- 	}
+- 
+- 	log.Printf("Forwarded %s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
+- }
+  
+```
+
+</details>
+
+---
+
+Now let me create a test scenario to understand the real issue. The 401 error from Google suggests it's not from our tunnel server but from Google Cloud Run's authentication. Let me check if the tunnel server is configured to allow unauthenticated access:
+
+---
+
+```bash
+cd .. && curl -I https://tunnel-server-3w6u4kmniq-ue.a.run.app/health
+```
+
+```
+HTTP/2 200 
+content-type: application/json
+x-cloud-trace-context: c4f080a194f85ffc58ebcef731cf4ea6;o=1
+content-length: 298
+date: Sat, 26 Jul 2025 01:18:59 GMT
+server: Google Frontend
+alt-svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+Good, the server is accessible. Now let me check if the specific tunnel ID exists:
+
+---
+
+```bash
+curl -s https://tunnel-server-3w6u4kmniq-ue.a.run.app/health | jq
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % curl -s https://tunnel-server-3w6u4kmniq-ue.a.run.ap
+p/health | jq                                           curl -s https://tunnel-server-3w6u4kmniq-ue.a.run.ap
+p/health | jq
+{
+  "active_connections": [
+    {
+      "id": "fafc92e9-e749-4b03-a8ac-23c0b064e2d9",
+      "connected_at": "2025-07-26T01:14:21Z"
+    },
+    {
+      "id": "6d589414-0fb8-460f-b32e-ac29b649b8ab",
+      "connected_at": "2025-07-26T01:18:41Z"
+    },
+    {
+      "id": "d1214e94-b1b6-4a24-9922-31caaba4d5f1",
+      "connected_at": "2025-07-26T01:14:14Z"
+    }
+  ],
+  "connection_count": 3
+}
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+Perfect! The tunnel ID `fafc92e9-e749-4b03-a8ac-23c0b064e2d9` is actively connected. Let me test the public endpoint directly:
+
+---
+
+```bash
+curl -I https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9/
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % curl -I https://tunnel-server-3w6u4kmniq-ue.a.run.ap
+p/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9/             curl -I https://tunnel-server-3w6u4kmniq-ue.a.run.ap
+p/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9/
+HTTP/2 200 
+content-type: text/html; charset=utf-8
+etag: W/"22f-Otg9QyfGGNVYHtDYXstZGpya7iQ"
+vary: Origin
+x-powered-by: Express
+x-cloud-trace-context: 5b5bbd584366a6bbb73ab75fcda623a5;o=1
+content-length: 559
+date: Sat, 26 Jul 2025 01:19:12 GMT
+server: Google Frontend
+alt-svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+The tunnel is working perfectly! The public endpoint returns a 200 OK response. The 401 error that user B was seeing is not from our tunnel server, but might be from:
+
+1. A misconfiguration in the reverse proxy
+2. Authentication requirements on the local service itself
+
+Let me check the exact error by testing with verbose output:
+
+---
+
+```bash
+cd reverse-proxy-agent && go run . --public-url https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9 --local-port 8082 &
+```
+
+---
+
+```bash
+sleep 2 && curl -I http://localhost:8082/
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % sleep 2 && curl -I http://localhost:8082/
+HTTP/1.1 404 Not Found
+Alt-Svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+Content-Type: text/html; charset=UTF-8
+Date: Sat, 26 Jul 2025 01:19:29 GMT
+
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+I see a 404, not a 401. Let me check the full response:
+
+---
+
+```bash
+curl -v http://localhost:8082/ 2>&1 | head -30
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % curl -v http://localhost:8082/ 2>&1 | head -30
+* Host localhost:8082 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0*   Trying [::1]:8082...
+* Connected to localhost (::1) port 8082
+> GET / HTTP/1.1
+> Host: localhost:8082
+> User-Agent: curl/8.7.1
+> Accept: */*
+> 
+* Request completely sent off
+< HTTP/1.1 404 Not Found
+< Alt-Svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+< Content-Length: 1602
+< Content-Type: text/html; charset=UTF-8
+< Date: Sat, 26 Jul 2025 01:19:34 GMT
+< Referrer-Policy: no-referrer
+< 
+{ [1602 bytes data]
+100  1602  100  1602    0     0  13996      0 --:--:-- --:--:-- --:--:-- 14052
+* Connection #0 to host localhost left intact
+<!DOCTYPE html>
+<html lang=en>
+  <meta charset=utf-8>
+  <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
+  <title>Error 404 (Not Found)!!1</title>
+  <style>
+    *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:1
+5px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www
+.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hi
+dden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:
+none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/goog
+lelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:1
+92dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no
+-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_colo
+r_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.goog
+le.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 1
+00%}}#logo{display:inline-block;height:54px;width:150px}
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+That's a Google 404 page! The issue is that the reverse proxy is trying to forward to the base path of the public URL, but it's not preserving the tunnel path correctly. The httputil.ReverseProxy is removing the `/pub/{id}` prefix. Let me fix this:
+
+---
+
+<details><summary>Edit file: reverse-proxy-agent/main.go</summary>
+
+I need to fix the reverse proxy to properly preserve the tunnel path prefix when forwarding requests
+
+**Chunk 1**
+Lines added: 1, lines removed: undefined
+
+```diff
+@@ -9,4 +9,5 @@
+  	"net/url"
+  	"os"
++ 	"strings"
+  )
+  
+```
+
+**Chunk 2**
+Lines added: 16, lines removed: 5
+
+```diff
+@@ -26,11 +27,22 @@
+  	}
+  
+- 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
++ 	// Extract the base URL and tunnel path
++ 	baseURL := &url.URL{
++ 		Scheme: targetURL.Scheme,
++ 		Host:   targetURL.Host,
++ 	}
++ 	tunnelPath := targetURL.Path // This should be /pub/{id}
++ 
++ 	proxy := httputil.NewSingleHostReverseProxy(baseURL)
+  	
+- 	// Modify the director to ensure proper forwarding
+- 	originalDirector := proxy.Director
++ 	// Modify the director to preserve the tunnel path
+  	proxy.Director = func(req *http.Request) {
+- 		originalDirector(req)
+- 		log.Printf("Forwarding %s %s to %s", req.Method, req.URL.Path, targetURL)
++ 		req.URL.Scheme = baseURL.Scheme
++ 		req.URL.Host = baseURL.Host
++ 		// Prepend the tunnel path to the request path
++ 		req.URL.Path = strings.TrimSuffix(tunnelPath, "/") + req.URL.Path
++ 		req.Host = baseURL.Host
++ 		
++ 		log.Printf("Forwarding %s %s to %s%s", req.Method, req.URL.Path, baseURL, req.URL.Path)
+  	}
+  
+```
+
+**Chunk 3**
+Lines added: 3, lines removed: 2
+
+```diff
+@@ -46,6 +58,7 @@
+  
+  	listenAddr := ":" + *localPort
+- 	log.Printf("Starting reverse proxy server on %s, forwarding to %s", listenAddr, targetURL)
+- 	log.Printf("Make sure the agent for tunnel ID is connected to the server!")
++ 	log.Printf("Starting reverse proxy server on %s", listenAddr)
++ 	log.Printf("Forwarding requests to %s", *publicURL)
++ 	log.Printf("Make sure the agent for this tunnel is connected to the server!")
+  	
+  	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+```
+
+</details>
+
+---
+
+Now let me kill the old process and start a new one with the fixed code:
+
+---
+
+```bash
+pkill -f "reverse-proxy-agent"
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % pkill -f "reverse-proxy-agent"
+```
+
+---
+
+```bash
+cd reverse-proxy-agent && go run . --public-url https://tunnel-server-3w6u4kmniq-ue.a.run.app/pub/fafc92e9-e749-4b03-a8ac-23c0b064e2d9 --local-port 8082 &
+```
+
+---
+
+```bash
+sleep 2 && curl -I http://localhost:8082/
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % sleep 2 && curl -I http://localhost:8082/
+HTTP/1.1 200 OK
+Alt-Svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+Content-Length: 559
+Content-Type: text/html; charset=utf-8
+Date: Sat, 26 Jul 2025 01:20:16 GMT
+Etag: W/"22f-Otg9QyfGGNVYHtDYXstZGpya7iQ"
+Server: Google Frontend
+Vary: Origin
+X-Cloud-Trace-Context: 4f1aa44dae1e5555846d21f19b2f2aa7;o=1
+X-Powered-By: Express
+
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+Excellent! The reverse proxy is now working correctly. I get a 200 OK response. Let me get the actual content to verify:
+
+---
+
+```bash
+curl http://localhost:8082/ | head -10
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy % curl http://localhost:8082/ | head -10
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100   559  100   559    0     0   5209      0 --:--:-- --:--:-- --:--:--  5175
+
+       <!DOCTYPE html>
+        <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <link rel="icon" href="/favicon.png" >
+<title >Discovery Anything | Your personal LLM trained on anything</title>
+            <script type="module" crossorigin src="/index.js"></script>
+            <link rel="stylesheet" href="/index.css">
+(base) jenniferyang@JennifertekiMacBook-Air gcp_proxy %
+```
+
+---
+
+Perfect! The reverse proxy is working correctly now. I've successfully fixed the issue.
+
+## Summary
+
+The problem was that the original `reverse-proxy-agent` wasn't properly preserving the tunnel path (`/pub/{id}`) when forwarding requests. The httputil.ReverseProxy was stripping the path prefix, causing requests to go to the wrong URL on the Cloud Run server, which resulted in Google's 404 error page (which user B might have mistaken for a 401).
+
+The fix was to:
+1. Parse the public URL to extract the base URL and tunnel path separately
+2. Configure the reverse proxy to prepend the tunnel path to all forwarded requests
+3. Ensure the Host header is set correctly
+
+Now user B can successfully use the reverse proxy to access the remote service through their local port 3001 (or any other port they choose).
+
+The reverse proxy agent now works as intended:
+- User A exposes their local service using the regular agent
+- User B can create a local proxy to that service using the reverse-proxy-agent
+- All requests to User B's local port are transparently forwarded through the tunnel to User A's service
+
+---
+
