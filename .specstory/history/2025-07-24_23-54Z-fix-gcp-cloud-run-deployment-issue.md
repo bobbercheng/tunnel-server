@@ -2865,3 +2865,213 @@ You can then use the `ID` and `secret` to restart the agent and maintain the sam
 
 ---
 
+_**User**_
+
+add health info endpoint to list all connections on the server
+
+---
+
+_**Assistant**_
+
+<think><details><summary>Thought Process</summary>
+**Contemplating Endpoint Creation**
+
+I'm now diving into the specifics of the health info endpoint. It's clear I need to start by crafting a handler function within `server/main.go`. The core functionality will revolve around iterating through all active connections to gather the necessary data for the response.
+
+
+**Outlining Data Structures**
+
+I'm now solidifying the data structure for the health info endpoint.  Leaning towards a `ConnectionInfo` struct with an `ID` and `ConnectedAt` timestamp, making sure it can be easily converted to JSON. I'll update the `agentConn` struct to include a `connectedAt` field. This will allow for more detailed and informative reporting of active connections.
+
+
+**Constructing Health Handler**
+
+I'm now focusing on the `healthHandler` function. I've decided on a `ConnectionInfo` struct to represent each connection, with `ID` and `ConnectedAt` timestamps.  I'm adding the `connectedAt` field to the `agentConn` struct and initializing it with `time.Now()` within the `wsHandler`.  The handler function will need to iterate through the `agents` map, and gather this data to respond in JSON format. I'm considering how to best format the output now.
+
+
+**Developing the Handler Logic**
+
+I'm now focused on the specifics of the `healthHandler` function. The plan is shaping up: iterate through the `agents` map (with appropriate locking, of course), gather the agent IDs and connection timestamps, and format the output into a JSON structure for delivery. I'm adding a connection count as well. The `agentInfo` struct will hold the agent's ID and formatted connection time for JSON serialization.
+
+
+**Formulating Handler and Data**
+
+I'm now sketching the final details. I'll create the `agentConn` struct, include `connectedAt time.Time`, and initialize it. Then, I will build `healthHandler` to read agent data and format the response in JSON, incorporating an `ActiveConnections` array and connection count, formatted with RFC3339 for time.
+
+
+**Implementing the `/health` Endpoint**
+
+I've finished the `/health` endpoint. The `agentConn` struct now includes `connectedAt`, initialized in `wsHandler`. The `healthHandler` function iterates through active connections, formats the output as JSON, and includes the agent ID and connection time. I've registered the `/health` route in `main()` to serve this data. The code has been updated, and I'm ready for testing.
+
+
+**Implementing the Changes**
+
+I've successfully implemented the plan. I've added `connectedAt` to the `agentConn` struct and initialized it in `wsHandler`. Then, I've crafted the `healthHandler` function to iterate through active connections, format the output as JSON, and include the agent ID and connection time, and registered the `/health` endpoint. Now ready for testing the new endpoint.
+
+
+</details></think>
+
+---
+
+
+
+Of course. I will add a `/health` endpoint to the server that provides a list of all active agent connections.
+
+This will involve a few changes to `server/main.go`:
+1.  I'll update the `agentConn` struct to include a timestamp for when the connection was established.
+2.  I'll create a new `healthHandler` function to gather and display information about all connected agents.
+3.  I'll register this new handler to the `/health` endpoint.
+
+Here are the changes I'll make.
+
+---
+
+<details><summary>Edit file: server/main.go</summary>
+
+I will add a new `/health` endpoint to the server by creating a `healthHandler` function that lists all active agent connections, updating the `agentConn` struct to include a connection timestamp, and registering the new endpoint in the main function.
+
+**Chunk 1**
+Lines added: 4, lines removed: 3
+
+```diff
+@@ -45,7 +45,8 @@
+  
+  type agentConn struct {
+- 	id     string
+- 	secret string
+- 	ws     *websocket.Conn
++ 	id          string
++ 	secret      string
++ 	ws          *websocket.Conn
++ 	connectedAt time.Time
+  
+  	writeMu sync.Mutex
+```
+
+**Chunk 2**
+Lines added: 5, lines removed: 4
+
+```diff
+@@ -140,8 +141,9 @@
+  
+  	ac := &agentConn{
+- 		id:      id,
+- 		secret:  secret,
+- 		ws:      c,
+- 		waiters: make(map[string]chan *RespFrame),
++ 		id:          id,
++ 		secret:      secret,
++ 		ws:          c,
++ 		waiters:     make(map[string]chan *RespFrame),
++ 		connectedAt: time.Now(),
+  	}
+  
+```
+
+**Chunk 3**
+Lines added: 27, lines removed: undefined
+
+```diff
+@@ -197,4 +199,31 @@
+  	}
+  }
++ 
++ func healthHandler(w http.ResponseWriter, r *http.Request) {
++ 	agentsMu.RLock()
++ 	defer agentsMu.RUnlock()
++ 
++ 	type agentInfo struct {
++ 		ID          string `json:"id"`
++ 		ConnectedAt string `json:"connected_at"`
++ 	}
++ 
++ 	info := struct {
++ 		ActiveConnections []agentInfo `json:"active_connections"`
++ 		ConnectionCount   int         `json:"connection_count"`
++ 	}{
++ 		ActiveConnections: make([]agentInfo, 0, len(agents)),
++ 		ConnectionCount:   len(agents),
++ 	}
++ 
++ 	for id, conn := range agents {
++ 		info.ActiveConnections = append(info.ActiveConnections, agentInfo{
++ 			ID:          id,
++ 			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
++ 		})
++ 	}
++ 
++ 	writeJSON(w, http.StatusOK, info)
++ }
+  
+  func publicHandler(w http.ResponseWriter, r *http.Request) {
+```
+
+**Chunk 4**
+Lines added: 1, lines removed: undefined
+
+```diff
+@@ -309,4 +338,5 @@
+  	mux.HandleFunc("/ws", wsHandler) // agent websocket
+  	mux.HandleFunc("/pub/", publicHandler)
++ 	mux.HandleFunc("/health", healthHandler)
+  
+  	port := os.Getenv("PORT")
+```
+
+</details>
+
+---
+
+Now that I've added the `/health` endpoint to the server, I'll redeploy it to Cloud Run. Once the deployment is complete, you will be able to check the status of all active connections.
+
+---
+
+```bash
+./deploy.sh
+```
+
+```
+(base) jenniferyang@JennifertekiMacBook-Air server % ./deploy.sh
+Building Docker image using Cloud Build...
+Creating temporary archive of 5 file(s) totalling 9.1 KiB before compression.
+Uploading tarball of [.] to [gs://contact-center-insights-poc_cloudbuild/source/1753488884.154564-b605c276f6
+4947f4b89e675ea039c55f.tgz]
+Created [https://cloudbuild.googleapis.com/v1/projects/contact-center-insights-poc/locations/global/builds/2
+421d774-9dd3-49bf-8e74-8a213cf75e32].
+Logs are available at [ https://console.cloud.google.com/cloud-build/builds/2421d774-9dd3-49bf-8e74-8a213cf7
+5e32?project=56084501768 ].
+Waiting for build to complete. Polling interval: 1 second(s).
+------------------------------------------- REMOTE BUILD OUTPUT --------------------------------------------
+starting build "2421d774-9dd3-49bf-8e74-8a213cf75e32"
+
+FETCHSOURCE
+Fetching storage object: gs://contact-center-insights-poc_cloudbuild/source/1753488884.154564-b605c276f64947
+f4b89e675ea039c55f.tgz#1753488884617629
+Copying gs://contact-center-insights-poc_cloudbuild/source/1753488884.154564-b605c276f64947f4b89e675ea039c55
+f.tgz#1753488884617629...
+/ [1 files][  4.0 KiB/  4.0 KiB]                                                
+Operation completed over 1 objects/4.0 KiB.
+BUILD
+Already have image (with digest): gcr.io/cloud-builders/docker
+Sending build context to Docker daemon  14.34kB
+Step 1/11 : FROM golang:1.22 AS build
+1.22: Pulling from library/golang
+a492eee5e559: Pulling fs layer
+32b550be6cb6: Pulling fs layer
+35af2a7690f2: Pulling fs layer
+3b7f19923e15: Pulling fs layer
+afa154b433c7: Pulling fs layer
+1451027d3c0e: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+3b7f19923e15: Waiting
+afa154b433c7: Waiting
+1451027d3c0e: Waiting
+4f4fb700ef54: Waiting
+```
+
+---
+
+
+
+---
+

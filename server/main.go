@@ -44,9 +44,10 @@ type RespFrame struct {
 }
 
 type agentConn struct {
-	id     string
-	secret string
-	ws     *websocket.Conn
+	id          string
+	secret      string
+	ws          *websocket.Conn
+	connectedAt time.Time
 
 	writeMu sync.Mutex
 
@@ -139,10 +140,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	defer c.Close(websocket.StatusInternalError, "server error")
 
 	ac := &agentConn{
-		id:      id,
-		secret:  secret,
-		ws:      c,
-		waiters: make(map[string]chan *RespFrame),
+		id:          id,
+		secret:      secret,
+		ws:          c,
+		waiters:     make(map[string]chan *RespFrame),
+		connectedAt: time.Now(),
 	}
 
 	agentsMu.Lock()
@@ -195,6 +197,33 @@ func agentReadLoop(ctx context.Context, ac *agentConn) error {
 			// ignore
 		}
 	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	agentsMu.RLock()
+	defer agentsMu.RUnlock()
+
+	type agentInfo struct {
+		ID          string `json:"id"`
+		ConnectedAt string `json:"connected_at"`
+	}
+
+	info := struct {
+		ActiveConnections []agentInfo `json:"active_connections"`
+		ConnectionCount   int         `json:"connection_count"`
+	}{
+		ActiveConnections: make([]agentInfo, 0, len(agents)),
+		ConnectionCount:   len(agents),
+	}
+
+	for id, conn := range agents {
+		info.ActiveConnections = append(info.ActiveConnections, agentInfo{
+			ID:          id,
+			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, info)
 }
 
 func publicHandler(w http.ResponseWriter, r *http.Request) {
@@ -308,6 +337,7 @@ func main() {
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/ws", wsHandler) // agent websocket
 	mux.HandleFunc("/pub/", publicHandler)
+	mux.HandleFunc("/health", healthHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
