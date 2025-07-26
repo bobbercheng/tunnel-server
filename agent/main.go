@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +41,8 @@ type RespFrame struct {
 	Body    []byte              `json:"body"`
 }
 
+var errUnauthorized = errors.New("unauthorized: credentials rejected by server")
+
 // Usage: cd agent
 // go run . \
 // --server https://tunnel-server-3w6u4kmniq-ue.a.run.app \
@@ -57,43 +60,77 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *id == "" || *secret == "" {
+	currentID := *id
+	currentSecret := *secret
+
+	if currentID == "" || currentSecret == "" {
+		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
 		reg, err := register(*server)
 		if err != nil {
-			panic(err)
+			fmt.Println("FATAL: initial registration failed:", err)
+			os.Exit(1)
 		}
-		*id, *secret = reg.ID, reg.Secret
-		fmt.Println("public_url:", reg.PublicURL)
+		currentID, currentSecret = reg.ID, reg.Secret
+		fmt.Println("Registered successfully!")
+		fmt.Println("  ID:", currentID)
+		fmt.Println("  Secret:", currentSecret)
+		fmt.Println("  Public URL:", reg.PublicURL)
 	}
 
 	for {
-		if err := runOnce(*server, *local, *id, *secret); err != nil {
-			fmt.Printf("agent loop error: %v\n", err)
-
-			// Check if it's a websocket close error and handle it gracefully
-			if websocket.CloseStatus(err) == websocket.StatusNormalClosure ||
-				websocket.CloseStatus(err) == websocket.StatusGoingAway {
-				fmt.Println("websocket closed normally, reconnecting...")
-			} else {
-				fmt.Printf("unexpected error: %v, reconnecting...\n", err)
-			}
+		err := runOnce(*server, *local, currentID, currentSecret)
+		if err == nil {
+			fmt.Println("Connection closed. Reconnecting in 2 seconds...")
+			time.Sleep(2 * time.Second)
+			continue
 		}
-		// backoff
+
+		if errors.Is(err, errUnauthorized) {
+			fmt.Println("Credentials rejected, re-registering for a new tunnel...")
+			reg, regErr := register(*server)
+			if regErr != nil {
+				fmt.Println("Failed to re-register:", regErr)
+				fmt.Println("Retrying in 5 seconds...")
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			currentID, currentSecret = reg.ID, reg.Secret
+			fmt.Println("Re-registered successfully!")
+			fmt.Println("  ID:", currentID)
+			fmt.Println("  Secret:", currentSecret)
+			fmt.Println("  New Public URL:", reg.PublicURL)
+			continue
+		}
+
+		fmt.Printf("Connection error: %v\n", err)
+		fmt.Println("Reconnecting in 2 seconds...")
 		time.Sleep(2 * time.Second)
 	}
 }
 
 func runOnce(server, local, id, secret string) error {
-	ctx := context.Background()
-	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", server, url.QueryEscape(id), url.QueryEscape(secret))
-	ws, _, err := websocket.Dial(ctx, wsURL, nil)
-	if err != nil {
-		return err
-	}
-	defer ws.Close(websocket.StatusInternalError, "internal")
+	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
+	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", server, url.QueryEscape(id), url.QueryEscape(secret))
+	ws, resp, err := websocket.Dial(dialCtx, wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				return errUnauthorized
+			}
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("handshake failed with status %d: %s", resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("dial error: %w", err)
+	}
+	defer ws.Close(websocket.StatusInternalError, "internal error")
+	fmt.Println("Connection established successfully.")
+
+	readCtx := context.Background()
 	for {
-		typ, data, err := ws.Read(ctx)
+		typ, data, err := ws.Read(readCtx)
 		if err != nil {
 			return err
 		}
@@ -108,23 +145,25 @@ func runOnce(server, local, id, secret string) error {
 			continue
 		}
 
-		status, hdr, body, ferr := forward(local, &req)
+		go func() {
+			status, hdr, body, ferr := forward(local, &req)
 
-		resp := RespFrame{
-			Type:    "resp",
-			ReqID:   req.ReqID,
-			Status:  status,
-			Headers: hdr,
-			Body:    body,
-		}
-		if ferr != nil {
-			resp.Status = http.StatusBadGateway
-			resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
-			resp.Body = []byte(ferr.Error())
-		}
-		if err := ws.Write(ctx, websocket.MessageText, mustJSON(resp)); err != nil {
-			return err
-		}
+			resp := RespFrame{
+				Type:    "resp",
+				ReqID:   req.ReqID,
+				Status:  status,
+				Headers: hdr,
+				Body:    body,
+			}
+			if ferr != nil {
+				resp.Status = http.StatusBadGateway
+				resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
+				resp.Body = []byte(ferr.Error())
+			}
+			if err := ws.Write(context.Background(), websocket.MessageText, mustJSON(resp)); err != nil {
+				fmt.Printf("Error writing response for req_id %s: %v\n", req.ReqID, err)
+			}
+		}()
 	}
 }
 

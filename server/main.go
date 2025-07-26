@@ -158,7 +158,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentsMu.Lock()
-	delete(agents, id)
+	// Only delete if the agent in the map is still this one.
+	// Another connection might have replaced it.
+	if currentAC, ok := agents[id]; ok && currentAC == ac {
+		delete(agents, id)
+		log.Printf("agent %s disconnected and removed", id)
+	}
 	agentsMu.Unlock()
 
 	c.Close(websocket.StatusNormalClosure, "bye")
