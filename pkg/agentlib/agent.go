@@ -3,6 +3,8 @@ package agentlib
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	crypto "tunnel.local/crypto"
 
 	"nhooyr.io/websocket"
 )
@@ -38,6 +42,12 @@ type RespFrame struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers"`
 	Body    []byte              `json:"body"`
+}
+
+// HandshakeFrame is used for initial key exchange
+type HandshakeFrame struct {
+	Type string `json:"type"` // "handshake"
+	Salt string `json:"salt"` // base64 encoded salt
 }
 
 var ErrUnauthorized = errors.New("unauthorized: credentials rejected by server")
@@ -123,7 +133,50 @@ func (a *Agent) runOnce() error {
 	// Set larger message size limit (10MB instead of default 32KB)
 	ws.SetReadLimit(10 * 1024 * 1024)
 
-	fmt.Println("Connection established successfully.")
+	// Perform key exchange
+	ctx := context.Background()
+
+	// Read handshake from server
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read handshake: %w", err)
+	}
+
+	var handshake HandshakeFrame
+	if err := json.Unmarshal(data, &handshake); err != nil {
+		return fmt.Errorf("invalid handshake format: %w", err)
+	}
+
+	if handshake.Type != "handshake" {
+		return fmt.Errorf("expected handshake message, got: %s", handshake.Type)
+	}
+
+	// Decode salt
+	salt, err := base64.StdEncoding.DecodeString(handshake.Salt)
+	if err != nil {
+		return fmt.Errorf("invalid salt in handshake: %w", err)
+	}
+
+	// Create cipher with the same master secret but isServer=false
+	masterSecret := sha256Sum([]byte(a.Secret))
+	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false) // false = isClient
+	if err != nil {
+		return fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Send handshake ACK
+	handshakeResp := struct {
+		Type string `json:"type"`
+		ACK  bool   `json:"ack"`
+	}{
+		Type: "handshake",
+		ACK:  true,
+	}
+	if err := ws.Write(ctx, websocket.MessageText, mustJSON(handshakeResp)); err != nil {
+		return fmt.Errorf("failed to send handshake ACK: %w", err)
+	}
+
+	fmt.Println("Connection established successfully with encryption.")
 
 	// Create a context that will be cancelled when the connection closes
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -138,6 +191,24 @@ func (a *Agent) runOnce() error {
 	// Channel to signal connection closure
 	done := make(chan struct{})
 
+	// Helper function to write encrypted messages
+	writeEncrypted := func(v any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+
+		// Marshal to JSON
+		jsonData := mustJSON(v)
+
+		// Encrypt the data
+		encryptedData, err := cipher.Encrypt(jsonData)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt message: %w", err)
+		}
+
+		// Send as binary WebSocket message
+		return ws.Write(ctx, websocket.MessageBinary, encryptedData)
+	}
+
 	// Start a goroutine to read messages
 	go func() {
 		defer close(done)
@@ -148,11 +219,19 @@ func (a *Agent) runOnce() error {
 				cancelCtx()
 				return
 			}
-			if typ != websocket.MessageText {
+			if typ != websocket.MessageBinary {
 				continue
 			}
+
+			// Decrypt the message
+			plaintext, err := cipher.Decrypt(data)
+			if err != nil {
+				fmt.Printf("Failed to decrypt message: %v\n", err)
+				continue
+			}
+
 			var req ReqFrame
-			if err := json.Unmarshal(data, &req); err != nil {
+			if err := json.Unmarshal(plaintext, &req); err != nil {
 				continue
 			}
 			if req.Type != "req" {
@@ -163,10 +242,6 @@ func (a *Agent) runOnce() error {
 			wg.Add(1)
 			go func(req ReqFrame) {
 				defer wg.Done()
-
-				// Create a context for this specific request
-				reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Second)
-				defer reqCancel()
 
 				// Check if connection is still alive before processing
 				select {
@@ -195,11 +270,9 @@ func (a *Agent) runOnce() error {
 				case <-ctx.Done():
 					return
 				default:
-					// Serialize the response
+					// Check response size before encryption
 					respData := mustJSON(resp)
-
-					// Check if response is too large (leave some room for WebSocket framing)
-					if len(respData) > 9*1024*1024 {
+					if len(respData) > crypto.MaxPlaintextSize {
 						// Response too large, send error instead
 						errResp := RespFrame{
 							Type:    "resp",
@@ -208,18 +281,18 @@ func (a *Agent) runOnce() error {
 							Headers: map[string][]string{"Content-Type": {"text/plain"}},
 							Body:    []byte("Response too large to send through tunnel"),
 						}
-						respData = mustJSON(errResp)
+						if err := writeEncrypted(errResp); err != nil {
+							select {
+							case <-ctx.Done():
+								// Connection was closed, this is expected
+							default:
+								fmt.Printf("Error writing error response for req_id %s: %v\n", req.ReqID, err)
+							}
+						}
+						return
 					}
 
-					// Try to write with a timeout, using mutex to prevent concurrent writes
-					writeCtx, writeCancel := context.WithTimeout(reqCtx, 10*time.Second)
-					defer writeCancel()
-
-					writeMu.Lock()
-					err := ws.Write(writeCtx, websocket.MessageText, respData)
-					writeMu.Unlock()
-
-					if err != nil {
+					if err := writeEncrypted(resp); err != nil {
 						// Only log if it's not due to context cancellation
 						select {
 						case <-ctx.Done():
@@ -364,4 +437,9 @@ func (a *Agent) register() (*RegisterResp, error) {
 func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// Helper function for SHA256 hash
+func sha256Sum(data []byte) [32]byte {
+	return sha256.Sum256(data)
 }

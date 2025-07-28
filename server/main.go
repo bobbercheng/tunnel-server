@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	crypto "tunnel.local/crypto"
 
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
@@ -43,10 +46,17 @@ type RespFrame struct {
 	Body    []byte              `json:"body"`
 }
 
+// HandshakeFrame is used for initial key exchange
+type HandshakeFrame struct {
+	Type string `json:"type"` // "handshake"
+	Salt string `json:"salt"` // base64 encoded salt
+}
+
 type agentConn struct {
 	id          string
 	secret      string
 	ws          *websocket.Conn
+	cipher      *crypto.StreamCipher
 	connectedAt time.Time
 
 	writeMu sync.Mutex
@@ -54,6 +64,23 @@ type agentConn struct {
 	// reqID -> channel to deliver response
 	respMu  sync.Mutex
 	waiters map[string]chan *RespFrame
+}
+
+func (a *agentConn) writeEncrypted(ctx context.Context, v any) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+
+	// Marshal to JSON
+	jsonData := mustJSON(v)
+
+	// Encrypt the data
+	encryptedData, err := a.cipher.Encrypt(jsonData)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt message: %w", err)
+	}
+
+	// Send as binary WebSocket message
+	return a.ws.Write(ctx, websocket.MessageBinary, encryptedData)
 }
 
 func (a *agentConn) write(ctx context.Context, v any) error {
@@ -142,10 +169,46 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Set larger message size limit to match agent (10MB)
 	c.SetReadLimit(10 * 1024 * 1024)
 
+	// Perform key exchange
+	kx := crypto.NewKeyExchange(secret)
+	cipher, err := kx.DeriveStreamCipher(true) // true = isServer
+	if err != nil {
+		log.Printf("failed to create cipher: %v", err)
+		c.Close(websocket.StatusInternalError, "crypto error")
+		return
+	}
+
+	// Send handshake with salt
+	handshake := HandshakeFrame{
+		Type: "handshake",
+		Salt: base64.StdEncoding.EncodeToString(kx.GetSalt()),
+	}
+	if err := c.Write(ctx, websocket.MessageText, mustJSON(handshake)); err != nil {
+		log.Printf("failed to send handshake: %v", err)
+		return
+	}
+
+	// Wait for handshake response
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		log.Printf("failed to read handshake response: %v", err)
+		return
+	}
+
+	var handshakeResp struct {
+		Type string `json:"type"`
+		ACK  bool   `json:"ack"`
+	}
+	if err := json.Unmarshal(data, &handshakeResp); err != nil || handshakeResp.Type != "handshake" || !handshakeResp.ACK {
+		log.Printf("invalid handshake response")
+		return
+	}
+
 	ac := &agentConn{
 		id:          id,
 		secret:      secret,
 		ws:          c,
+		cipher:      cipher,
 		waiters:     make(map[string]chan *RespFrame),
 		connectedAt: time.Now(),
 	}
@@ -154,7 +217,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	agents[id] = ac
 	agentsMu.Unlock()
 
-	log.Printf("agent %s connected", id)
+	log.Printf("agent %s connected with encrypted tunnel", id)
 
 	// reader goroutine: dispatch responses back to waiting requests
 	err = agentReadLoop(ctx, ac)
@@ -180,19 +243,27 @@ func agentReadLoop(ctx context.Context, ac *agentConn) error {
 		if err != nil {
 			return err
 		}
-		if typ != websocket.MessageText {
+		if typ != websocket.MessageBinary {
 			continue
 		}
+
+		// Decrypt the message
+		plaintext, err := ac.cipher.Decrypt(data)
+		if err != nil {
+			log.Printf("failed to decrypt message from agent %s: %v", ac.id, err)
+			continue
+		}
+
 		var base struct {
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal(data, &base); err != nil {
+		if err := json.Unmarshal(plaintext, &base); err != nil {
 			continue
 		}
 		switch base.Type {
 		case "resp":
 			var rf RespFrame
-			if err := json.Unmarshal(data, &rf); err != nil {
+			if err := json.Unmarshal(plaintext, &rf); err != nil {
 				continue
 			}
 			ac.deliver(&rf)
@@ -209,6 +280,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	type agentInfo struct {
 		ID          string `json:"id"`
 		ConnectedAt string `json:"connected_at"`
+		Encrypted   bool   `json:"encrypted"`
 	}
 
 	info := struct {
@@ -223,6 +295,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		info.ActiveConnections = append(info.ActiveConnections, agentInfo{
 			ID:          id,
 			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
+			Encrypted:   conn.cipher != nil,
 		})
 	}
 
@@ -275,7 +348,8 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	if err := ac.write(ctx, req); err != nil {
+	// Send encrypted request
+	if err := ac.writeEncrypted(ctx, req); err != nil {
 		http.Error(w, "failed to write to agent: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -353,7 +427,7 @@ func main() {
 		WriteTimeout: 0,
 		IdleTimeout:  0,
 	}
-	log.Printf("listening on :%s", port)
+	log.Printf("listening on :%s with encrypted tunnels", port)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"gcp-proxy/pkg/agentlib"
+	"tunnel.local/agentlib"
 )
 
 func main() {

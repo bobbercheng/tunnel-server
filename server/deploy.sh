@@ -6,9 +6,18 @@ export REGION=us-east1
 export SERVICE=tunnel-server
 export IMAGE_NAME=gcr.io/$PROJECT_ID/tunnel-server
 
-# Build using Cloud Build (no local Docker required)
+# Build using Cloud Build from parent directory to include crypto package
 echo "Building Docker image using Cloud Build..."
+cd ..
+
+# Copy Dockerfile to parent directory as expected name
+cp server/Dockerfile ./Dockerfile
+
+# Submit build 
 gcloud builds submit --tag $IMAGE_NAME .
+
+# Clean up
+rm ./Dockerfile
 
 # Deploy to Cloud Run
 echo "Deploying to Cloud Run..."
