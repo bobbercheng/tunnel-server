@@ -22,10 +22,17 @@ import (
 	"nhooyr.io/websocket"
 )
 
+type RegisterReq struct {
+	Protocol string `json:"protocol"` // "http" or "tcp"
+	Port     int    `json:"port"`     // for TCP tunnels, the local port being tunneled
+}
+
 type RegisterResp struct {
 	ID        string `json:"id"`
 	Secret    string `json:"secret"`
 	PublicURL string `json:"public_url"`
+	Protocol  string `json:"protocol"`
+	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
 }
 
 type ReqFrame struct {
@@ -52,6 +59,25 @@ type HandshakeFrame struct {
 	Salt string `json:"salt"` // base64 encoded salt
 }
 
+// TCP Frame types for raw TCP tunneling
+type TcpConnectFrame struct {
+	Type   string `json:"type"`    // "tcp_connect"
+	ConnID string `json:"conn_id"` // unique connection identifier
+	Port   int    `json:"port"`    // destination port
+}
+
+type TcpDataFrame struct {
+	Type   string `json:"type"`    // "tcp_data"
+	ConnID string `json:"conn_id"` // connection identifier
+	Data   []byte `json:"data"`    // raw TCP data
+}
+
+type TcpDisconnectFrame struct {
+	Type   string `json:"type"`    // "tcp_disconnect"
+	ConnID string `json:"conn_id"` // connection identifier
+	Reason string `json:"reason"`  // disconnect reason
+}
+
 type agentConn struct {
 	id          string
 	secret      string
@@ -61,9 +87,22 @@ type agentConn struct {
 
 	writeMu sync.Mutex
 
-	// reqID -> channel to deliver response
+	// reqID -> channel to deliver response (for HTTP)
 	respMu  sync.Mutex
 	waiters map[string]chan *RespFrame
+	
+	// TCP connection management
+	tcpConnsMu sync.Mutex
+	tcpConns   map[string]*TcpConn // connID -> TcpConn
+}
+
+// TcpConn represents an active TCP connection through the tunnel
+type TcpConn struct {
+	id       string
+	dataCh   chan []byte
+	closeCh  chan string
+	closed   bool
+	closeMu  sync.Mutex
 }
 
 func (a *agentConn) writeEncrypted(ctx context.Context, v any) error {
@@ -108,11 +147,66 @@ func (a *agentConn) deliver(resp *RespFrame) {
 	}
 }
 
+func (a *agentConn) deliverTcpData(frame *TcpDataFrame) {
+	a.tcpConnsMu.Lock()
+	conn, ok := a.tcpConns[frame.ConnID]
+	a.tcpConnsMu.Unlock()
+	
+	if ok && !conn.isClosed() {
+		select {
+		case conn.dataCh <- frame.Data:
+		default:
+			// Channel full, drop data
+		}
+	}
+}
+
+func (a *agentConn) deliverTcpDisconnect(frame *TcpDisconnectFrame) {
+	a.tcpConnsMu.Lock()
+	conn, ok := a.tcpConns[frame.ConnID]
+	if ok {
+		delete(a.tcpConns, frame.ConnID)
+	}
+	a.tcpConnsMu.Unlock()
+	
+	if ok {
+		conn.close(frame.Reason)
+	}
+}
+
+func (tc *TcpConn) isClosed() bool {
+	tc.closeMu.Lock()
+	defer tc.closeMu.Unlock()
+	return tc.closed
+}
+
+func (tc *TcpConn) close(reason string) {
+	tc.closeMu.Lock()
+	defer tc.closeMu.Unlock()
+	if !tc.closed {
+		tc.closed = true
+		select {
+		case tc.closeCh <- reason:
+		default:
+		}
+		close(tc.dataCh)
+		close(tc.closeCh)
+	}
+}
+
+// ---- tunnel metadata ----
+
+type TunnelInfo struct {
+	Secret   string
+	Protocol string // "http" or "tcp"
+	Port     int    // for TCP tunnels
+}
+
 // ---- global in-memory stores (PoC only) ----
 
 var (
-	// tunnel id -> secret
-	tunnels   = map[string]string{}
+	// tunnel id -> tunnel info
+	tunnels   = map[string]*TunnelInfo{}
 	tunnelsMu sync.RWMutex
 
 	// tunnel id -> active agent connection
@@ -123,11 +217,40 @@ var (
 // ---- handlers ----
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
+	// Parse request body for protocol and port info
+	var req RegisterReq
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			// Default to HTTP if no body or invalid JSON (backward compatibility)
+			req.Protocol = "http"
+			req.Port = 0
+		}
+	}
+	
+	// Validate and set defaults
+	if req.Protocol == "" {
+		req.Protocol = "http"
+	}
+	if req.Protocol != "http" && req.Protocol != "tcp" {
+		http.Error(w, "protocol must be 'http' or 'tcp'", http.StatusBadRequest)
+		return
+	}
+	if req.Protocol == "tcp" && req.Port <= 0 {
+		http.Error(w, "port is required for TCP tunnels", http.StatusBadRequest)
+		return
+	}
+
 	id := uuid.NewString()
 	secret := randHex(32)
 
+	tunnelInfo := &TunnelInfo{
+		Secret:   secret,
+		Protocol: req.Protocol,
+		Port:     req.Port,
+	}
+
 	tunnelsMu.Lock()
-	tunnels[id] = secret
+	tunnels[id] = tunnelInfo
 	tunnelsMu.Unlock()
 
 	publicBase := os.Getenv("PUBLIC_BASE_URL")
@@ -140,10 +263,23 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		publicBase = fmt.Sprintf("%s://%s", scheme, host)
 	}
 
+	var publicURL string
+	var tcpPort int
+	if req.Protocol == "tcp" {
+		// For TCP tunnels, we'll create a different endpoint structure
+		publicURL = fmt.Sprintf("%s/tcp/%s", publicBase, id)
+		tcpPort = req.Port
+	} else {
+		// HTTP tunnels use the existing /pub/ endpoint
+		publicURL = fmt.Sprintf("%s/pub/%s", publicBase, id)
+	}
+
 	resp := RegisterResp{
 		ID:        id,
 		Secret:    secret,
-		PublicURL: fmt.Sprintf("%s/pub/%s", publicBase, id),
+		PublicURL: publicURL,
+		Protocol:  req.Protocol,
+		TcpPort:   tcpPort,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -210,6 +346,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		ws:          c,
 		cipher:      cipher,
 		waiters:     make(map[string]chan *RespFrame),
+		tcpConns:    make(map[string]*TcpConn),
 		connectedAt: time.Now(),
 	}
 
@@ -267,6 +404,18 @@ func agentReadLoop(ctx context.Context, ac *agentConn) error {
 				continue
 			}
 			ac.deliver(&rf)
+		case "tcp_data":
+			var tf TcpDataFrame
+			if err := json.Unmarshal(plaintext, &tf); err != nil {
+				continue
+			}
+			ac.deliverTcpData(&tf)
+		case "tcp_disconnect":
+			var tf TcpDisconnectFrame
+			if err := json.Unmarshal(plaintext, &tf); err != nil {
+				continue
+			}
+			ac.deliverTcpDisconnect(&tf)
 		default:
 			// ignore
 		}
@@ -379,8 +528,14 @@ func validateTunnel(id, secret string) bool {
 	}
 	tunnelsMu.RLock()
 	defer tunnelsMu.RUnlock()
-	s, ok := tunnels[id]
-	return ok && s == secret
+	info, ok := tunnels[id]
+	return ok && info.Secret == secret
+}
+
+func getTunnelInfo(id string) *TunnelInfo {
+	tunnelsMu.RLock()
+	defer tunnelsMu.RUnlock()
+	return tunnels[id]
 }
 
 func getAgent(id string) *agentConn {
@@ -403,6 +558,118 @@ func mustJSON(v any) []byte {
 	return b
 }
 
+func tcpHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract tunnel ID from path: /tcp/{id}
+	path := strings.TrimPrefix(r.URL.Path, "/tcp/")
+	if path == "" {
+		http.Error(w, "missing tunnel id", http.StatusBadRequest)
+		return
+	}
+	
+	id := path
+	ac := getAgent(id)
+	if ac == nil {
+		http.Error(w, "agent not connected", http.StatusBadGateway)
+		return
+	}
+	
+	// Verify this is a TCP tunnel
+	tunnelInfo := getTunnelInfo(id)
+	if tunnelInfo == nil || tunnelInfo.Protocol != "tcp" {
+		http.Error(w, "not a TCP tunnel", http.StatusBadRequest)
+		return
+	}
+	
+	// Upgrade to WebSocket for TCP streaming
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		log.Printf("tcp websocket accept: %v", err)
+		return
+	}
+	defer c.Close(websocket.StatusInternalError, "server error")
+	
+	handleTcpConnection(r.Context(), c, ac, tunnelInfo.Port)
+}
+
+func handleTcpConnection(ctx context.Context, ws *websocket.Conn, ac *agentConn, port int) {
+	connID := uuid.NewString()
+	
+	// Create TCP connection tracking
+	tcpConn := &TcpConn{
+		id:      connID,
+		dataCh:  make(chan []byte, 100),
+		closeCh: make(chan string, 1),
+		closed:  false,
+	}
+	
+	ac.tcpConnsMu.Lock()
+	ac.tcpConns[connID] = tcpConn
+	ac.tcpConnsMu.Unlock()
+	
+	// Send TCP connect frame to agent
+	connectFrame := TcpConnectFrame{
+		Type:   "tcp_connect",
+		ConnID: connID,
+		Port:   port,
+	}
+	
+	if err := ac.writeEncrypted(ctx, connectFrame); err != nil {
+		log.Printf("failed to send tcp connect: %v", err)
+		return
+	}
+	
+	// Handle bidirectional data flow
+	go func() {
+		// Read from WebSocket and send to agent
+		for {
+			_, data, err := ws.Read(ctx)
+			if err != nil {
+				// Send disconnect to agent
+				disconnectFrame := TcpDisconnectFrame{
+					Type:   "tcp_disconnect",
+					ConnID: connID,
+					Reason: "client disconnected",
+				}
+				ac.writeEncrypted(ctx, disconnectFrame)
+				return
+			}
+			
+			// Forward data to agent
+			dataFrame := TcpDataFrame{
+				Type:   "tcp_data",
+				ConnID: connID,
+				Data:   data,
+			}
+			if err := ac.writeEncrypted(ctx, dataFrame); err != nil {
+				log.Printf("failed to send tcp data: %v", err)
+				return
+			}
+		}
+	}()
+	
+	// Read from agent and send to WebSocket
+	for {
+		select {
+		case data, ok := <-tcpConn.dataCh:
+			if !ok {
+				return // Connection closed
+			}
+			if err := ws.Write(ctx, websocket.MessageBinary, data); err != nil {
+				log.Printf("failed to write to websocket: %v", err)
+				return
+			}
+		case reason := <-tcpConn.closeCh:
+			log.Printf("TCP connection %s closed: %s", connID, reason)
+			ws.Close(websocket.StatusNormalClosure, reason)
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
@@ -414,6 +681,7 @@ func main() {
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/ws", wsHandler) // agent websocket
 	mux.HandleFunc("/pub/", publicHandler)
+	mux.HandleFunc("/tcp/", tcpHandler)
 	mux.HandleFunc("/health", healthHandler)
 
 	port := os.Getenv("PORT")

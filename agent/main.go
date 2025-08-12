@@ -16,7 +16,15 @@ func main() {
 	local := flag.String("local", "http://127.0.0.1:8080", "local http service")
 	id := flag.String("id", "", "tunnel id (optional)")
 	secret := flag.String("secret", "", "tunnel secret (optional)")
+	protocol := flag.String("protocol", "http", "protocol type: 'http' or 'tcp'")
+	port := flag.Int("port", 0, "port number (required for TCP tunnels)")
 	flag.Parse()
+
+	// Validate TCP configuration
+	if *protocol == "tcp" && *port <= 0 {
+		fmt.Println("--port is required for TCP tunnels")
+		os.Exit(1)
+	}
 
 	var serverURL, tunnelID, tunnelSecret string
 
@@ -53,6 +61,8 @@ func main() {
 		LocalURL:  *local,
 		ID:        tunnelID,
 		Secret:    tunnelSecret,
+		Protocol:  *protocol,
+		Port:      *port,
 	}
 
 	agent.Run()
