@@ -95,6 +95,24 @@ type TcpDisconnectFrame struct {
 	Reason string `json:"reason"`  // disconnect reason
 }
 
+// Ping/Pong frames for connection health monitoring
+type PingFrame struct {
+	Type      string    `json:"type"`      // "ping"
+	Timestamp time.Time `json:"timestamp"` // when ping was sent
+}
+
+type PongFrame struct {
+	Type      string    `json:"type"`      // "pong"
+	Timestamp time.Time `json:"timestamp"` // original ping timestamp
+}
+
+// TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
+type TunnelInfoFrame struct {
+	Type     string `json:"type"`     // "tunnel_info"
+	Protocol string `json:"protocol"` // "http" or "tcp"
+	Port     int    `json:"port"`     // for TCP tunnels
+}
+
 type agentConn struct {
 	id          string
 	secret      string
@@ -115,6 +133,10 @@ type agentConn struct {
 	// Chunked response management
 	chunkedMu        sync.Mutex
 	chunkedResponses map[string]*ChunkedResponse // reqID -> ChunkedResponse
+
+	// Connection health monitoring
+	lastPong time.Time
+	pingMu   sync.RWMutex
 }
 
 // ChunkedResponse tracks assembly of chunked responses
@@ -392,10 +414,13 @@ func (tc *TcpConn) close(reason string) {
 // ---- tunnel metadata ----
 
 type TunnelInfo struct {
-	Secret   string
-	Protocol string // "http" or "tcp"
-	Port     int    // for TCP tunnels
+	Secret   string    `json:"secret"`
+	Protocol string    `json:"protocol"` // "http" or "tcp"
+	Port     int       `json:"port"`     // for TCP tunnels
+	Created  time.Time `json:"created"`  // when tunnel was created
 }
+
+// Cloud Run: Stateless deployment - no persistence structs needed
 
 // ---- global in-memory stores (PoC only) ----
 
@@ -442,11 +467,15 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		Secret:   secret,
 		Protocol: req.Protocol,
 		Port:     req.Port,
+		Created:  time.Now(),
 	}
 
+	// Register in memory (Cloud Run stateless)
 	tunnelsMu.Lock()
 	tunnels[id] = tunnelInfo
 	tunnelsMu.Unlock()
+
+	log.Printf("Registered tunnel %s (stateless)", id)
 
 	publicBase := os.Getenv("PUBLIC_BASE_URL")
 	if publicBase == "" {
@@ -544,6 +573,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		tcpConns:         make(map[string]*TcpConn),
 		chunkedResponses: make(map[string]*ChunkedResponse),
 		connectedAt:      time.Now(),
+		lastPong:         time.Now(), // Initialize ping monitoring
 	}
 
 	agentsMu.Lock()
@@ -551,6 +581,42 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	agentsMu.Unlock()
 
 	log.Printf("agent %s connected with encrypted tunnel", id)
+
+	// Start ping monitoring goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // Ping every 30 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Send ping to agent
+				pingFrame := PingFrame{
+					Type:      "ping",
+					Timestamp: time.Now(),
+				}
+
+				if err := ac.writeEncrypted(ctx, pingFrame); err != nil {
+					log.Printf("Failed to send ping to agent %s: %v", id, err)
+					return
+				}
+
+				// Check if last pong is too old
+				ac.pingMu.RLock()
+				lastPong := ac.lastPong
+				ac.pingMu.RUnlock()
+
+				if time.Since(lastPong) > 90*time.Second { // 3 missed pings
+					log.Printf("Agent %s appears to be dead (no pong received), closing connection...", id)
+					// Close the websocket connection
+					ac.ws.Close(websocket.StatusGoingAway, "ping timeout")
+					return
+				}
+			}
+		}
+	}()
 
 	// reader goroutine: dispatch responses back to waiting requests
 	err = agentReadLoop(ctx, ac)
@@ -618,6 +684,45 @@ func agentReadLoop(ctx context.Context, ac *agentConn) error {
 				continue
 			}
 			ac.deliverTcpDisconnect(&tf)
+		case "ping":
+			// Respond to agent ping with pong
+			var pingFrame PingFrame
+			if err := json.Unmarshal(plaintext, &pingFrame); err != nil {
+				continue
+			}
+			pongFrame := PongFrame{
+				Type:      "pong",
+				Timestamp: pingFrame.Timestamp,
+			}
+			if err := ac.writeEncrypted(context.Background(), pongFrame); err != nil {
+				log.Printf("Failed to send pong to agent %s: %v", ac.id, err)
+			}
+		case "pong":
+			// Update last pong time for connection health monitoring
+			ac.pingMu.Lock()
+			ac.lastPong = time.Now()
+			ac.pingMu.Unlock()
+		case "tunnel_info":
+			// Agent is providing tunnel details for stateless reconnection
+			var tunnelFrame TunnelInfoFrame
+			if err := json.Unmarshal(plaintext, &tunnelFrame); err != nil {
+				continue
+			}
+
+			// Recreate tunnel info for this reconnecting agent
+			tunnelInfo := &TunnelInfo{
+				Secret:   ac.secret,
+				Protocol: tunnelFrame.Protocol,
+				Port:     tunnelFrame.Port,
+				Created:  time.Now(), // Mark as recreated
+			}
+
+			tunnelsMu.Lock()
+			tunnels[ac.id] = tunnelInfo
+			tunnelsMu.Unlock()
+
+			log.Printf("Recreated tunnel info for reconnecting agent %s (protocol: %s, port: %d)",
+				ac.id, tunnelFrame.Protocol, tunnelFrame.Port)
 		default:
 			// ignore
 		}
@@ -635,13 +740,15 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := struct {
-		ActiveConnections []agentInfo            `json:"active_connections"`
-		ConnectionCount   int                    `json:"connection_count"`
-		ClientTracking    map[string]interface{} `json:"client_tracking"`
+		ActiveConnections   []agentInfo            `json:"active_connections"`
+		ConnectionCount     int                    `json:"connection_count"`
+		ClientTracking      map[string]interface{} `json:"client_tracking"`
+		GeographicalRouting map[string]interface{} `json:"geographical_routing"`
 	}{
-		ActiveConnections: make([]agentInfo, 0, len(agents)),
-		ConnectionCount:   len(agents),
-		ClientTracking:    clientTracker.GetClientStats(),
+		ActiveConnections:   make([]agentInfo, 0, len(agents)),
+		ConnectionCount:     len(agents),
+		ClientTracking:      clientTracker.GetClientStats(),
+		GeographicalRouting: getGeoRoutingStats(),
 	}
 
 	for id, conn := range agents {
@@ -713,6 +820,10 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		clientKey := generateClientKey(r)
 		clientTracker.RecordSuccess(clientKey, id)
 
+		// Record IP-based geographical routing (NEW)
+		clientIP := extractRealClientIP(r)
+		recordIPTunnelMapping(clientIP, id)
+
 		// For non-asset requests (main pages), record asset mapping
 		if !isAssetRequest(restPath) {
 			recordClientAssetMapping(clientKey, id)
@@ -739,10 +850,54 @@ func validateTunnel(id, secret string) bool {
 	if id == "" || secret == "" {
 		return false
 	}
+
+	// For Cloud Run stateless deployment: validate tunnel format rather than lookup
+	// Accept any tunnel with valid UUID format and non-empty secret
+	if !isValidUUID(id) {
+		return false
+	}
+
+	if len(secret) < 32 { // Ensure minimum secret length
+		return false
+	}
+
+	// If we have the tunnel in memory (newly registered), validate normally
 	tunnelsMu.RLock()
 	defer tunnelsMu.RUnlock()
-	info, ok := tunnels[id]
-	return ok && info.Secret == secret
+	if info, ok := tunnels[id]; ok {
+		return info.Secret == secret
+	}
+
+	// For reconnecting agents after server restart: accept valid-looking credentials
+	// This allows agents to reconnect with their existing tunnels
+	log.Printf("Accepting reconnecting tunnel %s (stateless validation)", id)
+	return true
+}
+
+func isValidUUID(id string) bool {
+	// Basic UUID format validation (8-4-4-4-12 hex digits)
+	if len(id) != 36 {
+		return false
+	}
+
+	expected := []int{8, 4, 4, 4, 12}
+	parts := strings.Split(id, "-")
+	if len(parts) != 5 {
+		return false
+	}
+
+	for i, part := range parts {
+		if len(part) != expected[i] {
+			return false
+		}
+		for _, char := range part {
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func getTunnelInfo(id string) *TunnelInfo {
@@ -750,6 +905,8 @@ func getTunnelInfo(id string) *TunnelInfo {
 	defer tunnelsMu.RUnlock()
 	return tunnels[id]
 }
+
+// Cloud Run: No tunnel persistence needed - removed file-based storage functions
 
 func getAgent(id string) *agentConn {
 	agentsMu.RLock()
@@ -952,6 +1109,277 @@ func recordClientAssetMapping(clientKey, tunnelID string) {
 	log.Printf("Smart routing: recorded asset mapping %s -> %s", clientKey, tunnelID)
 }
 
+// Simple geographical routing functions
+
+// lookupIPGeoData performs a simple geographical lookup for an IP address
+func lookupIPGeoData(ipAddress string) *IPGeoData {
+	if !geoRoutingConfig.EnableGeoRouting || ipAddress == "" {
+		return nil
+	}
+
+	// Check cache first
+	ipGeoCacheMu.RLock()
+	if cached, exists := ipGeoCache[ipAddress]; exists {
+		// Check if cache is still valid
+		if time.Since(cached.CacheTime) < geoRoutingConfig.GeoCacheTTL {
+			ipGeoCacheMu.RUnlock()
+			return cached
+		}
+	}
+	ipGeoCacheMu.RUnlock()
+
+	// For now, implement a simple country/region detection based on IP patterns
+	// This is a placeholder - in production you'd use a real GeoIP database
+	geoData := &IPGeoData{
+		Country:   getCountryFromIP(ipAddress),
+		Region:    getRegionFromIP(ipAddress),
+		CacheTime: time.Now(),
+	}
+
+	// Cache the result (with size limit)
+	ipGeoCacheMu.Lock()
+	if len(ipGeoCache) >= geoRoutingConfig.MaxGeoCache {
+		// Simple cache eviction - remove oldest entry
+		var oldestIP string
+		var oldestTime time.Time = time.Now()
+		for ip, data := range ipGeoCache {
+			if data.CacheTime.Before(oldestTime) {
+				oldestTime = data.CacheTime
+				oldestIP = ip
+			}
+		}
+		if oldestIP != "" {
+			delete(ipGeoCache, oldestIP)
+		}
+	}
+	ipGeoCache[ipAddress] = geoData
+	ipGeoCacheMu.Unlock()
+
+	return geoData
+}
+
+// Simple IP-based country detection (placeholder implementation)
+func getCountryFromIP(ipAddress string) string {
+	// This is a very basic implementation based on IP ranges
+	// In production, you would use a proper GeoIP database like GeoLite2
+
+	if strings.HasPrefix(ipAddress, "127.") || strings.HasPrefix(ipAddress, "::1") {
+		return "LOCAL"
+	}
+
+	// US IP ranges (simplified examples)
+	if strings.HasPrefix(ipAddress, "8.") || strings.HasPrefix(ipAddress, "4.") {
+		return "US"
+	}
+
+	// European IP ranges (simplified examples)
+	if strings.HasPrefix(ipAddress, "85.") || strings.HasPrefix(ipAddress, "91.") {
+		return "EU"
+	}
+
+	// Asian IP ranges (simplified examples)
+	if strings.HasPrefix(ipAddress, "202.") || strings.HasPrefix(ipAddress, "203.") {
+		return "AS"
+	}
+
+	// Default to unknown
+	return "UNKNOWN"
+}
+
+// Simple IP-based region detection (placeholder implementation)
+func getRegionFromIP(ipAddress string) string {
+	country := getCountryFromIP(ipAddress)
+
+	switch country {
+	case "US":
+		// Very basic US region detection based on IP
+		if strings.HasPrefix(ipAddress, "8.8.") {
+			return "US-WEST"
+		}
+		return "US-EAST"
+	case "EU":
+		return "EU-CENTRAL"
+	case "AS":
+		return "AS-PACIFIC"
+	default:
+		return country + "-DEFAULT"
+	}
+}
+
+// recordIPTunnelMapping records successful IP -> tunnel mapping
+func recordIPTunnelMapping(ipAddress, tunnelID string) {
+	if !geoRoutingConfig.EnableGeoRouting || ipAddress == "" || tunnelID == "" {
+		return
+	}
+
+	ipTunnelMu.Lock()
+	defer ipTunnelMu.Unlock()
+
+	// Check size limit
+	if len(ipTunnelMap) >= geoRoutingConfig.MaxIPMappings {
+		// Simple cleanup - remove entries older than TTL
+		now := time.Now()
+		for ip, mapping := range ipTunnelMap {
+			if now.Sub(mapping.LastSuccess) > geoRoutingConfig.IPMappingTTL {
+				delete(ipTunnelMap, ip)
+			}
+		}
+	}
+
+	if existing, exists := ipTunnelMap[ipAddress]; exists {
+		// Update existing mapping
+		existing.LastTunnelID = tunnelID
+		existing.LastSuccess = time.Now()
+		existing.UsageCount++
+
+		// Update success rate using exponential moving average
+		existing.SuccessRate = existing.SuccessRate*0.9 + 1.0*0.1
+	} else {
+		// Create new mapping
+		ipTunnelMap[ipAddress] = &IPTunnelMapping{
+			IPAddress:    ipAddress,
+			LastTunnelID: tunnelID,
+			LastSuccess:  time.Now(),
+			UsageCount:   1,
+			SuccessRate:  1.0,
+		}
+	}
+
+	// Also update geographical preferences
+	updateGeoTunnelPreference(ipAddress, tunnelID)
+
+	log.Printf("Smart routing: recorded IP tunnel mapping %s -> %s", ipAddress, tunnelID)
+}
+
+// updateGeoTunnelPreference updates tunnel preferences for geographical regions
+func updateGeoTunnelPreference(ipAddress, tunnelID string) {
+	geoData := lookupIPGeoData(ipAddress)
+	if geoData == nil {
+		return
+	}
+
+	geoKey := geoData.Country + "_" + geoData.Region
+
+	geoTunnelMu.Lock()
+	defer geoTunnelMu.Unlock()
+
+	if existing, exists := geoTunnelPrefs[geoKey]; exists {
+		// Update existing preference
+		existing.TunnelID = tunnelID
+		existing.UsageCount++
+		existing.LastUsed = time.Now()
+		existing.SuccessRate = existing.SuccessRate*0.9 + 1.0*0.1
+	} else {
+		// Create new preference
+		geoTunnelPrefs[geoKey] = &GeoTunnelPreference{
+			TunnelID:    tunnelID,
+			UsageCount:  1,
+			SuccessRate: 1.0,
+			LastUsed:    time.Now(),
+		}
+	}
+
+	log.Printf("Smart routing: updated geo preference %s -> %s", geoKey, tunnelID)
+}
+
+// getIPTunnelMapping retrieves the preferred tunnel for an IP address
+func getIPTunnelMapping(ipAddress string) string {
+	if !geoRoutingConfig.EnableGeoRouting || ipAddress == "" {
+		return ""
+	}
+
+	ipTunnelMu.RLock()
+	defer ipTunnelMu.RUnlock()
+
+	if mapping, exists := ipTunnelMap[ipAddress]; exists {
+		// Check if mapping is still valid
+		if time.Since(mapping.LastSuccess) <= geoRoutingConfig.IPMappingTTL {
+			return mapping.LastTunnelID
+		}
+	}
+
+	return ""
+}
+
+// getGeoTunnelPreference retrieves the preferred tunnel for a geographical region
+func getGeoTunnelPreference(ipAddress string) string {
+	if !geoRoutingConfig.EnableGeoRouting || ipAddress == "" {
+		return ""
+	}
+
+	geoData := lookupIPGeoData(ipAddress)
+	if geoData == nil {
+		return ""
+	}
+
+	geoKey := geoData.Country + "_" + geoData.Region
+
+	geoTunnelMu.RLock()
+	defer geoTunnelMu.RUnlock()
+
+	if pref, exists := geoTunnelPrefs[geoKey]; exists {
+		// Check if preference is recent and has good success rate
+		if time.Since(pref.LastUsed) <= geoRoutingConfig.GeoCacheTTL && pref.SuccessRate > 0.5 {
+			return pref.TunnelID
+		}
+	}
+
+	return ""
+}
+
+// getGeoRoutingStats returns statistics about geographical routing
+func getGeoRoutingStats() map[string]interface{} {
+	stats := map[string]interface{}{
+		"enabled":     geoRoutingConfig.EnableGeoRouting,
+		"cache_ttl":   geoRoutingConfig.GeoCacheTTL.String(),
+		"mapping_ttl": geoRoutingConfig.IPMappingTTL.String(),
+	}
+
+	if !geoRoutingConfig.EnableGeoRouting {
+		return stats
+	}
+
+	// Get IP mapping stats
+	ipTunnelMu.RLock()
+	ipMappingCount := len(ipTunnelMap)
+	ipStats := make(map[string]interface{})
+	countryStats := make(map[string]int)
+
+	for _, mapping := range ipTunnelMap {
+		geoData := lookupIPGeoData(mapping.IPAddress)
+		if geoData != nil {
+			countryStats[geoData.Country]++
+		}
+	}
+	ipTunnelMu.RUnlock()
+
+	ipStats["total_mappings"] = ipMappingCount
+	ipStats["countries"] = countryStats
+
+	// Get geo cache stats
+	ipGeoCacheMu.RLock()
+	geoCacheCount := len(ipGeoCache)
+	ipGeoCacheMu.RUnlock()
+
+	// Get geo tunnel preferences
+	geoTunnelMu.RLock()
+	geoPrefsCount := len(geoTunnelPrefs)
+	geoRegions := make([]string, 0, len(geoTunnelPrefs))
+	for geoKey := range geoTunnelPrefs {
+		geoRegions = append(geoRegions, geoKey)
+	}
+	geoTunnelMu.RUnlock()
+
+	stats["ip_mappings"] = ipStats
+	stats["geo_cache_size"] = geoCacheCount
+	stats["geo_preferences"] = map[string]interface{}{
+		"count":   geoPrefsCount,
+		"regions": geoRegions,
+	}
+
+	return stats
+}
+
 // getClientAssetMapping retrieves the tunnel ID for a client's asset requests
 func getClientAssetMapping(clientKey string) string {
 	clientAssetMu.RLock()
@@ -1006,6 +1434,53 @@ var (
 	// Enhanced asset tracking
 	clientAssetMappings = make(map[string]string) // clientKey -> tunnelID
 	clientAssetMu       sync.RWMutex
+)
+
+// Simple IP-based geographical routing structures
+type IPGeoData struct {
+	Country   string    `json:"country"`
+	Region    string    `json:"region"`
+	CacheTime time.Time `json:"cache_time"`
+}
+
+type IPTunnelMapping struct {
+	IPAddress    string    `json:"ip_address"`
+	LastTunnelID string    `json:"last_tunnel_id"`
+	LastSuccess  time.Time `json:"last_success"`
+	UsageCount   int       `json:"usage_count"`
+	SuccessRate  float64   `json:"success_rate"`
+}
+
+type GeoTunnelPreference struct {
+	TunnelID    string    `json:"tunnel_id"`
+	UsageCount  int       `json:"usage_count"`
+	SuccessRate float64   `json:"success_rate"`
+	LastUsed    time.Time `json:"last_used"`
+}
+
+// Fast in-memory geographical routing stores
+var (
+	ipGeoCache     = make(map[string]*IPGeoData)           // IP -> geo data
+	ipTunnelMap    = make(map[string]*IPTunnelMapping)     // IP -> tunnel mapping
+	geoTunnelPrefs = make(map[string]*GeoTunnelPreference) // country_region -> preferred tunnel
+	ipGeoCacheMu   sync.RWMutex
+	ipTunnelMu     sync.RWMutex
+	geoTunnelMu    sync.RWMutex
+
+	// Configuration
+	geoRoutingConfig = struct {
+		EnableGeoRouting bool
+		GeoCacheTTL      time.Duration
+		IPMappingTTL     time.Duration
+		MaxGeoCache      int
+		MaxIPMappings    int
+	}{
+		EnableGeoRouting: true,
+		GeoCacheTTL:      24 * time.Hour,     // Cache geo data for 24 hours
+		IPMappingTTL:     7 * 24 * time.Hour, // Keep IP mappings for 7 days
+		MaxGeoCache:      10000,              // Max cached geo lookups
+		MaxIPMappings:    50000,              // Max IP tunnel mappings
+	}
 )
 
 // Client tracking and fingerprinting
@@ -1880,7 +2355,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Strategy 1: Enhanced Client Tracking (NEW)
+	// Strategy 1: Enhanced Client Tracking (EXISTING)
 	if tunnelID := clientTracker.GetBestTunnel(clientKey); tunnelID != "" {
 		confidence := clientTracker.GetConfidence(clientKey, tunnelID)
 		// Lower confidence threshold for API endpoints since they're critical
@@ -1892,6 +2367,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		if confidence > minConfidence && tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, tunnelID)
 
+			// Record geographical routing success (NEW)
+			clientIP := extractRealClientIP(r)
+			recordIPTunnelMapping(clientIP, tunnelID)
+
 			// Record asset mapping for non-asset requests (main pages)
 			if !isAsset {
 				recordClientAssetMapping(clientKey, tunnelID)
@@ -1902,6 +2381,53 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		} else if confidence > minConfidence {
 			// High confidence but failed - record failure
 			clientTracker.RecordFailure(clientKey, tunnelID)
+		}
+	}
+
+	// Strategy 1.5: IP-based Geographical Routing (NEW)
+	clientIP := extractRealClientIP(r)
+	if tunnelID := getIPTunnelMapping(clientIP); tunnelID != "" {
+		if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
+			clientTracker.RecordSuccess(clientKey, tunnelID)
+			recordIPTunnelMapping(clientIP, tunnelID)
+
+			// Record asset mapping for non-asset requests (main pages)
+			if !isAsset {
+				recordClientAssetMapping(clientKey, tunnelID)
+			}
+
+			log.Printf("Smart routing: %s -> tunnel %s (ip-mapping, ip=%s)", r.URL.Path, tunnelID, clientIP)
+			return
+		} else {
+			log.Printf("Smart routing: IP mapping failed for %s -> %s (ip=%s)", r.URL.Path, tunnelID, clientIP)
+		}
+	}
+
+	// Strategy 1.6: Geographical Region Routing (NEW)
+	if tunnelID := getGeoTunnelPreference(clientIP); tunnelID != "" {
+		if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
+			clientTracker.RecordSuccess(clientKey, tunnelID)
+			recordIPTunnelMapping(clientIP, tunnelID)
+
+			// Record asset mapping for non-asset requests (main pages)
+			if !isAsset {
+				recordClientAssetMapping(clientKey, tunnelID)
+			}
+
+			geoData := lookupIPGeoData(clientIP)
+			geoKey := ""
+			if geoData != nil {
+				geoKey = geoData.Country + "_" + geoData.Region
+			}
+			log.Printf("Smart routing: %s -> tunnel %s (geo-preference, ip=%s, geo=%s)", r.URL.Path, tunnelID, clientIP, geoKey)
+			return
+		} else {
+			geoData := lookupIPGeoData(clientIP)
+			geoKey := ""
+			if geoData != nil {
+				geoKey = geoData.Country + "_" + geoData.Region
+			}
+			log.Printf("Smart routing: Geo preference failed for %s -> %s (ip=%s, geo=%s)", r.URL.Path, tunnelID, clientIP, geoKey)
 		}
 	}
 
@@ -1967,6 +2493,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	for _, result := range results {
 		if result.success {
 			clientTracker.LearnMapping(clientKey, result.tunnelID)
+			// Record geographical mapping for successful results (NEW)
+			recordIPTunnelMapping(clientIP, result.tunnelID)
 		} else {
 			clientTracker.RecordFailure(clientKey, result.tunnelID)
 		}
@@ -1980,6 +2508,9 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 		if tryTunnelRouteWithTimeout(w, finalReq, successfulTunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, successfulTunnelID)
+
+			// Record geographical mapping (NEW)
+			recordIPTunnelMapping(clientIP, successfulTunnelID)
 
 			// Record asset mapping for non-asset requests (main pages)
 			if !isAsset {
@@ -2030,6 +2561,9 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 				select {
 				case resp := <-respCh:
 					clientTracker.RecordSuccess(clientKey, tunnelID)
+
+					// Record geographical mapping (NEW)
+					recordIPTunnelMapping(clientIP, tunnelID)
 
 					// Cache assets and record mappings
 					if isAsset {
@@ -2111,6 +2645,9 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	// Smart fallback handler - must be last (catch-all)
 	mux.HandleFunc("/", smartFallbackHandler)
+
+	// Cloud Run: No tunnel persistence needed - agents will reconnect and provide tunnel info
+	log.Println("Starting stateless server for Cloud Run - agents will re-register tunnel info on reconnection")
 
 	port := os.Getenv("PORT")
 	if port == "" {

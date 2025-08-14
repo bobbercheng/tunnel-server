@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,7 +54,7 @@ type RespFrame struct {
 }
 
 type ChunkedRespFrame struct {
-	Type        string              `json:"type"`     // "chunked_resp"
+	Type        string              `json:"type"` // "chunked_resp"
 	ReqID       string              `json:"req_id"`
 	Status      int                 `json:"status"`
 	Headers     map[string][]string `json:"headers"`
@@ -88,10 +89,28 @@ type TcpDisconnectFrame struct {
 	Reason string `json:"reason"`  // disconnect reason
 }
 
+// Ping/Pong frames for connection health monitoring
+type PingFrame struct {
+	Type      string    `json:"type"`      // "ping"
+	Timestamp time.Time `json:"timestamp"` // when ping was sent
+}
+
+type PongFrame struct {
+	Type      string    `json:"type"`      // "pong"
+	Timestamp time.Time `json:"timestamp"` // original ping timestamp
+}
+
+// TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
+type TunnelInfoFrame struct {
+	Type     string `json:"type"`     // "tunnel_info"
+	Protocol string `json:"protocol"` // "http" or "tcp"
+	Port     int    `json:"port"`     // for TCP tunnels
+}
+
 var (
-	ErrUnauthorized = errors.New("unauthorized: credentials rejected by server")
+	ErrUnauthorized   = errors.New("unauthorized: credentials rejected by server")
 	ErrNetworkFailure = errors.New("network failure: unable to reach server")
-	ErrDNSFailure = errors.New("dns failure: unable to resolve server hostname")
+	ErrDNSFailure     = errors.New("dns failure: unable to resolve server hostname")
 )
 
 type Agent struct {
@@ -101,26 +120,30 @@ type Agent struct {
 	Secret    string
 	Protocol  string // "http" or "tcp"
 	Port      int    // for TCP tunnels
-	
+
 	// Retry state
 	consecutiveDNSFailures     int
 	consecutiveNetworkFailures int
-	
+
 	// TCP connection management
 	tcpConnsMu sync.Mutex
 	tcpConns   map[string]net.Conn // connID -> TCP connection
-	
+
 	// Chunked response management
 	chunkedRespMu sync.Mutex
 	chunkedResps  map[string]*ChunkedResponse // reqID -> partial response
+
+	// Connection health monitoring
+	lastPong time.Time
+	pingMu   sync.RWMutex
 }
 
 // ChunkedResponse tracks partial chunked responses
 type ChunkedResponse struct {
-	Status      int
-	Headers     map[string][]string
-	Chunks      map[int][]byte // chunkIndex -> data
-	TotalChunks int
+	Status         int
+	Headers        map[string][]string
+	Chunks         map[int][]byte // chunkIndex -> data
+	TotalChunks    int
 	ReceivedChunks int
 }
 
@@ -203,14 +226,14 @@ func (a *Agent) runOnce() error {
 		a.tcpConns = make(map[string]net.Conn)
 	}
 	a.tcpConnsMu.Unlock()
-	
+
 	// Initialize chunked response map
 	a.chunkedRespMu.Lock()
 	if a.chunkedResps == nil {
 		a.chunkedResps = make(map[string]*ChunkedResponse)
 	}
 	a.chunkedRespMu.Unlock()
-	
+
 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -315,6 +338,60 @@ func (a *Agent) runOnce() error {
 		return ws.Write(ctx, websocket.MessageBinary, encryptedData)
 	}
 
+	// Send tunnel info for stateless server reconnection (Cloud Run)
+	tunnelInfo := TunnelInfoFrame{
+		Type:     "tunnel_info",
+		Protocol: a.Protocol,
+		Port:     a.Port,
+	}
+	if err := writeEncrypted(tunnelInfo); err != nil {
+		log.Printf("Failed to send tunnel info: %v", err)
+		// Don't fail connection for this
+	} else {
+		log.Printf("Sent tunnel info: protocol=%s, port=%d", a.Protocol, a.Port)
+	}
+
+	// Initialize ping monitoring
+	a.pingMu.Lock()
+	a.lastPong = time.Now()
+	a.pingMu.Unlock()
+
+	// Start ping monitoring goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // Ping every 30 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Send ping
+				pingFrame := PingFrame{
+					Type:      "ping",
+					Timestamp: time.Now(),
+				}
+
+				if err := writeEncrypted(pingFrame); err != nil {
+					log.Printf("Failed to send ping: %v", err)
+					cancelCtx()
+					return
+				}
+
+				// Check if last pong is too old
+				a.pingMu.RLock()
+				lastPong := a.lastPong
+				a.pingMu.RUnlock()
+
+				if time.Since(lastPong) > 90*time.Second { // 3 missed pings
+					log.Println("Connection appears to be dead (no pong received), closing...")
+					cancelCtx()
+					return
+				}
+			}
+		}
+	}()
+
 	// Start a goroutine to read messages
 	go func() {
 		defer close(done)
@@ -342,7 +419,7 @@ func (a *Agent) runOnce() error {
 			if err := json.Unmarshal(plaintext, &base); err != nil {
 				continue
 			}
-			
+
 			switch base.Type {
 			case "req":
 				var req ReqFrame
@@ -374,6 +451,24 @@ func (a *Agent) runOnce() error {
 					continue
 				}
 				go a.handleTcpDisconnect(&frame)
+			case "ping":
+				// Respond to server ping with pong
+				var pingFrame PingFrame
+				if err := json.Unmarshal(plaintext, &pingFrame); err != nil {
+					continue
+				}
+				pongFrame := PongFrame{
+					Type:      "pong",
+					Timestamp: pingFrame.Timestamp,
+				}
+				if err := writeEncrypted(pongFrame); err != nil {
+					log.Printf("Failed to send pong: %v", err)
+				}
+			case "pong":
+				// Update last pong time for connection health monitoring
+				a.pingMu.Lock()
+				a.lastPong = time.Now()
+				a.pingMu.Unlock()
 			default:
 				continue
 			}
@@ -503,17 +598,17 @@ func (a *Agent) register() (*RegisterResp, error) {
 		Protocol: a.Protocol,
 		Port:     a.Port,
 	}
-	
+
 	// Default to HTTP if not specified
 	if req.Protocol == "" {
 		req.Protocol = "http"
 	}
-	
+
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	resp, err := http.Post(a.ServerURL+"/register", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
@@ -607,7 +702,7 @@ func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, wr
 			target = fmt.Sprintf("%s:%d", u.Hostname(), frame.Port)
 		}
 	}
-	
+
 	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		// Send disconnect frame on connection failure
@@ -619,12 +714,12 @@ func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, wr
 		writeEncrypted(disconnectFrame)
 		return
 	}
-	
+
 	// Store the connection
 	a.tcpConnsMu.Lock()
 	a.tcpConns[frame.ConnID] = conn
 	a.tcpConnsMu.Unlock()
-	
+
 	// Start reading from TCP connection and sending to server
 	go func() {
 		defer func() {
@@ -632,7 +727,7 @@ func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, wr
 			a.tcpConnsMu.Lock()
 			delete(a.tcpConns, frame.ConnID)
 			a.tcpConnsMu.Unlock()
-			
+
 			disconnectFrame := TcpDisconnectFrame{
 				Type:   "tcp_disconnect",
 				ConnID: frame.ConnID,
@@ -640,20 +735,20 @@ func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, wr
 			}
 			writeEncrypted(disconnectFrame)
 		}()
-		
+
 		buf := make([]byte, 4096)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
-			
+
 			dataFrame := TcpDataFrame{
 				Type:   "tcp_data",
 				ConnID: frame.ConnID,
 				Data:   buf[:n],
 			}
-			
+
 			if err := writeEncrypted(dataFrame); err != nil {
 				return
 			}
@@ -666,7 +761,7 @@ func (a *Agent) handleTcpData(frame *TcpDataFrame) {
 	a.tcpConnsMu.Lock()
 	conn, ok := a.tcpConns[frame.ConnID]
 	a.tcpConnsMu.Unlock()
-	
+
 	if ok {
 		_, err := conn.Write(frame.Data)
 		if err != nil {
@@ -687,7 +782,7 @@ func (a *Agent) handleTcpDisconnect(frame *TcpDisconnectFrame) {
 		delete(a.tcpConns, frame.ConnID)
 	}
 	a.tcpConnsMu.Unlock()
-	
+
 	if ok {
 		conn.Close()
 	}
@@ -703,13 +798,13 @@ func calculateBackoff(failures int, baseDelay time.Duration, maxDelay time.Durat
 	if failures <= 0 {
 		return baseDelay
 	}
-	
+
 	// Exponential backoff: baseDelay * 2^failures
 	delay := baseDelay
 	for i := 0; i < failures && delay < maxDelay/2; i++ {
 		delay *= 2
 	}
-	
+
 	if delay > maxDelay {
 		return maxDelay
 	}
@@ -720,7 +815,7 @@ func calculateBackoff(failures int, baseDelay time.Duration, maxDelay time.Durat
 func (a *Agent) handleChunkedResponse(chunk *ChunkedRespFrame, writeEncrypted func(v any) error) {
 	a.chunkedRespMu.Lock()
 	defer a.chunkedRespMu.Unlock()
-	
+
 	// Get or create chunked response tracker
 	resp, exists := a.chunkedResps[chunk.ReqID]
 	if !exists {
@@ -733,11 +828,11 @@ func (a *Agent) handleChunkedResponse(chunk *ChunkedRespFrame, writeEncrypted fu
 		}
 		a.chunkedResps[chunk.ReqID] = resp
 	}
-	
+
 	// Store the chunk data
 	resp.Chunks[chunk.ChunkIndex] = chunk.Data
 	resp.ReceivedChunks++
-	
+
 	// Check if we have all chunks
 	if resp.ReceivedChunks == resp.TotalChunks {
 		// Assemble the complete response
@@ -751,10 +846,10 @@ func (a *Agent) handleChunkedResponse(chunk *ChunkedRespFrame, writeEncrypted fu
 			}
 			body = append(body, chunkData...)
 		}
-		
+
 		// Log the assembled response
 		fmt.Printf("Assembled chunked response for req_id %s: %d bytes, status: %d\n", chunk.ReqID, len(body), resp.Status)
-		
+
 		// Clean up
 		delete(a.chunkedResps, chunk.ReqID)
 	}
@@ -765,13 +860,13 @@ func classifyNetworkError(err error) error {
 	if err == nil {
 		return nil
 	}
-	
+
 	// Check for DNS resolution errors
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		return ErrDNSFailure
 	}
-	
+
 	// Check for connection refused or network unreachable
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
@@ -779,7 +874,7 @@ func classifyNetworkError(err error) error {
 			return ErrNetworkFailure
 		}
 	}
-	
+
 	// Check for context timeout (includes DNS timeout)
 	if errors.Is(err, context.DeadlineExceeded) {
 		if strings.Contains(err.Error(), "dns") || strings.Contains(err.Error(), "lookup") {
@@ -787,7 +882,7 @@ func classifyNetworkError(err error) error {
 		}
 		return ErrNetworkFailure
 	}
-	
+
 	// Check for common network errors by string matching
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "no such host") || strings.Contains(errStr, "dns") {
@@ -796,7 +891,7 @@ func classifyNetworkError(err error) error {
 	if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "network unreachable") {
 		return ErrNetworkFailure
 	}
-	
+
 	// Default to network failure for unknown connection errors
 	return ErrNetworkFailure
 }

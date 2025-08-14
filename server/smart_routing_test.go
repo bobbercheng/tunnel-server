@@ -2417,3 +2417,321 @@ func TestCompleteURLEquivalence(t *testing.T) {
 		})
 	}
 }
+
+// Tests for geographical routing functionality
+func TestGeoRoutingFunctionality(t *testing.T) {
+	// Save original state
+	originalIPGeoCache := ipGeoCache
+	originalIPTunnelMap := ipTunnelMap
+	originalGeoTunnelPrefs := geoTunnelPrefs
+	originalGeoConfig := geoRoutingConfig
+	defer func() {
+		ipGeoCache = originalIPGeoCache
+		ipTunnelMap = originalIPTunnelMap
+		geoTunnelPrefs = originalGeoTunnelPrefs
+		geoRoutingConfig = originalGeoConfig
+	}()
+
+	// Reset for testing
+	ipGeoCache = make(map[string]*IPGeoData)
+	ipTunnelMap = make(map[string]*IPTunnelMapping)
+	geoTunnelPrefs = make(map[string]*GeoTunnelPreference)
+
+	// Enable geo routing for tests
+	geoRoutingConfig.EnableGeoRouting = true
+
+	testIPs := []struct {
+		ip              string
+		expectedCountry string
+		expectedRegion  string
+	}{
+		{"8.8.8.8", "US", "US-WEST"},
+		{"4.4.4.4", "US", "US-EAST"},
+		{"85.1.1.1", "EU", "EU-CENTRAL"},
+		{"202.1.1.1", "AS", "AS-PACIFIC"},
+		{"127.0.0.1", "LOCAL", "LOCAL-DEFAULT"},
+	}
+
+	for _, test := range testIPs {
+		t.Run(fmt.Sprintf("GeoLookup_%s", test.ip), func(t *testing.T) {
+			geoData := lookupIPGeoData(test.ip)
+			if geoData == nil {
+				t.Fatalf("Expected geo data for IP %s", test.ip)
+			}
+
+			if geoData.Country != test.expectedCountry {
+				t.Errorf("Expected country %s, got %s for IP %s", test.expectedCountry, geoData.Country, test.ip)
+			}
+
+			if geoData.Region != test.expectedRegion {
+				t.Errorf("Expected region %s, got %s for IP %s", test.expectedRegion, geoData.Region, test.ip)
+			}
+
+			// Test caching
+			geoData2 := lookupIPGeoData(test.ip)
+			if geoData != geoData2 {
+				t.Error("Expected cached geo data to be returned")
+			}
+		})
+	}
+}
+
+func TestIPTunnelMapping(t *testing.T) {
+	// Save original state
+	originalIPTunnelMap := ipTunnelMap
+	originalGeoTunnelPrefs := geoTunnelPrefs
+	originalGeoConfig := geoRoutingConfig
+	defer func() {
+		ipTunnelMap = originalIPTunnelMap
+		geoTunnelPrefs = originalGeoTunnelPrefs
+		geoRoutingConfig = originalGeoConfig
+	}()
+
+	// Reset for testing
+	ipTunnelMap = make(map[string]*IPTunnelMapping)
+	geoTunnelPrefs = make(map[string]*GeoTunnelPreference)
+	geoRoutingConfig.EnableGeoRouting = true
+
+	testIP := "8.8.8.8"
+	tunnelID := "test-tunnel-123"
+
+	t.Run("Record IP tunnel mapping", func(t *testing.T) {
+		recordIPTunnelMapping(testIP, tunnelID)
+
+		// Check IP mapping was recorded
+		if mapping, exists := ipTunnelMap[testIP]; exists {
+			if mapping.LastTunnelID != tunnelID {
+				t.Errorf("Expected tunnel ID %s, got %s", tunnelID, mapping.LastTunnelID)
+			}
+			if mapping.UsageCount != 1 {
+				t.Errorf("Expected usage count 1, got %d", mapping.UsageCount)
+			}
+			if mapping.SuccessRate != 1.0 {
+				t.Errorf("Expected success rate 1.0, got %f", mapping.SuccessRate)
+			}
+		} else {
+			t.Error("Expected IP tunnel mapping to be recorded")
+		}
+
+		// Check geo preference was updated
+		expectedGeoKey := "US_US-WEST"
+		if pref, exists := geoTunnelPrefs[expectedGeoKey]; exists {
+			if pref.TunnelID != tunnelID {
+				t.Errorf("Expected geo preference tunnel %s, got %s", tunnelID, pref.TunnelID)
+			}
+		} else {
+			t.Error("Expected geo preference to be recorded")
+		}
+	})
+
+	t.Run("Retrieve IP tunnel mapping", func(t *testing.T) {
+		retrievedTunnelID := getIPTunnelMapping(testIP)
+		if retrievedTunnelID != tunnelID {
+			t.Errorf("Expected retrieved tunnel ID %s, got %s", tunnelID, retrievedTunnelID)
+		}
+	})
+
+	t.Run("Retrieve geo tunnel preference", func(t *testing.T) {
+		retrievedTunnelID := getGeoTunnelPreference(testIP)
+		if retrievedTunnelID != tunnelID {
+			t.Errorf("Expected geo preference tunnel ID %s, got %s", tunnelID, retrievedTunnelID)
+		}
+	})
+
+	t.Run("Multiple recordings update stats", func(t *testing.T) {
+		// Record multiple times to test success rate calculation
+		recordIPTunnelMapping(testIP, tunnelID)
+		recordIPTunnelMapping(testIP, tunnelID)
+
+		if mapping := ipTunnelMap[testIP]; mapping != nil {
+			if mapping.UsageCount != 3 {
+				t.Errorf("Expected usage count 3, got %d", mapping.UsageCount)
+			}
+			// Success rate should be close to 1.0 (using EMA)
+			if mapping.SuccessRate < 0.9 {
+				t.Errorf("Expected success rate > 0.9, got %f", mapping.SuccessRate)
+			}
+		}
+	})
+}
+
+func TestGeoRoutingStats(t *testing.T) {
+	// Save original state
+	originalIPGeoCache := ipGeoCache
+	originalIPTunnelMap := ipTunnelMap
+	originalGeoTunnelPrefs := geoTunnelPrefs
+	originalGeoConfig := geoRoutingConfig
+	defer func() {
+		ipGeoCache = originalIPGeoCache
+		ipTunnelMap = originalIPTunnelMap
+		geoTunnelPrefs = originalGeoTunnelPrefs
+		geoRoutingConfig = originalGeoConfig
+	}()
+
+	// Reset for testing
+	ipGeoCache = make(map[string]*IPGeoData)
+	ipTunnelMap = make(map[string]*IPTunnelMapping)
+	geoTunnelPrefs = make(map[string]*GeoTunnelPreference)
+	geoRoutingConfig.EnableGeoRouting = true
+
+	// Add some test data
+	recordIPTunnelMapping("8.8.8.8", "tunnel-us")
+	recordIPTunnelMapping("85.1.1.1", "tunnel-eu")
+	recordIPTunnelMapping("202.1.1.1", "tunnel-as")
+
+	stats := getGeoRoutingStats()
+
+	t.Run("Basic stats structure", func(t *testing.T) {
+		if enabled, ok := stats["enabled"].(bool); !ok || !enabled {
+			t.Error("Expected geo routing to be enabled in stats")
+		}
+
+		if _, ok := stats["cache_ttl"]; !ok {
+			t.Error("Expected cache_ttl in stats")
+		}
+
+		if _, ok := stats["mapping_ttl"]; !ok {
+			t.Error("Expected mapping_ttl in stats")
+		}
+	})
+
+	t.Run("IP mappings stats", func(t *testing.T) {
+		ipMappings, ok := stats["ip_mappings"].(map[string]interface{})
+		if !ok {
+			t.Fatal("Expected ip_mappings in stats")
+		}
+
+		if totalMappings, ok := ipMappings["total_mappings"].(int); !ok || totalMappings != 3 {
+			t.Errorf("Expected 3 total mappings, got %v", totalMappings)
+		}
+
+		countries, ok := ipMappings["countries"].(map[string]int)
+		if !ok {
+			t.Fatal("Expected countries in ip_mappings stats")
+		}
+
+		expectedCountries := map[string]int{"US": 1, "EU": 1, "AS": 1}
+		for country, expectedCount := range expectedCountries {
+			if actualCount := countries[country]; actualCount != expectedCount {
+				t.Errorf("Expected %d mappings for country %s, got %d", expectedCount, country, actualCount)
+			}
+		}
+	})
+
+	t.Run("Geo preferences stats", func(t *testing.T) {
+		geoPrefs, ok := stats["geo_preferences"].(map[string]interface{})
+		if !ok {
+			t.Fatal("Expected geo_preferences in stats")
+		}
+
+		if count, ok := geoPrefs["count"].(int); !ok || count != 3 {
+			t.Errorf("Expected 3 geo preferences, got %v", count)
+		}
+
+		regions, ok := geoPrefs["regions"].([]string)
+		if !ok {
+			t.Fatal("Expected regions in geo_preferences stats")
+		}
+
+		if len(regions) != 3 {
+			t.Errorf("Expected 3 regions, got %d", len(regions))
+		}
+
+		// Check that expected regions are present
+		expectedRegions := map[string]bool{
+			"US_US-WEST":    false,
+			"EU_EU-CENTRAL": false,
+			"AS_AS-PACIFIC": false,
+		}
+		for _, region := range regions {
+			if _, exists := expectedRegions[region]; exists {
+				expectedRegions[region] = true
+			}
+		}
+
+		for region, found := range expectedRegions {
+			if !found {
+				t.Errorf("Expected region %s not found in stats", region)
+			}
+		}
+	})
+}
+
+func TestGeoRoutingIntegration(t *testing.T) {
+	// Save original state
+	originalAgents := agents
+	originalIPTunnelMap := ipTunnelMap
+	originalGeoTunnelPrefs := geoTunnelPrefs
+	originalGeoConfig := geoRoutingConfig
+	defer func() {
+		agents = originalAgents
+		ipTunnelMap = originalIPTunnelMap
+		geoTunnelPrefs = originalGeoTunnelPrefs
+		geoRoutingConfig = originalGeoConfig
+	}()
+
+	// Reset for testing
+	agents = map[string]*agentConn{
+		"tunnel-us": nil,
+		"tunnel-eu": nil,
+	}
+	ipTunnelMap = make(map[string]*IPTunnelMapping)
+	geoTunnelPrefs = make(map[string]*GeoTunnelPreference)
+	geoRoutingConfig.EnableGeoRouting = true
+
+	t.Run("IP routing preference", func(t *testing.T) {
+		testIP := "8.8.8.8" // US IP
+
+		// First, record that this IP successfully used tunnel-us
+		recordIPTunnelMapping(testIP, "tunnel-us")
+
+		// Now check that getIPTunnelMapping returns the right tunnel
+		preferredTunnel := getIPTunnelMapping(testIP)
+		if preferredTunnel != "tunnel-us" {
+			t.Errorf("Expected IP %s to prefer tunnel-us, got %s", testIP, preferredTunnel)
+		}
+
+		// Check geo preference as well
+		geoPreferredTunnel := getGeoTunnelPreference(testIP)
+		if geoPreferredTunnel != "tunnel-us" {
+			t.Errorf("Expected geo preference for IP %s to be tunnel-us, got %s", testIP, geoPreferredTunnel)
+		}
+	})
+
+	t.Run("Geo region fallback", func(t *testing.T) {
+		// Test that a different US IP (same region) gets the same preference
+		newUSIP := "8.8.4.4" // Different US IP but same region (US-WEST)
+
+		// This IP hasn't been used before, but should get US-WEST region preference
+		geoPreferredTunnel := getGeoTunnelPreference(newUSIP)
+		if geoPreferredTunnel != "tunnel-us" {
+			t.Errorf("Expected new US IP %s to get US tunnel preference, got %s", newUSIP, geoPreferredTunnel)
+		}
+
+		// Test that a different US region gets no preference yet
+		usEastIP := "4.4.4.4" // US-EAST IP
+		geoPreferredTunnel = getGeoTunnelPreference(usEastIP)
+		if geoPreferredTunnel != "" {
+			t.Errorf("Expected US-EAST IP %s to get no preference yet, got %s", usEastIP, geoPreferredTunnel)
+		}
+	})
+
+	t.Run("Different region gets different preference", func(t *testing.T) {
+		euIP := "85.1.1.1" // EU IP
+
+		// Record EU IP using EU tunnel
+		recordIPTunnelMapping(euIP, "tunnel-eu")
+
+		preferredTunnel := getIPTunnelMapping(euIP)
+		if preferredTunnel != "tunnel-eu" {
+			t.Errorf("Expected EU IP %s to prefer tunnel-eu, got %s", euIP, preferredTunnel)
+		}
+
+		// Now a different EU IP should get EU preference
+		newEUIP := "91.1.1.1"
+		geoPreferredTunnel := getGeoTunnelPreference(newEUIP)
+		if geoPreferredTunnel != "tunnel-eu" {
+			t.Errorf("Expected new EU IP %s to get EU tunnel preference, got %s", newEUIP, geoPreferredTunnel)
+		}
+	})
+}
