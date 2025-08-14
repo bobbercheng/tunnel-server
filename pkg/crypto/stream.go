@@ -23,7 +23,7 @@ const (
 	// OverheadSize is the overhead of the AEAD cipher (tag size)
 	OverheadSize = 16
 	// MaxPlaintextSize is the maximum size of plaintext that can be encrypted in one message
-	MaxPlaintextSize = 1024 * 1024 // 1MB
+	MaxPlaintextSize = 16 * 1024 * 1024 // 16MB - increased to handle large assets
 )
 
 var (

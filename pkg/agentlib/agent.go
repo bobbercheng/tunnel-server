@@ -52,6 +52,17 @@ type RespFrame struct {
 	Body    []byte              `json:"body"`
 }
 
+type ChunkedRespFrame struct {
+	Type        string              `json:"type"`     // "chunked_resp"
+	ReqID       string              `json:"req_id"`
+	Status      int                 `json:"status"`
+	Headers     map[string][]string `json:"headers"`
+	ChunkIndex  int                 `json:"chunk_index"`
+	TotalChunks int                 `json:"total_chunks"`
+	Data        []byte              `json:"data"`
+	IsLast      bool                `json:"is_last"`
+}
+
 // HandshakeFrame is used for initial key exchange
 type HandshakeFrame struct {
 	Type string `json:"type"` // "handshake"
@@ -98,6 +109,19 @@ type Agent struct {
 	// TCP connection management
 	tcpConnsMu sync.Mutex
 	tcpConns   map[string]net.Conn // connID -> TCP connection
+	
+	// Chunked response management
+	chunkedRespMu sync.Mutex
+	chunkedResps  map[string]*ChunkedResponse // reqID -> partial response
+}
+
+// ChunkedResponse tracks partial chunked responses
+type ChunkedResponse struct {
+	Status      int
+	Headers     map[string][]string
+	Chunks      map[int][]byte // chunkIndex -> data
+	TotalChunks int
+	ReceivedChunks int
 }
 
 func (a *Agent) Run() {
@@ -180,6 +204,13 @@ func (a *Agent) runOnce() error {
 	}
 	a.tcpConnsMu.Unlock()
 	
+	// Initialize chunked response map
+	a.chunkedRespMu.Lock()
+	if a.chunkedResps == nil {
+		a.chunkedResps = make(map[string]*ChunkedResponse)
+	}
+	a.chunkedRespMu.Unlock()
+	
 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -205,8 +236,8 @@ func (a *Agent) runOnce() error {
 	}
 	defer ws.Close(websocket.StatusInternalError, "internal error")
 
-	// Set larger message size limit (10MB instead of default 32KB)
-	ws.SetReadLimit(10 * 1024 * 1024)
+	// Set larger message size limit (20MB to match server)
+	ws.SetReadLimit(20 * 1024 * 1024)
 
 	// Perform key exchange
 	ctx := context.Background()
@@ -319,6 +350,12 @@ func (a *Agent) runOnce() error {
 					continue
 				}
 				a.handleHttpRequest(ctx, &req, writeEncrypted, &wg)
+			case "chunked_resp":
+				var chunk ChunkedRespFrame
+				if err := json.Unmarshal(plaintext, &chunk); err != nil {
+					continue
+				}
+				go a.handleChunkedResponse(&chunk, writeEncrypted)
 			case "tcp_connect":
 				var frame TcpConnectFrame
 				if err := json.Unmarshal(plaintext, &frame); err != nil {
@@ -677,6 +714,50 @@ func calculateBackoff(failures int, baseDelay time.Duration, maxDelay time.Durat
 		return maxDelay
 	}
 	return delay
+}
+
+// handleChunkedResponse processes chunked response frames and assembles them
+func (a *Agent) handleChunkedResponse(chunk *ChunkedRespFrame, writeEncrypted func(v any) error) {
+	a.chunkedRespMu.Lock()
+	defer a.chunkedRespMu.Unlock()
+	
+	// Get or create chunked response tracker
+	resp, exists := a.chunkedResps[chunk.ReqID]
+	if !exists {
+		resp = &ChunkedResponse{
+			Status:         chunk.Status,
+			Headers:        chunk.Headers,
+			Chunks:         make(map[int][]byte),
+			TotalChunks:    chunk.TotalChunks,
+			ReceivedChunks: 0,
+		}
+		a.chunkedResps[chunk.ReqID] = resp
+	}
+	
+	// Store the chunk data
+	resp.Chunks[chunk.ChunkIndex] = chunk.Data
+	resp.ReceivedChunks++
+	
+	// Check if we have all chunks
+	if resp.ReceivedChunks == resp.TotalChunks {
+		// Assemble the complete response
+		var body []byte
+		for i := 0; i < resp.TotalChunks; i++ {
+			chunkData, ok := resp.Chunks[i]
+			if !ok {
+				fmt.Printf("Missing chunk %d for request %s\n", i, chunk.ReqID)
+				delete(a.chunkedResps, chunk.ReqID)
+				return
+			}
+			body = append(body, chunkData...)
+		}
+		
+		// Log the assembled response
+		fmt.Printf("Assembled chunked response for req_id %s: %d bytes, status: %d\n", chunk.ReqID, len(body), resp.Status)
+		
+		// Clean up
+		delete(a.chunkedResps, chunk.ReqID)
+	}
 }
 
 // classifyNetworkError determines the type of network error
