@@ -18,6 +18,7 @@ func main() {
 	secret := flag.String("secret", "", "tunnel secret (optional)")
 	protocol := flag.String("protocol", "http", "protocol type: 'http' or 'tcp'")
 	port := flag.Int("port", 0, "port number (required for TCP tunnels)")
+	customURL := flag.String("custom-url", "", "custom URL path, e.g. 'bob/chatbot'")
 	flag.Parse()
 
 	// Validate TCP configuration
@@ -63,6 +64,7 @@ func main() {
 		Secret:    tunnelSecret,
 		Protocol:  *protocol,
 		Port:      *port,
+		CustomURL: *customURL,
 	}
 
 	agent.Run()

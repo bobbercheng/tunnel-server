@@ -23,14 +23,16 @@ import (
 )
 
 type RegisterReq struct {
-	Protocol string `json:"protocol"` // "http" or "tcp"
-	Port     int    `json:"port"`     // for TCP tunnels, the local port being tunneled
+	Protocol  string `json:"protocol"`           // "http" or "tcp"
+	Port      int    `json:"port"`               // for TCP tunnels, the local port being tunneled
+	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
 }
 
 type RegisterResp struct {
 	ID        string `json:"id"`
 	Secret    string `json:"secret"`
 	PublicURL string `json:"public_url"`
+	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol  string `json:"protocol"`
 	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
 }
@@ -120,6 +122,7 @@ type Agent struct {
 	Secret    string
 	Protocol  string // "http" or "tcp"
 	Port      int    // for TCP tunnels
+	CustomURL string // custom URL for this tunnel
 
 	// Retry state
 	consecutiveDNSFailures     int
@@ -160,6 +163,9 @@ func (a *Agent) Run() {
 		fmt.Println("  ID:", a.ID)
 		fmt.Println("  Secret:", a.Secret)
 		fmt.Println("  Public URL:", reg.PublicURL)
+		if reg.CustomURL != "" {
+			fmt.Println("  Custom URL:", reg.CustomURL)
+		}
 	}
 
 	for {
@@ -190,6 +196,9 @@ func (a *Agent) Run() {
 			fmt.Println("  ID:", a.ID)
 			fmt.Println("  Secret:", a.Secret)
 			fmt.Println("  New Public URL:", reg.PublicURL)
+			if reg.CustomURL != "" {
+				fmt.Println("  Custom URL:", reg.CustomURL)
+			}
 			continue
 		}
 
@@ -595,8 +604,9 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 
 func (a *Agent) register() (*RegisterResp, error) {
 	req := RegisterReq{
-		Protocol: a.Protocol,
-		Port:     a.Port,
+		Protocol:  a.Protocol,
+		Port:      a.Port,
+		CustomURL: a.CustomURL,
 	}
 
 	// Default to HTTP if not specified
