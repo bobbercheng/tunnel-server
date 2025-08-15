@@ -5,7 +5,7 @@
 ## 1. Overview
 
 This project implements a lightweight reverse-tunnel HTTP proxy using Google Cloud Run and Go.
-- A Cloud Run "server" exposes a public URL: `https://<service>/pub/{tunnel_id}/...`
+- A Cloud Run "server" exposes a public URL: `https://<service>/__pub__/{tunnel_id}/...`
 - An on-prem/inside-network "agent" keeps a persistent WebSocket to the server.
 - Every public HTTP request received by the server is forwarded through that WebSocket to the agent, which proxies it to your internal HTTP service and streams the response back.
 
@@ -17,14 +17,14 @@ This is faster and simpler than the Firestore/Cloud Functions long-polling appro
 
 ### 2.1 Server (Cloud Run)
 - **Endpoints:**
-  - `POST /register` → returns `{id, secret, public_url}`
-  - `GET /ws?id=...&secret=...` → WebSocket endpoint for agents
-  - `ANY /pub/{id}/...` → Public HTTP entrypoint, forwarded to the agent
+  - `POST /__register__` → returns `{id, secret, public_url}`
+  - `GET /__ws__?id=...&secret=...` → WebSocket endpoint for agents
+  - `ANY /__pub__/{id}/...` → Public HTTP entrypoint, forwarded to the agent
 - Keeps in-memory maps for tunnels and active agents (PoC). For production, use Redis/Memorystore or Pub/Sub/NATS to share state across instances.
 
 ### 2.2 Agent (runs near your internal HTTP service)
 - Registers to get tunnel id/secret/public_url
-- Opens a WebSocket to `/ws`
+- Opens a WebSocket to `/__ws__`
 - For each request frame, forwards to the local HTTP service and returns the response over the WebSocket
 
 ### 2.3 Message protocol (JSON over WebSocket)
@@ -118,12 +118,12 @@ This path relies on the server code's fallback to `r.Host` when `PUBLIC_BASE_URL
    ```
    The agent will:
    - POST `/register` to get `{id, secret, public_url}`
-   - Print `public_url` (e.g. `https://tunnel-server-abc123-uc.a.run.app/pub/<id>`)
-   - Open a WebSocket to `/ws`
+   - Print `public_url` (e.g. `https://tunnel-server-abc123-uc.a.run.app/__pub__/<id>`)
+   - Open a WebSocket to `/__ws__`
 
 5. **Test**
    ```bash
-   curl -i https://tunnel-server-abc123-uc.a.run.app/pub/<id>/
+   curl -i https://tunnel-server-abc123-uc.a.run.app/__pub__/<id>/
    ```
    You should see the same response as your local service at `http://127.0.0.1:8080/`
 
@@ -186,7 +186,7 @@ WantedBy=multi-user.target
 - Protect `/register` (IAM, mTLS, an API key, or a signed token).
 - Consider signing every frame (HMAC) to prevent tampering.
 - Rotate secrets and expire tunnels after inactivity.
-- Optionally whitelist IPs or require JWTs on `/pub` or on `/ws`.
+- Optionally whitelist IPs or require JWTs on `/__pub__` or on `/__ws__`.
 
 ---
 
@@ -221,9 +221,9 @@ WantedBy=multi-user.target
 
 | Symptom | Cause | Solution |
 |---------|--------|----------|
-| `curl` to `/pub/` returns 502 or "agent not connected" | Agent not connected or crashed | Check agent logs |
+| `curl` to `/__pub__/` returns 502 or "agent not connected" | Agent not connected or crashed | Check agent logs |
 | "timeout waiting agent" | Internal HTTP service slow or not reachable | Increase timeouts or verify service |
-| 401 unauthorized on `/ws` | Wrong id/secret pair | Delete the tunnel, register again |
+| 401 unauthorized on `/__ws__` | Wrong id/secret pair | Delete the tunnel, register again |
 | Multiple agents for the same id bouncing | PoC doesn't coordinate multi-connect properly | Avoid multiple agents for the same id or implement locking with Redis |
 
 ---

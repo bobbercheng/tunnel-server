@@ -33,7 +33,7 @@ func main() {
 	}
 
 	// Determine protocol type based on URL path
-	if strings.Contains(targetURL.Path, "/tcp/") {
+	if strings.Contains(targetURL.Path, "/__tcp__/") {
 		// TCP tunnel mode
 		log.Printf("Detected TCP tunnel: %s", *publicURL)
 		startTcpProxy(*publicURL, *localPort)
@@ -55,7 +55,7 @@ func startHttpProxy(publicURL, localPort string) {
 		Scheme: targetURL.Scheme,
 		Host:   targetURL.Host,
 	}
-	tunnelPath := targetURL.Path // This should be /pub/{id}
+	tunnelPath := targetURL.Path // This should be /__pub__/{id}
 
 	proxy := httputil.NewSingleHostReverseProxy(baseURL)
 

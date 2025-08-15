@@ -6,7 +6,7 @@ export REGION=us-east1
 export SERVICE=tunnel-server
 export IMAGE_NAME=gcr.io/$PROJECT_ID/tunnel-server
 
-# Build using Cloud Build from parent directory to include crypto package
+# Build using Cloud Build from parent directory to include crypto package and GeoLite2 database
 echo "Building Docker image using Cloud Build..."
 cd ..
 

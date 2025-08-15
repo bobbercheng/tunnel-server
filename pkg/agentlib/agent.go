@@ -237,7 +237,7 @@ func (a *Agent) runOnce() error {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	wsURL := fmt.Sprintf("%s/ws?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
+	wsURL := fmt.Sprintf("%s/__ws__?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
 
 	// Configure WebSocket options with larger message size limit
 	ws, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
@@ -609,7 +609,7 @@ func (a *Agent) register() (*RegisterResp, error) {
 		return nil, err
 	}
 
-	resp, err := http.Post(a.ServerURL+"/register", "application/json", bytes.NewReader(reqBody))
+	resp, err := http.Post(a.ServerURL+"/__register__", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}

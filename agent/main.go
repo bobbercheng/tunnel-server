@@ -12,7 +12,7 @@ import (
 
 func main() {
 	server := flag.String("server", "", "Cloud Run base, e.g. https://<service>-<hash>-uc.a.run.app")
-	publicURL := flag.String("public-url", "", "Public URL of the tunnel, e.g. https://<service>/pub/<id>")
+	publicURL := flag.String("public-url", "", "Public URL of the tunnel, e.g. https://<service>/__pub__/<id>")
 	local := flag.String("local", "http://127.0.0.1:8080", "local http service")
 	id := flag.String("id", "", "tunnel id (optional)")
 	secret := flag.String("secret", "", "tunnel secret (optional)")
@@ -40,8 +40,8 @@ func main() {
 		}
 		serverURL = u.Scheme + "://" + u.Host
 		pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(pathParts) < 2 || pathParts[0] != "pub" {
-			fmt.Println("Invalid public URL format. Expected /pub/<id>")
+		if len(pathParts) < 2 || pathParts[0] != "__pub__" {
+			fmt.Println("Invalid public URL format. Expected /__pub__/<id>")
 			os.Exit(1)
 		}
 		tunnelID = pathParts[1]

@@ -11,27 +11,32 @@ The tunnel server is the cloud component of a reverse tunneling system that allo
 ### Core Components
 
 - **WebSocket Server**: Handles persistent connections from tunnel agents
-- **Public HTTP Gateway**: Exposes tunneled services through `/pub/{id}/` endpoints  
+- **Public HTTP Gateway**: Exposes tunneled services through `/__pub__/{id}/` endpoints and custom URLs
 - **Enhanced Smart Routing System**: Multi-header client fingerprinting with learning capabilities
 - **Client Tracker**: Intelligent client identification and tunnel mapping with adaptive learning
 - **Encryption Layer**: ChaCha20-Poly1305 AEAD encryption for all tunnel communication
-- **Registration System**: Issues tunnel credentials and public URLs
+- **Registration System**: Issues tunnel credentials and public URLs with optional custom URLs
+- **Custom URL System**: Case-sensitive memorable URLs like `/bob/chatbot` instead of `/__pub__/{uuid}`
 
 ### Request Flow
 
 ```
-Public Request → Enhanced Smart Router → Client Fingerprinting → Tunnel Selection → Agent → Local Service → Response
+Public Request → Custom URL Router → Enhanced Smart Router → Client Fingerprinting → Tunnel Selection → Agent → Local Service → Response
 ```
 
 ## Endpoints
 
 ### Core Endpoints
 
-- `POST /register` - Register a new tunnel and get public URL
-- `GET /ws` - WebSocket endpoint for agent connections  
-- `GET /pub/{id}/*` - Public access to tunneled HTTP services
-- `GET /tcp/{id}` - WebSocket endpoint for TCP tunneling
-- `GET /health` - Health check and active connections status
+- `POST /__register__` - Register a new tunnel and get public URL (supports custom URLs)
+- `GET /__ws__` - WebSocket endpoint for agent connections  
+- `GET /__pub__/{id}/*` - Public access to tunneled HTTP services (legacy UUID-based)
+- `GET /__tcp__/{id}` - WebSocket endpoint for TCP tunneling
+- `GET /__health__` - Health check and active connections status
+
+### Custom URL Endpoints
+
+- `GET /{custom-path}/*` - Public access via memorable custom URLs (e.g., `/bob/chatbot/api`)
 
 ### Enhanced Smart Routing (Fallback)
 
@@ -41,7 +46,7 @@ Public Request → Enhanced Smart Router → Client Fingerprinting → Tunnel Se
 
 ### Problem Solved
 
-Single-page applications (SPAs) served through tunnels often generate absolute asset paths like `/assets/polyfills-B8p9DdqU.js` that bypass the tunnel prefix, causing 404 errors. These requests should be routed to `/pub/{tunnelID}/assets/polyfills-B8p9DdqU.js`.
+Single-page applications (SPAs) served through tunnels often generate absolute asset paths like `/assets/polyfills-B8p9DdqU.js` that bypass the tunnel prefix, causing 404 errors. These requests should be routed to `/__pub__/{tunnelID}/assets/polyfills-B8p9DdqU.js`.
 
 ### Enhanced Solution Architecture
 
@@ -75,7 +80,7 @@ Asset Request: /assets/file.js
 │    Attempts         │ (<5% fallback usage)      │
 └─────────────────────────────────────────────────┘
         ↓
-   Route to: /pub/{detectedID}/assets/file.js
+   Route to: /__pub__/{detectedID}/assets/file.js
 ```
 
 ### Enhanced Detection Strategies
@@ -95,8 +100,8 @@ Asset Request: /assets/file.js
 
 #### 3. Enhanced Referer Analysis  
 - **Purpose**: Fallback detection with learning integration
-- **Mechanism**: Extract tunnel ID from `Referer: https://server.../pub/{tunnelID}/page`
-- **Regex**: `^/pub/([a-f0-9\-]+)(/.*)?$`
+- **Mechanism**: Extract tunnel ID from `Referer: https://server.../__pub__/{tunnelID}/page`
+- **Regex**: `^/__pub__/([a-f0-9\-]+)(/.*)?$`
 - **Learning**: Records successful mappings for future use
 - **Success Rate**: ~90% for normal browser requests
 
@@ -175,14 +180,99 @@ var (
 #### Route Integration
 
 ```go
-// Smart fallback must be registered last (catch-all)
-mux.HandleFunc("/register", registerHandler)
-mux.HandleFunc("/ws", wsHandler)
-mux.HandleFunc("/pub/", publicHandler)
-mux.HandleFunc("/tcp/", tcpHandler)
-mux.HandleFunc("/health", healthHandler)
-mux.HandleFunc("/", smartFallbackHandler) // ← Catch-all route
+// Updated route registration with custom URL support
+mux.HandleFunc("/__register__", registerHandler)
+mux.HandleFunc("/__ws__", wsHandler)
+mux.HandleFunc("/__pub__/", publicHandler)
+mux.HandleFunc("/__tcp__/", tcpHandler)
+mux.HandleFunc("/__health__", healthHandler)
+mux.HandleFunc("/", customURLHandler) // ← Custom URL + smart fallback handler
 ```
+
+## Custom URLs
+
+### Overview
+
+Custom URLs provide memorable, branded paths instead of cryptic UUID-based URLs:
+
+- **Traditional**: `https://server.run.app/__pub__/abc123-def456-789abc-012def/api`
+- **Custom**: `https://server.run.app/company/api`
+
+### Registration
+
+Register tunnels with custom URLs via the registration endpoint:
+
+```bash
+curl -X POST https://server/__register__ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "protocol": "http",
+    "custom_url": "company/api"
+  }'
+```
+
+Response includes both traditional and custom URLs:
+
+```json
+{
+  "id": "abc123-def456-789abc-012def",
+  "secret": "...",
+  "public_url": "https://server/__pub__/abc123-def456-789abc-012def",
+  "custom_url": "https://server/company/api",
+  "protocol": "http"
+}
+```
+
+### URL Rules
+
+Custom URLs follow strict validation rules:
+
+- **Format**: `/[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*`
+- **Case-Sensitive**: `/Bob/ChatBot` and `/bob/chatbot` are different URLs
+- **Length**: 1-64 characters (after removing leading/trailing slashes)
+- **Characters**: Letters, numbers, hyphens, underscores, and forward slashes only
+- **Reserved Paths**: Cannot conflict with system endpoints (`__health__`, `__pub__`, etc.)
+- **Uniqueness**: Each custom URL must be unique across the server
+
+### Path Routing
+
+Custom URLs support intelligent path forwarding:
+
+```bash
+# Root access
+GET /company/api → agent receives /
+
+# Nested paths
+GET /company/api/users → agent receives /users
+GET /company/api/v1/data → agent receives /v1/data
+
+# Prefix matching
+GET /company/api-v2 → matches /company/api custom URL if registered
+```
+
+### Validation Examples
+
+```bash
+# Valid custom URLs
+"bob/chatbot"     ✅
+"Company/API"     ✅
+"user_123/app-v2" ✅
+
+# Invalid custom URLs
+"bob@chatbot"     ❌ (invalid character @)
+"__health__"      ❌ (reserved system path)
+"very-long-url-that-exceeds-the-64-character-limit-for-custom-paths" ❌ (too long)
+""                ❌ (empty after normalization)
+```
+
+### Integration with Smart Routing
+
+Custom URLs work seamlessly with the existing smart routing system:
+
+1. **Priority Order**: Custom URL matching → Smart routing fallback
+2. **Asset Handling**: SPAs work transparently with custom URLs
+3. **Learning**: Smart router learns custom URL patterns for better performance
+4. **Fallback**: If custom URL tunnel fails, falls back to smart routing
 
 ## Security Features
 
@@ -249,7 +339,7 @@ go build -o ../server-bin
 
 ### Health Endpoint
 ```bash
-curl https://your-server.run.app/health
+curl https://your-server.run.app/__health__
 ```
 
 Response:
@@ -271,34 +361,50 @@ Response:
     "session_ttl": "30m0s",
     "max_sessions": 10000,
     "confidence_distribution": {
-      "high (>0.7)": 120,
+      "high (0.7-1.0)": 120,
       "medium (0.3-0.7)": 25,
-      "low (<0.3)": 5
+      "low (0.0-0.3)": 5
     }
+  },
+  "custom_urls": {
+    "total_custom_urls": 5,
+    "active_mappings": 4,
+    "registered_paths": [
+      "bob/chatbot",
+      "company/api", 
+      "Alice/WebApp",
+      "demo/service"
+    ]
   }
 }
 ```
 
 ### Enhanced Logs
-Smart routing events are logged with detailed context:
+Smart routing and custom URL events are logged with detailed context:
 ```
+Custom URL routing: /bob/chatbot -> tunnel abc123
+Custom URL routing: /company/api/users -> tunnel def456
 Smart routing: /assets/file.js -> tunnel abc123 (client-tracker, conf=0.85)
 Smart routing: /api/data -> tunnel def456 (referer)
 Smart routing: /chunks/xyz.js -> tunnel ghi789 (parallel)
 Smart routing failed: /missing.js (tried 3 tunnels)
 ClientTracker: cleaned up 15 expired sessions
+Registered tunnel abc123 with custom URL: bob/chatbot (stateless)
+Cleaned up custom URL mapping: company/api -> def456
 ```
 
 ## Limitations
 
 ### Current Constraints
 - **In-Memory State**: Single instance deployment required
-- **No Persistence**: Tunnels lost on server restart  
-- **Memory Cache**: Asset mappings cleared on restart
+- **No Persistence**: Tunnels and custom URLs lost on server restart  
+- **Memory Cache**: Asset mappings and custom URL mappings cleared on restart
+- **Custom URL Conflicts**: No reservation system - first-come-first-served on restart
 
 ### Scalability Considerations
 - Current design optimized for single Cloud Run instance
 - Horizontal scaling would require external state management
+- Custom URL mappings could be moved to Redis for shared state
 - Cache could be moved to Redis for shared state
 
 ## Supported Clients
@@ -391,3 +497,32 @@ ClientTracker: cleaned up 15 expired sessions
 4. Test with real applications
 
 The Smart Routing system makes the tunnel server compatible with any modern web application without requiring changes to the application code.
+
+## Client Agent Compatibility
+
+### Endpoint Updates Required
+
+⚠️ **Breaking Change**: System endpoints have been moved to uncommon names to free up namespace for custom URLs.
+
+Client agents must be updated to use the new endpoints:
+
+| Old Endpoint | New Endpoint | Purpose |
+|--------------|--------------|---------|
+| `/register` | `/__register__` | Tunnel registration |
+| `/ws` | `/__ws__` | WebSocket connections |
+| `/health` | `/__health__` | Health monitoring |
+
+### Legacy Support
+
+- No automatic redirects from old to new endpoints
+- Existing agents will fail to connect until updated
+- Update all agent configurations before deploying new server version
+
+### Migration Strategy
+
+1. Update agent code to use new endpoints
+2. Test agents against updated server
+3. Deploy updated server and agents simultaneously
+
+# TODO
+1. Test geolite db from maxmind
