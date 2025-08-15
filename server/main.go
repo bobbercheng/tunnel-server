@@ -2089,19 +2089,19 @@ func (ct *ClientTracker) GetClientStats() map[string]interface{} {
 
 	// Confidence distribution
 	confidenceRanges := map[string]int{
-		"high (>0.7)":      0,
+		"high (0.7-1.0)":   0,
 		"medium (0.3-0.7)": 0,
-		"low (<0.3)":       0,
+		"low (0.0-0.3)":    0,
 	}
 
 	for _, session := range ct.clientSessions {
 		conf := session.Confidence
 		if conf > 0.7 {
-			confidenceRanges["high (>0.7)"]++
+			confidenceRanges["high (0.7-1.0)"]++
 		} else if conf >= 0.3 {
 			confidenceRanges["medium (0.3-0.7)"]++
 		} else {
-			confidenceRanges["low (<0.3)"]++
+			confidenceRanges["low (0.0-0.3)"]++
 		}
 	}
 
