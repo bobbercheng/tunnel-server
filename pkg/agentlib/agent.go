@@ -72,6 +72,27 @@ type HandshakeFrame struct {
 	Salt string `json:"salt"` // base64 encoded salt
 }
 
+// RegisterFrame is used for agent registration over WebSocket (encrypted)
+type RegisterFrame struct {
+	Type      string `json:"type"`               // "register"
+	Protocol  string `json:"protocol"`           // "http" or "tcp"
+	Port      int    `json:"port"`               // for TCP tunnels, the local port being tunneled
+	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
+}
+
+// RegisterResponseFrame is the server's response to registration (encrypted)
+type RegisterResponseFrame struct {
+	Type      string `json:"type"`               // "register_response"
+	ID        string `json:"id"`
+	Secret    string `json:"secret"`
+	PublicURL string `json:"public_url"`        // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
+	Protocol  string `json:"protocol"`
+	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`    // error message if Success is false
+}
+
 // TCP Frame types for raw TCP tunneling
 type TcpConnectFrame struct {
 	Type   string `json:"type"`    // "tcp_connect"
@@ -151,22 +172,7 @@ type ChunkedResponse struct {
 }
 
 func (a *Agent) Run() {
-	if a.ID == "" || a.Secret == "" {
-		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
-		reg, err := a.register()
-		if err != nil {
-			fmt.Println("FATAL: initial registration failed:", err)
-			return
-		}
-		a.ID, a.Secret = reg.ID, reg.Secret
-		fmt.Println("Registered successfully!")
-		fmt.Println("  ID:", a.ID)
-		fmt.Println("  Secret:", a.Secret)
-		fmt.Println("  Public URL:", reg.PublicURL)
-		if reg.CustomURL != "" {
-			fmt.Println("  Custom URL:", reg.CustomURL)
-		}
-	}
+	// Note: Registration now happens over WebSocket during connection
 
 	for {
 		err := a.runOnce()
@@ -246,7 +252,14 @@ func (a *Agent) runOnce() error {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	wsURL := fmt.Sprintf("%s/__ws__?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
+	var wsURL string
+	if a.ID != "" && a.Secret != "" {
+		// Reconnection with existing credentials
+		wsURL = fmt.Sprintf("%s/__ws__?id=%s&secret=%s", a.ServerURL, url.QueryEscape(a.ID), url.QueryEscape(a.Secret))
+	} else {
+		// New connection - no credentials yet
+		wsURL = fmt.Sprintf("%s/__ws__", a.ServerURL)
+	}
 
 	// Configure WebSocket options with larger message size limit
 	ws, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
@@ -295,8 +308,16 @@ func (a *Agent) runOnce() error {
 		return fmt.Errorf("invalid salt in handshake: %w", err)
 	}
 
-	// Create cipher with the same master secret but isServer=false
-	masterSecret := sha256Sum([]byte(a.Secret))
+	// Create cipher - for new connections we'll use a well-known temporary secret, for reconnections we use the stored secret
+	var secretForHandshake string
+	if a.Secret != "" {
+		secretForHandshake = a.Secret
+	} else {
+		// For new connections, use a well-known temporary secret that the server will also use
+		secretForHandshake = "temp_handshake_secret_for_registration"
+	}
+	
+	masterSecret := sha256Sum([]byte(secretForHandshake))
 	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false) // false = isClient
 	if err != nil {
 		return fmt.Errorf("failed to create cipher: %w", err)
@@ -315,6 +336,19 @@ func (a *Agent) runOnce() error {
 	}
 
 	fmt.Println("Connection established successfully with encryption.")
+
+	// If this is a new connection (no ID/Secret), perform registration over encrypted WebSocket
+	if a.ID == "" || a.Secret == "" {
+		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
+		err := a.registerOverWebSocket(ctx, ws, cipher)
+		if err != nil {
+			return fmt.Errorf("WebSocket registration failed: %w", err)
+		}
+		fmt.Println("Registered successfully!")
+		fmt.Println("  ID:", a.ID)
+		fmt.Println("  Secret:", a.Secret)
+		// Note: Public URL and Custom URL will be logged by registerOverWebSocket
+	}
 
 	// Create a context that will be cancelled when the connection closes
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -600,6 +634,74 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 		return resp.StatusCode, resp.Header, buffer.Bytes(), nil
 	}
 	return resp.StatusCode, resp.Header, buffer.Bytes(), nil
+}
+
+// registerOverWebSocket performs registration over encrypted WebSocket connection
+func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, cipher *crypto.StreamCipher) error {
+	// Create registration frame
+	regFrame := &RegisterFrame{
+		Type:      "register",
+		Protocol:  a.Protocol,
+		Port:      a.Port,
+		CustomURL: a.CustomURL,
+	}
+
+	// Default to HTTP if not specified
+	if regFrame.Protocol == "" {
+		regFrame.Protocol = "http"
+	}
+
+	// Encrypt and send registration request
+	regData, err := json.Marshal(regFrame)
+	if err != nil {
+		return fmt.Errorf("failed to marshal registration: %w", err)
+	}
+
+	encryptedRegData, err := cipher.Encrypt(regData)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt registration: %w", err)
+	}
+
+	if err := ws.Write(ctx, websocket.MessageBinary, encryptedRegData); err != nil {
+		return fmt.Errorf("failed to send registration: %w", err)
+	}
+
+	// Wait for registration response
+	_, responseData, err := ws.Read(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read registration response: %w", err)
+	}
+
+	// Decrypt response
+	decryptedResponse, err := cipher.Decrypt(responseData)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt registration response: %w", err)
+	}
+
+	var regResp RegisterResponseFrame
+	if err := json.Unmarshal(decryptedResponse, &regResp); err != nil {
+		return fmt.Errorf("failed to parse registration response: %w", err)
+	}
+
+	if regResp.Type != "register_response" {
+		return fmt.Errorf("unexpected response type: %s", regResp.Type)
+	}
+
+	if !regResp.Success {
+		return fmt.Errorf("registration failed: %s", regResp.Error)
+	}
+
+	// Store the registration details
+	a.ID = regResp.ID
+	a.Secret = regResp.Secret
+	
+	// Log the URLs
+	fmt.Println("  Public URL:", regResp.PublicURL)
+	if regResp.CustomURL != "" {
+		fmt.Println("  Custom URL:", regResp.CustomURL)
+	}
+
+	return nil
 }
 
 func (a *Agent) register() (*RegisterResp, error) {

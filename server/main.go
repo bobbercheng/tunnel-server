@@ -39,7 +39,7 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/__register__", registerHandler)
+	// mux.HandleFunc("/__register__", registerHandler) // Disabled: Registration now happens over WebSocket
 	mux.HandleFunc("/__ws__", wsHandler) // agent websocket
 	mux.HandleFunc("/__pub__/", publicHandler)
 	mux.HandleFunc("/__tcp__/", tcpHandler)

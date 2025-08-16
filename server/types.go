@@ -61,6 +61,27 @@ type HandshakeFrame struct {
 	Salt string `json:"salt"` // base64 encoded salt
 }
 
+// RegisterFrame is used for agent registration over WebSocket (encrypted)
+type RegisterFrame struct {
+	Type      string `json:"type"`               // "register"
+	Protocol  string `json:"protocol"`           // "http" or "tcp"
+	Port      int    `json:"port"`               // for TCP tunnels, the local port being tunneled
+	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
+}
+
+// RegisterResponseFrame is the server's response to registration (encrypted)
+type RegisterResponseFrame struct {
+	Type      string `json:"type"`               // "register_response"
+	ID        string `json:"id"`
+	Secret    string `json:"secret"`
+	PublicURL string `json:"public_url"`        // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
+	Protocol  string `json:"protocol"`
+	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`    // error message if Success is false
+}
+
 // TCP Frame types for raw TCP tunneling
 type TcpConnectFrame struct {
 	Type   string `json:"type"`    // "tcp_connect"

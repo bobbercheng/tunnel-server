@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	crypto "tunnel.local/crypto"
 
 	"nhooyr.io/websocket"
@@ -19,23 +22,27 @@ import (
 
 // wsHandler handles WebSocket connections from agents
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a new connection (no id/secret) or existing agent reconnection
 	id := r.URL.Query().Get("id")
 	secret := r.URL.Query().Get("secret")
+	
+	var existingTunnel *TunnelInfo
+	var isReconnection bool
+	
+	if id != "" && secret != "" {
+		// This is a reconnection attempt - verify tunnel exists and secret matches
+		tunnelsMu.RLock()
+		tunnel, exists := tunnels[id]
+		tunnelsMu.RUnlock()
 
-	if id == "" || secret == "" {
-		http.Error(w, "missing id or secret", http.StatusBadRequest)
-		return
+		if !exists || tunnel.Secret != secret {
+			http.Error(w, "invalid id or secret", http.StatusUnauthorized)
+			return
+		}
+		existingTunnel = tunnel
+		isReconnection = true
 	}
-
-	// Verify tunnel exists and secret matches
-	tunnelsMu.RLock()
-	tunnel, exists := tunnels[id]
-	tunnelsMu.RUnlock()
-
-	if !exists || tunnel.Secret != secret {
-		http.Error(w, "invalid id or secret", http.StatusUnauthorized)
-		return
-	}
+	// If no id/secret provided, this is a new connection that will register over WebSocket
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       []string{"tunnel"},
@@ -48,8 +55,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusInternalError, "server error")
 
 	ac := &agentConn{
-		id:               id,
-		secret:           secret,
+		id:               id, // Will be empty for new connections until registration
+		secret:           secret, // Will be empty for new connections until registration
 		ws:               conn,
 		connectedAt:      time.Now(),
 		waiters:          make(map[string]chan *RespFrame),
@@ -58,33 +65,56 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		lastPong:         time.Now(),
 	}
 
-	// Register agent
-	agentsMu.Lock()
-	agents[id] = ac
-	agentsMu.Unlock()
+	// For reconnections, register agent immediately
+	if isReconnection {
+		agentsMu.Lock()
+		agents[id] = ac
+		agentsMu.Unlock()
+	}
 
 	defer func() {
-		agentsMu.Lock()
-		delete(agents, id)
-		agentsMu.Unlock()
+		if ac.id != "" { // Only clean up if agent was fully registered
+			agentsMu.Lock()
+			delete(agents, ac.id)
+			agentsMu.Unlock()
 
-		// Close all TCP connections
-		ac.tcpConnsMu.Lock()
-		for _, tcpConn := range ac.tcpConns {
-			tcpConn.close("agent disconnected")
+			// Close all TCP connections
+			ac.tcpConnsMu.Lock()
+			for _, tcpConn := range ac.tcpConns {
+				tcpConn.close("agent disconnected")
+			}
+			ac.tcpConnsMu.Unlock()
+
+			log.Printf("Agent %s disconnected", ac.id)
 		}
-		ac.tcpConnsMu.Unlock()
-
-		log.Printf("Agent %s disconnected", id)
 	}()
 
-	// Perform key exchange
-	if err := performKeyExchange(r.Context(), ac); err != nil {
-		log.Printf("Key exchange failed for agent %s: %v", id, err)
+	// Perform key exchange with temporary secret for new connections
+	var keyExchangeSecret string
+	if isReconnection {
+		keyExchangeSecret = secret
+	} else {
+		// For new connections, use a well-known temporary secret for key exchange
+		// The real secret will be generated during registration
+		keyExchangeSecret = "temp_handshake_secret_for_registration"
+		ac.secret = keyExchangeSecret
+	}
+	
+	if err := performKeyExchange(r.Context(), ac, keyExchangeSecret); err != nil {
+		log.Printf("Key exchange failed for agent: %v", err)
 		return
 	}
 
-	log.Printf("Agent %s connected with encrypted tunnel (protocol: %s)", id, tunnel.Protocol)
+	if isReconnection {
+		log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s)", id, existingTunnel.Protocol)
+	} else {
+		log.Printf("New agent connected, waiting for registration")
+		// Handle registration over encrypted WebSocket
+		if err := handleWebSocketRegistration(r.Context(), ac); err != nil {
+			log.Printf("Registration failed for new agent: %v", err)
+			return
+		}
+	}
 
 	// Create connection-specific context for proper cleanup coordination
 	connCtx, connCancel := context.WithCancel(context.Background())
@@ -114,7 +144,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // performKeyExchange handles the initial key exchange with the agent
-func performKeyExchange(ctx context.Context, ac *agentConn) error {
+func performKeyExchange(ctx context.Context, ac *agentConn, secret string) error {
 	// Generate salt for key derivation
 	salt := make([]byte, 32)
 	if _, err := rand.Read(salt); err != nil {
@@ -132,7 +162,7 @@ func performKeyExchange(ctx context.Context, ac *agentConn) error {
 	}
 
 	// Create cipher with derived keys (hash the secret like the agent does)
-	masterSecret := sha256.Sum256([]byte(ac.secret))
+	masterSecret := sha256.Sum256([]byte(secret))
 	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, true)
 	if err != nil {
 		return fmt.Errorf("failed to create cipher: %w", err)
@@ -158,6 +188,143 @@ func performKeyExchange(ctx context.Context, ac *agentConn) error {
 	}
 
 	return nil
+}
+
+// handleWebSocketRegistration handles agent registration over encrypted WebSocket
+func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
+	// Wait for registration message
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	_, regData, err := ac.ws.Read(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read registration: %w", err)
+	}
+
+	// Decrypt registration message
+	decryptedData, err := ac.cipher.Decrypt(regData)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt registration: %w", err)
+	}
+
+	var regFrame RegisterFrame
+	if err := json.Unmarshal(decryptedData, &regFrame); err != nil {
+		return fmt.Errorf("failed to parse registration: %w", err)
+	}
+
+	if regFrame.Type != "register" {
+		return fmt.Errorf("expected register frame, got: %s", regFrame.Type)
+	}
+
+	// Validate registration data
+	if regFrame.Protocol == "" {
+		regFrame.Protocol = "http"
+	}
+	if regFrame.Protocol != "http" && regFrame.Protocol != "tcp" {
+		return sendRegistrationError(ac, "protocol must be 'http' or 'tcp'")
+	}
+	if regFrame.Protocol == "tcp" && regFrame.Port <= 0 {
+		return sendRegistrationError(ac, "port is required for TCP tunnels")
+	}
+
+	// Validate custom URL if provided
+	if err := validateCustomURL(regFrame.CustomURL); err != nil {
+		return sendRegistrationError(ac, fmt.Sprintf("invalid custom URL: %s", err.Error()))
+	}
+
+	// Check if custom URL is available
+	if regFrame.CustomURL != "" && !isCustomURLAvailable(regFrame.CustomURL) {
+		return sendRegistrationError(ac, "custom URL is already taken")
+	}
+
+	// Generate tunnel ID and secret
+	id := uuid.NewString()
+	secret := randHex(32)
+
+	// Normalize custom URL
+	var normalizedCustomURL string
+	if regFrame.CustomURL != "" {
+		normalizedCustomURL = strings.Trim(regFrame.CustomURL, "/")
+	}
+
+	// Create tunnel info
+	tunnelInfo := &TunnelInfo{
+		Secret:    secret,
+		Protocol:  regFrame.Protocol,
+		Port:      regFrame.Port,
+		Created:   time.Now(),
+		CustomURL: normalizedCustomURL,
+	}
+
+	// Register tunnel
+	tunnelsMu.Lock()
+	tunnels[id] = tunnelInfo
+	tunnelsMu.Unlock()
+
+	// Register custom URL mapping if provided
+	if normalizedCustomURL != "" {
+		customURLsMu.Lock()
+		customURLs[normalizedCustomURL] = id
+		customURLsMu.Unlock()
+		log.Printf("Registered tunnel %s with custom URL: %s (WebSocket)", id, normalizedCustomURL)
+	} else {
+		log.Printf("Registered tunnel %s (WebSocket)", id)
+	}
+
+	// Update agent connection with real ID and secret
+	ac.id = id
+	ac.secret = secret
+
+	// Register agent in active connections
+	agentsMu.Lock()
+	agents[id] = ac
+	agentsMu.Unlock()
+
+	// Build URLs
+	publicBase := os.Getenv("PUBLIC_BASE_URL")
+	if publicBase == "" {
+		// Since we're in WebSocket context, we need to reconstruct the base URL
+		// We'll use a default scheme and assume standard port
+		publicBase = "https://localhost" // This will need to be configured properly
+	}
+
+	var publicURL string
+	var tcpPort int
+	if regFrame.Protocol == "tcp" {
+		publicURL = fmt.Sprintf("%s/__tcp__/%s", publicBase, id)
+		tcpPort = regFrame.Port
+	} else {
+		publicURL = fmt.Sprintf("%s/__pub__/%s", publicBase, id)
+	}
+
+	var customURLResponse string
+	if normalizedCustomURL != "" {
+		customURLResponse = fmt.Sprintf("%s/%s", publicBase, normalizedCustomURL)
+	}
+
+	// Send registration response
+	response := &RegisterResponseFrame{
+		Type:      "register_response",
+		ID:        id,
+		Secret:    secret,
+		PublicURL: publicURL,
+		CustomURL: customURLResponse,
+		Protocol:  regFrame.Protocol,
+		TcpPort:   tcpPort,
+		Success:   true,
+	}
+
+	return ac.writeEncrypted(ctx, response)
+}
+
+// sendRegistrationError sends an encrypted error response for registration
+func sendRegistrationError(ac *agentConn, errorMsg string) error {
+	response := &RegisterResponseFrame{
+		Type:    "register_response",
+		Success: false,
+		Error:   errorMsg,
+	}
+	return ac.writeEncrypted(context.Background(), response)
 }
 
 // registerWaiter registers a channel to wait for a response
@@ -227,6 +394,9 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		ac.handlePong(data)
 	case "tunnel_info":
 		ac.handleTunnelInfo(data)
+	case "register":
+		// Registration should be handled during initial connection, not here
+		log.Printf("Unexpected register message from agent %s", ac.id)
 	default:
 		log.Printf("Unknown message type from agent %s: %s", ac.id, baseMsg.Type)
 	}
