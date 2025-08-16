@@ -98,7 +98,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if msgType != websocket.MessageText {
+		if msgType != websocket.MessageBinary {
 			log.Printf("Unexpected message type from agent %s: %v", id, msgType)
 			continue
 		}
@@ -132,19 +132,13 @@ func performKeyExchange(ctx context.Context, ac *agentConn) error {
 	}
 	ac.cipher = cipher
 
-	// Wait for acknowledgment (encrypted "ack" message)
+	// Wait for acknowledgment (plain text "handshake" message)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	_, encryptedData, err := ac.ws.Read(ctx)
+	_, ackData, err := ac.ws.Read(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read ack: %w", err)
-	}
-
-	// Decrypt and verify acknowledgment
-	ackData, err := ac.cipher.Decrypt(encryptedData)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt ack: %w", err)
 	}
 
 	var ackMsg map[string]interface{}
@@ -152,8 +146,8 @@ func performKeyExchange(ctx context.Context, ac *agentConn) error {
 		return fmt.Errorf("failed to parse ack: %w", err)
 	}
 
-	if ackMsg["type"] != "ack" {
-		return fmt.Errorf("expected ack message, got: %v", ackMsg["type"])
+	if ackMsg["type"] != "handshake" || ackMsg["ack"] != true {
+		return fmt.Errorf("expected handshake ack message, got: %v", ackMsg)
 	}
 
 	return nil
