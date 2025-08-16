@@ -20,13 +20,8 @@ import (
 	crypto "tunnel.local/crypto"
 
 	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
-
-type RegisterReq struct {
-	Protocol  string `json:"protocol"`             // "http" or "tcp"
-	Port      int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
-	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
-}
 
 type RegisterResp struct {
 	ID        string `json:"id"`
@@ -705,29 +700,109 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 }
 
 func (a *Agent) register() (*RegisterResp, error) {
-	req := RegisterReq{
+	// Create WebSocket connection for registration (without existing credentials)
+	wsURL := strings.Replace(a.ServerURL, "http", "ws", 1) + "/__ws__"
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect for registration: %w", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "registration complete")
+
+	// Complete handshake first
+	var handshake HandshakeFrame
+	err = wsjson.Read(ctx, conn, &handshake)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read handshake: %w", err)
+	}
+
+	// Send handshake ACK
+	handshakeResp := map[string]interface{}{
+		"type": "handshake",
+		"ack":  true,
+	}
+	err = wsjson.Write(ctx, conn, handshakeResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send handshake ACK: %w", err)
+	}
+
+	// Create cipher for registration
+	salt, err := base64.StdEncoding.DecodeString(handshake.Salt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode salt: %w", err)
+	}
+
+	// Use the well-known temporary secret that the server expects for new registrations
+	tempSecretString := "temp_handshake_secret_for_registration"
+	masterSecret := sha256.Sum256([]byte(tempSecretString))
+	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Create registration frame
+	regFrame := &RegisterFrame{
+		Type:      "register",
 		Protocol:  a.Protocol,
 		Port:      a.Port,
 		CustomURL: a.CustomURL,
 	}
 
 	// Default to HTTP if not specified
-	if req.Protocol == "" {
-		req.Protocol = "http"
+	if regFrame.Protocol == "" {
+		regFrame.Protocol = "http"
 	}
 
-	reqBody, err := json.Marshal(req)
+	// Encrypt and send registration request
+	regData, err := json.Marshal(regFrame)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal registration: %w", err)
 	}
 
-	resp, err := http.Post(a.ServerURL+"/__register__", "application/json", bytes.NewReader(reqBody))
+	encryptedRegData, err := cipher.Encrypt(regData)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to encrypt registration: %w", err)
 	}
-	defer resp.Body.Close()
-	var r RegisterResp
-	return &r, json.NewDecoder(resp.Body).Decode(&r)
+
+	if err := conn.Write(ctx, websocket.MessageBinary, encryptedRegData); err != nil {
+		return nil, fmt.Errorf("failed to send registration: %w", err)
+	}
+
+	// Wait for registration response
+	_, responseData, err := conn.Read(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read registration response: %w", err)
+	}
+
+	// Decrypt response
+	decryptedResponse, err := cipher.Decrypt(responseData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt registration response: %w", err)
+	}
+
+	var regResp RegisterResponseFrame
+	if err := json.Unmarshal(decryptedResponse, &regResp); err != nil {
+		return nil, fmt.Errorf("failed to parse registration response: %w", err)
+	}
+
+	if regResp.Type != "register_response" {
+		return nil, fmt.Errorf("unexpected response type: %s", regResp.Type)
+	}
+
+	if !regResp.Success {
+		return nil, fmt.Errorf("registration failed: %s", regResp.Error)
+	}
+
+	// Convert to RegisterResp format for compatibility
+	return &RegisterResp{
+		ID:        regResp.ID,
+		Secret:    regResp.Secret,
+		PublicURL: regResp.PublicURL,
+		CustomURL: regResp.CustomURL,
+	}, nil
 }
 
 func mustJSON(v any) []byte {

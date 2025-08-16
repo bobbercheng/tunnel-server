@@ -171,7 +171,7 @@ curl https://server/__pub__/abc123-def456/users
 - Streaming responses supported with timeouts
 - Use server/deploy.sh to deploy server to GCP
 - Always use GCP server to test client and proxy
-- GCP server url is https://tunnel-server-3w6u4kmniq-ue.a.run.app
+- GCP server url is https://tunnel-server-56084501768.us-east1.run.app
 - Always write new unit test for new feature and run unit test for regression test
 - Smart routing requires no application changes - works transparently with SPAs
 - TCP tunneling supports databases, SSH, and other TCP services

@@ -524,5 +524,65 @@ Client agents must be updated to use the new endpoints:
 2. Test agents against updated server
 3. Deploy updated server and agents simultaneously
 
+# Log Monitoring and Debugging
+
+This server includes powerful log viewing utilities for monitoring and debugging Cloud Run deployments.
+
+## Quick Log Access
+
+```bash
+# Show recent logs
+./quick-logs.sh recent
+
+# Show errors and warnings
+./quick-logs.sh errors
+
+# Follow logs in real-time
+./quick-logs.sh live
+
+# Show connection issues
+./quick-logs.sh disconnect
+
+# Show ping/pong communication
+./quick-logs.sh ping
+
+# Monitor specific agent
+./quick-logs.sh agent <agent-id>
+```
+
+## Advanced Log Filtering
+
+```bash
+# Show logs with advanced options
+./logs.sh --help
+
+# Examples
+./logs.sh --errors -l 100          # Last 100 error logs
+./logs.sh --websocket -f           # Follow WebSocket logs
+./logs.sh --agent abc123 -t 1h     # Agent logs for last hour
+./logs.sh --ping --fresh           # Recent ping activity
+```
+
+For detailed documentation, see [LOG_VIEWER.md](./LOG_VIEWER.md).
+
+## Common Debugging Scenarios
+
+### Connection Issues
+```bash
+./quick-logs.sh disconnect    # Recent connection problems
+./logs.sh --websocket -f      # Real-time WebSocket monitoring
+```
+
+### Performance Problems
+```bash
+./quick-logs.sh errors        # Show errors and timeouts
+./logs.sh | grep -i timeout   # Find timeout patterns
+```
+
+### URL Mismatch (401/404 errors)
+```bash
+./quick-logs.sh recent        # Check for wrong server URLs
+```
+
 # TODO
 1. Test geolite db from maxmind
