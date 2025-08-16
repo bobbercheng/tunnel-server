@@ -697,6 +697,106 @@ func (tc *TcpConn) close(reason string) {
 	close(tc.closeCh)
 }
 
+// validateAndCleanupStaleConnections checks for and removes stale agent connections
+// This is called on server startup to handle connections that may have persisted
+// from before a server restart but are no longer valid
+func validateAndCleanupStaleConnections() {
+	agentsMu.Lock()
+	defer agentsMu.Unlock()
+
+	if len(agents) == 0 {
+		log.Println("Connection validation: No existing connections to validate")
+		return
+	}
+
+	staleConnections := make([]*agentConn, 0)
+	validConnections := 0
+
+	// Check each connection for staleness indicators
+	for id, conn := range agents {
+		if isConnectionStale(conn) {
+			log.Printf("Connection validation: Marking agent %s as stale (connected %v ago, last pong %v ago)", 
+				id, time.Since(conn.connectedAt), time.Since(conn.lastPong))
+			staleConnections = append(staleConnections, conn)
+		} else {
+			validConnections++
+		}
+	}
+
+	log.Printf("Connection validation: Found %d valid connections, %d stale connections", 
+		validConnections, len(staleConnections))
+
+	// Close stale connections asynchronously to avoid blocking server startup
+	if len(staleConnections) > 0 {
+		go func() {
+			for _, conn := range staleConnections {
+				closeStaleConnection(conn, "server restart validation")
+			}
+		}()
+	}
+}
+
+// isConnectionStale determines if a connection should be considered stale
+func isConnectionStale(conn *agentConn) bool {
+	now := time.Now()
+	
+	// Connection is stale if:
+	// 1. Last pong is older than 30 seconds (likely disconnected during restart)
+	// 2. Connection time is more than 5 minutes old but no recent pong activity
+	// 3. Connection was made before the current server process started (if we could detect that)
+	
+	timeSinceLastPong := now.Sub(conn.lastPong)
+	timeSinceConnect := now.Sub(conn.connectedAt)
+	
+	// If last pong is older than 30 seconds, likely stale
+	if timeSinceLastPong > 30*time.Second {
+		return true
+	}
+	
+	// If connected more than 5 minutes ago but no pong in last minute, likely stale
+	if timeSinceConnect > 5*time.Minute && timeSinceLastPong > 1*time.Minute {
+		return true
+	}
+	
+	return false
+}
+
+// closeStaleConnection safely closes a stale connection
+func closeStaleConnection(conn *agentConn, reason string) {
+	if conn == nil || conn.ws == nil {
+		return
+	}
+	
+	// Close the WebSocket connection
+	err := conn.ws.Close(websocket.StatusGoingAway, reason)
+	if err != nil {
+		log.Printf("Error closing stale connection for agent %s: %v", conn.id, err)
+	} else {
+		log.Printf("Closed stale connection for agent %s: %s", conn.id, reason)
+	}
+}
+
+// schedulePeriodicConnectionValidation sets up a routine to periodically validate connections
+// This provides ongoing monitoring in addition to startup validation
+func schedulePeriodicConnectionValidation() {
+	go func() {
+		// Run validation every 5 minutes
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			agentsMu.RLock()
+			connectionCount := len(agents)
+			agentsMu.RUnlock()
+			
+			if connectionCount > 0 {
+				log.Printf("Periodic connection validation: Checking %d connections", connectionCount)
+				validateAndCleanupStaleConnections()
+			}
+		}
+	}()
+}
+
 // getAgent retrieves an agent connection by ID
 func getAgent(id string) *agentConn {
 	agentsMu.RLock()

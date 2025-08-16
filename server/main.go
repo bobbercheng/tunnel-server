@@ -28,6 +28,13 @@ var (
 )
 
 func main() {
+	// Validate and cleanup any stale connections from previous server instance
+	log.Println("Performing connection validation on startup...")
+	validateAndCleanupStaleConnections()
+	
+	// Start periodic connection validation routine
+	schedulePeriodicConnectionValidation()
+	
 	// Start client tracker cleanup routine
 	go func() {
 		ticker := time.NewTicker(clientTracker.cleanupInterval)
