@@ -88,6 +88,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			delete(agents, ac.id)
 			agentsMu.Unlock()
 
+			// Clean up custom URL mappings for this tunnel
+			cleanupCustomURLsForTunnel(ac.id)
+
 			// Close all TCP connections
 			ac.tcpConnsMu.Lock()
 			for _, tcpConn := range ac.tcpConns {
