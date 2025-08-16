@@ -11,11 +11,10 @@ import (
 var (
 	// Reserved paths that cannot be used as custom URLs
 	reservedPaths = map[string]bool{
-		"__health__":   true,
-		"__pub__":      true,
-		"__register__": true,
-		"__ws__":       true,
-		"__tcp__":      true,
+		"__health__": true,
+		"__pub__":    true,
+		"__ws__":     true,
+		"__tcp__":    true,
 	}
 
 	// Custom URL validation regex
