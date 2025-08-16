@@ -58,11 +58,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close(websocket.StatusInternalError, "server error")
 
+	// Extract client IP and perform geolocation lookup
+	clientIP := extractRealClientIP(r)
+	geoData := lookupIPGeoData(clientIP)
+
 	ac := &agentConn{
 		id:               id,     // Will be empty for new connections until registration
 		secret:           secret, // Will be empty for new connections until registration
 		ws:               conn,
 		connectedAt:      time.Now(),
+		clientIP:         clientIP,
+		geoData:          geoData,
 		waiters:          make(map[string]chan *RespFrame),
 		tcpConns:         make(map[string]*TcpConn),
 		chunkedResponses: make(map[string]*ChunkedResponse),
@@ -89,7 +95,15 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			ac.tcpConnsMu.Unlock()
 
-			log.Printf("Agent %s disconnected", ac.id)
+			if ac.geoData != nil && ac.geoData.Country != "" {
+				if ac.geoData.City != "" {
+					log.Printf("Agent %s disconnected from %s, %s, %s (%s)", ac.id, ac.geoData.Country, ac.geoData.Region, ac.geoData.City, ac.clientIP)
+				} else {
+					log.Printf("Agent %s disconnected from %s, %s (%s)", ac.id, ac.geoData.Country, ac.geoData.Region, ac.clientIP)
+				}
+			} else {
+				log.Printf("Agent %s disconnected from %s", ac.id, ac.clientIP)
+			}
 		}
 	}()
 
@@ -110,9 +124,25 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isReconnection {
-		log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s)", id, existingTunnel.Protocol)
+		if geoData != nil && geoData.Country != "" {
+			if geoData.City != "" {
+				log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s) from %s, %s, %s (%s)", id, existingTunnel.Protocol, geoData.Country, geoData.Region, geoData.City, clientIP)
+			} else {
+				log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s) from %s, %s (%s)", id, existingTunnel.Protocol, geoData.Country, geoData.Region, clientIP)
+			}
+		} else {
+			log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s) from %s", id, existingTunnel.Protocol, clientIP)
+		}
 	} else {
-		log.Printf("New agent connected, waiting for registration")
+		if geoData != nil && geoData.Country != "" {
+			if geoData.City != "" {
+				log.Printf("New agent connected from %s, %s, %s (%s), waiting for registration", geoData.Country, geoData.Region, geoData.City, clientIP)
+			} else {
+				log.Printf("New agent connected from %s, %s (%s), waiting for registration", geoData.Country, geoData.Region, clientIP)
+			}
+		} else {
+			log.Printf("New agent connected from %s, waiting for registration", clientIP)
+		}
 		// Handle registration over encrypted WebSocket
 		if err := handleWebSocketRegistration(r.Context(), ac); err != nil {
 			log.Printf("Registration failed for new agent: %v", err)

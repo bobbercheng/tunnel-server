@@ -126,6 +126,8 @@ type agentConn struct {
 	ws          *websocket.Conn
 	cipher      *crypto.StreamCipher
 	connectedAt time.Time
+	clientIP    string
+	geoData     *IPGeoData
 
 	writeMu sync.Mutex
 
@@ -271,6 +273,7 @@ type FingerprintConfig struct {
 type IPGeoData struct {
 	Country   string    `json:"country"`
 	Region    string    `json:"region"`
+	City      string    `json:"city"`
 	CacheTime time.Time `json:"cache_time"`
 }
 

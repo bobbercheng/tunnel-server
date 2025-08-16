@@ -250,11 +250,18 @@ func lookupIPGeoData(clientIP string) *IPGeoData {
 
 	subdivision := ""
 	if len(record.Subdivisions) > 0 {
-		subdivision = record.Subdivisions[0].IsoCode
+		subdivision = record.Subdivisions[0].Names["en"]
+		if subdivision == "" {
+			subdivision = record.Subdivisions[0].IsoCode
+		}
 	}
+
+	city := record.City.Names["en"]
+
 	return &IPGeoData{
-		Country:   record.Country.IsoCode,
+		Country:   record.Country.Names["en"],
 		Region:    subdivision,
+		City:      city,
 		CacheTime: time.Now(),
 	}
 }

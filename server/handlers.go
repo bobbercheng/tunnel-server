@@ -131,6 +131,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		ConnectedAt string `json:"connected_at"`
 		Encrypted   bool   `json:"encrypted"`
 		CustomURL   string `json:"custom_url,omitempty"`
+		ClientIP    string `json:"client_ip,omitempty"`
+		Country     string `json:"country,omitempty"`
+		Region      string `json:"region,omitempty"`
+		City        string `json:"city,omitempty"`
 	}
 
 	info := struct {
@@ -158,11 +162,25 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			customURL = tunnel.CustomURL
 		}
 		
+		// Extract geolocation info
+		country := ""
+		region := ""
+		city := ""
+		if conn.geoData != nil {
+			country = conn.geoData.Country
+			region = conn.geoData.Region
+			city = conn.geoData.City
+		}
+
 		info.ActiveConnections = append(info.ActiveConnections, agentInfo{
 			ID:          id,
 			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
 			Encrypted:   conn.cipher != nil,
 			CustomURL:   customURL,
+			ClientIP:    conn.clientIP,
+			Country:     country,
+			Region:      region,
+			City:        city,
 		})
 	}
 

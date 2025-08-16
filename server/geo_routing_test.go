@@ -44,6 +44,12 @@ func testIPGeoDataLookup(t *testing.T) {
 			description: "Should handle IPs without geo data gracefully",
 		},
 		{
+			name:        "User provided IP", 
+			ip:          "173.34.203.180", // User's public IP 
+			expectData:  true,
+			description: "Should return geographical data for user's IP",
+		},
+		{
 			name:        "Invalid IP",
 			ip:          "invalid-ip",
 			expectData:  false,
@@ -79,7 +85,7 @@ func testIPGeoDataLookup(t *testing.T) {
 				}
 				
 				// For some IPs (like private IPs), country may be empty - that's OK
-				t.Logf("IP %s: Country=%s, Region=%s", tt.ip, geoData.Country, geoData.Region)
+				t.Logf("IP %s: Country=%s, Region=%s, City=%s", tt.ip, geoData.Country, geoData.Region, geoData.City)
 			} else {
 				if geoData != nil {
 					t.Errorf("Expected nil geo data for IP %s, got %+v", tt.ip, geoData)
@@ -289,7 +295,7 @@ func testGeoRoutingIntegration(t *testing.T) {
 		return
 	}
 	
-	t.Logf("Extracted geo data - Country: %s, Region: %s", geoData.Country, geoData.Region)
+	t.Logf("Extracted geo data - Country: %s, Region: %s, City: %s", geoData.Country, geoData.Region, geoData.City)
 	
 	// Test fingerprint extraction includes geographical context
 	fingerprint := extractFingerprint(req)
