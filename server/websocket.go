@@ -25,10 +25,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if this is a new connection (no id/secret) or existing agent reconnection
 	id := r.URL.Query().Get("id")
 	secret := r.URL.Query().Get("secret")
-	
+
 	var existingTunnel *TunnelInfo
 	var isReconnection bool
-	
+
 	if id != "" && secret != "" {
 		// This is a reconnection attempt - verify tunnel exists and secret matches
 		tunnelsMu.RLock()
@@ -48,6 +48,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		Subprotocols:       []string{"tunnel"},
 		InsecureSkipVerify: true,
 	})
+	if err == nil {
+		// Set read limit to 20MB to handle large encrypted messages (crypto MaxPlaintextSize is 16MB + encryption overhead)
+		conn.SetReadLimit(20 * 1024 * 1024)
+	}
 	if err != nil {
 		log.Printf("WebSocket accept failed: %v", err)
 		return
@@ -55,7 +59,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusInternalError, "server error")
 
 	ac := &agentConn{
-		id:               id, // Will be empty for new connections until registration
+		id:               id,     // Will be empty for new connections until registration
 		secret:           secret, // Will be empty for new connections until registration
 		ws:               conn,
 		connectedAt:      time.Now(),
@@ -99,7 +103,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		keyExchangeSecret = "temp_handshake_secret_for_registration"
 		ac.secret = keyExchangeSecret
 	}
-	
+
 	if err := performKeyExchange(r.Context(), ac, keyExchangeSecret); err != nil {
 		log.Printf("Key exchange failed for agent: %v", err)
 		return
@@ -390,6 +394,8 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		ac.handleTCPData(data)
 	case "tcp_disconnect":
 		ac.handleTCPDisconnect(data)
+	case "ping":
+		ac.handlePing(data)
 	case "pong":
 		ac.handlePong(data)
 	case "tunnel_info":
@@ -538,6 +544,25 @@ func (ac *agentConn) handleTCPDisconnect(data []byte) {
 	}
 }
 
+// handlePing processes ping messages from the agent and sends pong response
+func (ac *agentConn) handlePing(data []byte) {
+	var ping PingFrame
+	if err := json.Unmarshal(data, &ping); err != nil {
+		log.Printf("Failed to parse ping from agent %s: %v", ac.id, err)
+		return
+	}
+
+	// Respond with pong
+	pong := &PongFrame{
+		Type:      "pong",
+		Timestamp: ping.Timestamp,
+	}
+
+	if err := ac.writeEncrypted(context.Background(), pong); err != nil {
+		log.Printf("Failed to send pong to agent %s: %v", ac.id, err)
+	}
+}
+
 // handlePong processes pong messages for connection health monitoring
 func (ac *agentConn) handlePong(data []byte) {
 	var pong PongFrame
@@ -584,7 +609,7 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 			lastPong := ac.lastPong
 			ac.pingMu.RUnlock()
 
-			if time.Since(lastPong) > 2*time.Minute {
+			if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
 				log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
 				// Force close the WebSocket to trigger cleanup
 				ac.ws.Close(websocket.StatusGoingAway, "unresponsive")

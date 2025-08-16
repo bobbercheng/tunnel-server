@@ -23,8 +23,8 @@ import (
 )
 
 type RegisterReq struct {
-	Protocol  string `json:"protocol"`           // "http" or "tcp"
-	Port      int    `json:"port"`               // for TCP tunnels, the local port being tunneled
+	Protocol  string `json:"protocol"`             // "http" or "tcp"
+	Port      int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
 	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
 }
 
@@ -74,23 +74,23 @@ type HandshakeFrame struct {
 
 // RegisterFrame is used for agent registration over WebSocket (encrypted)
 type RegisterFrame struct {
-	Type      string `json:"type"`               // "register"
-	Protocol  string `json:"protocol"`           // "http" or "tcp"
-	Port      int    `json:"port"`               // for TCP tunnels, the local port being tunneled
+	Type      string `json:"type"`                 // "register"
+	Protocol  string `json:"protocol"`             // "http" or "tcp"
+	Port      int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
 	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
 }
 
 // RegisterResponseFrame is the server's response to registration (encrypted)
 type RegisterResponseFrame struct {
-	Type      string `json:"type"`               // "register_response"
+	Type      string `json:"type"` // "register_response"
 	ID        string `json:"id"`
 	Secret    string `json:"secret"`
-	PublicURL string `json:"public_url"`        // Default /__pub__/{id} or /__tcp__/{id}
+	PublicURL string `json:"public_url"`           // Default /__pub__/{id} or /__tcp__/{id}
 	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol  string `json:"protocol"`
 	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
 	Success   bool   `json:"success"`
-	Error     string `json:"error,omitempty"`    // error message if Success is false
+	Error     string `json:"error,omitempty"` // error message if Success is false
 }
 
 // TCP Frame types for raw TCP tunneling
@@ -316,7 +316,7 @@ func (a *Agent) runOnce() error {
 		// For new connections, use a well-known temporary secret that the server will also use
 		secretForHandshake = "temp_handshake_secret_for_registration"
 	}
-	
+
 	masterSecret := sha256Sum([]byte(secretForHandshake))
 	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false) // false = isClient
 	if err != nil {
@@ -426,7 +426,7 @@ func (a *Agent) runOnce() error {
 				lastPong := a.lastPong
 				a.pingMu.RUnlock()
 
-				if time.Since(lastPong) > 90*time.Second { // 3 missed pings
+				if time.Since(lastPong) > 150*time.Second { // 5 missed pings, more lenient for cloud environments
 					log.Println("Connection appears to be dead (no pong received), closing...")
 					cancelCtx()
 					return
@@ -694,7 +694,7 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 	// Store the registration details
 	a.ID = regResp.ID
 	a.Secret = regResp.Secret
-	
+
 	// Log the URLs
 	fmt.Println("  Public URL:", regResp.PublicURL)
 	if regResp.CustomURL != "" {
