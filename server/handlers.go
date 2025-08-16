@@ -130,6 +130,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		ID          string `json:"id"`
 		ConnectedAt string `json:"connected_at"`
 		Encrypted   bool   `json:"encrypted"`
+		CustomURL   string `json:"custom_url,omitempty"`
 	}
 
 	info := struct {
@@ -147,10 +148,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for id, conn := range agents {
+		// Look up custom URL for this tunnel
+		tunnelsMu.RLock()
+		tunnel := tunnels[id]
+		tunnelsMu.RUnlock()
+		
+		customURL := ""
+		if tunnel != nil && tunnel.CustomURL != "" {
+			customURL = tunnel.CustomURL
+		}
+		
 		info.ActiveConnections = append(info.ActiveConnections, agentInfo{
 			ID:          id,
 			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
 			Encrypted:   conn.cipher != nil,
+			CustomURL:   customURL,
 		})
 	}
 
