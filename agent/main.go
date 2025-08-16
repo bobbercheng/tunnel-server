@@ -19,11 +19,18 @@ func main() {
 	protocol := flag.String("protocol", "http", "protocol type: 'http' or 'tcp'")
 	port := flag.Int("port", 0, "port number (required for TCP tunnels)")
 	customURL := flag.String("custom-url", "", "custom URL path, e.g. 'bob/chatbot'")
+	useRedirect := flag.Bool("use-redirect", false, "enable SPA redirection for React/Vue/Angular apps (requires custom URL)")
 	flag.Parse()
 
 	// Validate TCP configuration
 	if *protocol == "tcp" && *port <= 0 {
 		fmt.Println("--port is required for TCP tunnels")
+		os.Exit(1)
+	}
+
+	// Validate redirection configuration
+	if *useRedirect && *customURL == "" {
+		fmt.Println("--use-redirect requires a --custom-url")
 		os.Exit(1)
 	}
 
@@ -58,13 +65,14 @@ func main() {
 	}
 
 	agent := &agentlib.Agent{
-		ServerURL: serverURL,
-		LocalURL:  *local,
-		ID:        tunnelID,
-		Secret:    tunnelSecret,
-		Protocol:  *protocol,
-		Port:      *port,
-		CustomURL: *customURL,
+		ServerURL:   serverURL,
+		LocalURL:    *local,
+		ID:          tunnelID,
+		Secret:      tunnelSecret,
+		Protocol:    *protocol,
+		Port:        *port,
+		CustomURL:   *customURL,
+		UseRedirect: *useRedirect,
 	}
 
 	agent.Run()

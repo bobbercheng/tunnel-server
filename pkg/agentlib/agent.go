@@ -24,12 +24,13 @@ import (
 )
 
 type RegisterResp struct {
-	ID        string `json:"id"`
-	Secret    string `json:"secret"`
-	PublicURL string `json:"public_url"`
-	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
-	Protocol  string `json:"protocol"`
-	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
+	ID          string `json:"id"`
+	Secret      string `json:"secret"`
+	PublicURL   string `json:"public_url"`
+	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	Protocol    string `json:"protocol"`
+	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
+	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled
 }
 
 type ReqFrame struct {
@@ -69,23 +70,25 @@ type HandshakeFrame struct {
 
 // RegisterFrame is used for agent registration over WebSocket (encrypted)
 type RegisterFrame struct {
-	Type      string `json:"type"`                 // "register"
-	Protocol  string `json:"protocol"`             // "http" or "tcp"
-	Port      int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
-	CustomURL string `json:"custom_url,omitempty"` // custom URL like "bob/chatbot"
+	Type        string `json:"type"`                   // "register"
+	Protocol    string `json:"protocol"`               // "http" or "tcp"
+	Port        int    `json:"port"`                   // for TCP tunnels, the local port being tunneled
+	CustomURL   string `json:"custom_url,omitempty"`   // custom URL like "bob/chatbot"
+	UseRedirect bool   `json:"use_redirect,omitempty"` // enable SPA redirection
 }
 
 // RegisterResponseFrame is the server's response to registration (encrypted)
 type RegisterResponseFrame struct {
-	Type      string `json:"type"` // "register_response"
-	ID        string `json:"id"`
-	Secret    string `json:"secret"`
-	PublicURL string `json:"public_url"`           // Default /__pub__/{id} or /__tcp__/{id}
-	CustomURL string `json:"custom_url,omitempty"` // custom URL if requested
-	Protocol  string `json:"protocol"`
-	TcpPort   int    `json:"tcp_port,omitempty"` // for TCP tunnels
-	Success   bool   `json:"success"`
-	Error     string `json:"error,omitempty"` // error message if Success is false
+	Type        string `json:"type"` // "register_response"
+	ID          string `json:"id"`
+	Secret      string `json:"secret"`
+	PublicURL   string `json:"public_url"`             // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	Protocol    string `json:"protocol"`
+	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
+	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled
+	Success     bool   `json:"success"`
+	Error       string `json:"error,omitempty"` // error message if Success is false
 }
 
 // TCP Frame types for raw TCP tunneling
@@ -132,13 +135,14 @@ var (
 )
 
 type Agent struct {
-	ServerURL string
-	LocalURL  string
-	ID        string
-	Secret    string
-	Protocol  string // "http" or "tcp"
-	Port      int    // for TCP tunnels
-	CustomURL string // custom URL for this tunnel
+	ServerURL   string
+	LocalURL    string
+	ID          string
+	Secret      string
+	Protocol    string // "http" or "tcp"
+	Port        int    // for TCP tunnels
+	CustomURL   string // custom URL for this tunnel
+	UseRedirect bool   // enable SPA redirection
 
 	// Retry state
 	consecutiveDNSFailures     int
@@ -199,6 +203,9 @@ func (a *Agent) Run() {
 			fmt.Println("  New Public URL:", reg.PublicURL)
 			if reg.CustomURL != "" {
 				fmt.Println("  Custom URL:", reg.CustomURL)
+				if reg.UseRedirect {
+					fmt.Println("  SPA Redirection: Enabled")
+				}
 			}
 			continue
 		}
@@ -635,10 +642,11 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, cipher *crypto.StreamCipher) error {
 	// Create registration frame
 	regFrame := &RegisterFrame{
-		Type:      "register",
-		Protocol:  a.Protocol,
-		Port:      a.Port,
-		CustomURL: a.CustomURL,
+		Type:        "register",
+		Protocol:    a.Protocol,
+		Port:        a.Port,
+		CustomURL:   a.CustomURL,
+		UseRedirect: a.UseRedirect,
 	}
 
 	// Default to HTTP if not specified
@@ -694,6 +702,9 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 	fmt.Println("  Public URL:", regResp.PublicURL)
 	if regResp.CustomURL != "" {
 		fmt.Println("  Custom URL:", regResp.CustomURL)
+		if regResp.UseRedirect {
+			fmt.Println("  SPA Redirection: Enabled")
+		}
 	}
 
 	return nil
@@ -745,10 +756,11 @@ func (a *Agent) register() (*RegisterResp, error) {
 
 	// Create registration frame
 	regFrame := &RegisterFrame{
-		Type:      "register",
-		Protocol:  a.Protocol,
-		Port:      a.Port,
-		CustomURL: a.CustomURL,
+		Type:        "register",
+		Protocol:    a.Protocol,
+		Port:        a.Port,
+		CustomURL:   a.CustomURL,
+		UseRedirect: a.UseRedirect,
 	}
 
 	// Default to HTTP if not specified
@@ -798,10 +810,11 @@ func (a *Agent) register() (*RegisterResp, error) {
 
 	// Convert to RegisterResp format for compatibility
 	return &RegisterResp{
-		ID:        regResp.ID,
-		Secret:    regResp.Secret,
-		PublicURL: regResp.PublicURL,
-		CustomURL: regResp.CustomURL,
+		ID:          regResp.ID,
+		Secret:      regResp.Secret,
+		PublicURL:   regResp.PublicURL,
+		CustomURL:   regResp.CustomURL,
+		UseRedirect: regResp.UseRedirect,
 	}, nil
 }
 
