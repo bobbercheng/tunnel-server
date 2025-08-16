@@ -283,11 +283,12 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 
 	// Create tunnel info
 	tunnelInfo := &TunnelInfo{
-		Secret:    secret,
-		Protocol:  regFrame.Protocol,
-		Port:      regFrame.Port,
-		Created:   time.Now(),
-		CustomURL: normalizedCustomURL,
+		Secret:      secret,
+		Protocol:    regFrame.Protocol,
+		Port:        regFrame.Port,
+		Created:     time.Now(),
+		CustomURL:   normalizedCustomURL,
+		UseRedirect: regFrame.UseRedirect,
 	}
 
 	// Register tunnel
@@ -338,14 +339,15 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 
 	// Send registration response
 	response := &RegisterResponseFrame{
-		Type:      "register_response",
-		ID:        id,
-		Secret:    secret,
-		PublicURL: publicURL,
-		CustomURL: customURLResponse,
-		Protocol:  regFrame.Protocol,
-		TcpPort:   tcpPort,
-		Success:   true,
+		Type:        "register_response",
+		ID:          id,
+		Secret:      secret,
+		PublicURL:   publicURL,
+		CustomURL:   customURLResponse,
+		Protocol:    regFrame.Protocol,
+		TcpPort:     tcpPort,
+		UseRedirect: regFrame.UseRedirect,
+		Success:     true,
 	}
 
 	return ac.writeEncrypted(ctx, response)

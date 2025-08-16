@@ -28,15 +28,22 @@ Public Request → Custom URL Router → Enhanced Smart Router → Client Finger
 
 ### Core Endpoints
 
-- `POST /__register__` - Register a new tunnel and get public URL (supports custom URLs)
-- `GET /__ws__` - WebSocket endpoint for agent connections  
+- `GET /__ws__` - WebSocket endpoint for agent connections and registration (supports custom URLs and SPA redirection)
 - `GET /__pub__/{id}/*` - Public access to tunneled HTTP services (legacy UUID-based)
 - `GET /__tcp__/{id}` - WebSocket endpoint for TCP tunneling
 - `GET /__health__` - Health check and active connections status
 
+**Note:** Tunnel registration now happens exclusively over encrypted WebSocket connection. HTTP POST registration has been removed.
+
 ### Custom URL Endpoints
 
 - `GET /{custom-path}/*` - Public access via memorable custom URLs (e.g., `/bob/chatbot/api`)
+
+### SPA Redirection Support
+
+- **Opt-in Feature**: Custom URLs with `use_redirect: true` enable SPA routing support
+- **Hybrid Approach**: Initial redirect to `/` with session-based routing for subsequent requests
+- **Framework Support**: Works with React, Vue, Angular, and other SPAs without code changes
 
 ### Enhanced Smart Routing (Fallback)
 
@@ -180,13 +187,13 @@ var (
 #### Route Integration
 
 ```go
-// Updated route registration with custom URL support
-mux.HandleFunc("/__register__", registerHandler)
-mux.HandleFunc("/__ws__", wsHandler)
+// Current route registration (POST registration removed)
+// mux.HandleFunc("/__register__", registerHandler) // Disabled: Registration now happens over WebSocket
+mux.HandleFunc("/__ws__", wsHandler) // agent websocket + registration
 mux.HandleFunc("/__pub__/", publicHandler)
 mux.HandleFunc("/__tcp__/", tcpHandler)
 mux.HandleFunc("/__health__", healthHandler)
-mux.HandleFunc("/", customURLHandler) // ← Custom URL + smart fallback handler
+mux.HandleFunc("/", customURLHandler) // ← Custom URL + smart fallback handler (catch-all)
 ```
 
 ## Custom URLs
@@ -200,15 +207,14 @@ Custom URLs provide memorable, branded paths instead of cryptic UUID-based URLs:
 
 ### Registration
 
-Register tunnels with custom URLs via the registration endpoint:
+Register tunnels with custom URLs via WebSocket connection:
 
-```bash
-curl -X POST https://server/__register__ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "protocol": "http",
-    "custom_url": "company/api"
-  }'
+```json
+{
+  "type": "register",
+  "protocol": "http",
+  "custom_url": "company/api"
+}
 ```
 
 Response includes both traditional and custom URLs:
@@ -273,6 +279,270 @@ Custom URLs work seamlessly with the existing smart routing system:
 2. **Asset Handling**: SPAs work transparently with custom URLs
 3. **Learning**: Smart router learns custom URL patterns for better performance
 4. **Fallback**: If custom URL tunnel fails, falls back to smart routing
+
+## SPA Redirection Support
+
+### Problem Solved
+
+Single Page Applications (SPAs) like React, Vue, and Angular apps often fail when served under custom URLs because they expect to run at the root path (`/`) but are actually accessed via paths like `/myapp`. This causes:
+
+- **Route Matching Failures**: React Router can't match routes under `/myapp`
+- **Blank Pages**: Components fail to render due to unmatched routes
+- **Asset Loading Issues**: Relative paths resolve incorrectly
+
+### Hybrid Redirection Solution
+
+The server provides an **opt-in hybrid redirection system** that solves SPA base path issues without modifying application code:
+
+#### Core Approach
+1. **Initial Redirect**: First request to custom URL root triggers `307 Temporary Redirect` to `/`
+2. **Session Tracking**: Client fingerprinting creates persistent session mapping
+3. **Direct Routing**: Subsequent requests route directly to tunnel without redirect
+4. **Content Preservation**: No HTML modification or asset rewriting required
+
+### Registration with SPA Support
+
+#### WebSocket Registration (Only Method Available)
+```json
+{
+  "type": "register",
+  "protocol": "http",
+  "custom_url": "myapp", 
+  "use_redirect": true
+}
+```
+
+**Note:** HTTP POST registration has been removed. All registration now happens over encrypted WebSocket connection.
+
+#### Response
+```json
+{
+  "id": "abc123-def456",
+  "secret": "...",
+  "public_url": "https://server/__pub__/abc123-def456",
+  "custom_url": "https://server/myapp",
+  "protocol": "http",
+  "use_redirect": true
+}
+```
+
+### Request Flow Example
+
+#### 1. Initial Access (Triggers Redirect)
+```bash
+GET /myapp
+→ 307 Temporary Redirect
+→ Location: /?<query-params>
+```
+
+**Client automatically follows redirect:**
+```bash
+GET /
+→ 200 OK (React app loads normally at root path)
+```
+
+#### 2. Subsequent Requests (Direct Routing)
+```bash
+GET /api/users        → Routes directly to tunnel
+GET /assets/app.js    → Routes directly to tunnel  
+GET /login           → Routes directly to tunnel
+```
+
+### Session Management
+
+#### Client Fingerprinting
+Uses sophisticated multi-header fingerprinting for session persistence:
+- **Authentication**: Authorization headers, session cookies
+- **Browser**: User-Agent, Accept headers, Client Hints
+- **Network**: Real IP extraction, proxy analysis
+- **Framework**: React/Vue/Angular detection headers
+
+#### Session Lifecycle
+- **Creation**: When redirection is first triggered
+- **Duration**: 30-minute TTL with automatic cleanup
+- **Scope**: Per-client, per-custom-URL mapping
+- **Thread Safety**: Concurrent access with proper locking
+
+### Technical Implementation
+
+#### Registration Types Enhanced
+```go
+type RegisterReq struct {
+    Protocol     string `json:"protocol"`
+    CustomURL    string `json:"custom_url,omitempty"`
+    UseRedirect  bool   `json:"use_redirect,omitempty"` // NEW
+}
+
+type TunnelInfo struct {
+    Secret      string `json:"secret"`
+    Protocol    string `json:"protocol"`
+    CustomURL   string `json:"custom_url,omitempty"`
+    UseRedirect bool   `json:"use_redirect,omitempty"` // NEW
+}
+```
+
+#### Session Tracking
+```go
+type RedirectSession struct {
+    CustomURL    string        `json:"custom_url"`
+    TunnelID     string        `json:"tunnel_id"`
+    RedirectTime time.Time     `json:"redirect_time"`
+    LastUsed     time.Time     `json:"last_used"`
+    RequestCount int           `json:"request_count"`
+    Active       bool          `json:"active"`
+    TTL          time.Duration `json:"ttl"`
+}
+```
+
+#### Routing Logic
+```go
+// customURLHandler with redirection support
+func customURLHandler(w http.ResponseWriter, r *http.Request) {
+    // Check for redirection-enabled tunnels
+    if tunnel.UseRedirect && isRootRequest {
+        session := getRedirectSession(clientKey, customURL)
+        if session == nil {
+            // Create session and redirect
+            createRedirectSession(clientKey, customURL, tunnelID)
+            http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+            return
+        }
+    }
+    // Normal tunnel routing...
+}
+
+// Enhanced smart fallback with session awareness
+func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
+    // Check for active redirection sessions
+    if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
+        tryTunnelRouteWithTimeout(w, r, redirectSession.TunnelID, isAsset)
+        return
+    }
+    // Normal smart routing...
+}
+```
+
+### Monitoring and Health
+
+#### Health Endpoint Enhancement
+```bash
+curl https://server/__health__
+```
+
+```json
+{
+  "active_connections": [
+    {
+      "id": "abc123-def456",
+      "custom_url": "myapp",
+      "use_redirect": true,
+      "connected_at": "2024-01-01T00:00:00Z"
+    }
+  ],
+  "redirection_sessions": {
+    "active_sessions": 2,
+    "total_sessions": 15,
+    "total_requests": 347,
+    "sessions_by_tunnel": {
+      "abc123-def456": 1,
+      "def789-abc123": 1
+    },
+    "sessions_by_custom_url": {
+      "myapp": 1,
+      "dashboard": 1
+    }
+  }
+}
+```
+
+### Benefits
+
+#### For SPA Developers
+- ✅ **Zero Code Changes**: No webpack config or routing modifications
+- ✅ **Framework Agnostic**: Works with React, Vue, Angular, Svelte, etc.
+- ✅ **Asset Handling**: JavaScript and CSS assets load correctly
+- ✅ **Development Workflow**: Same local development experience
+
+#### For System Operations  
+- ✅ **Content Preservation**: No HTML modification or proxy rewriting
+- ✅ **Performance**: Only first request redirected (minimal overhead)
+- ✅ **Scalability**: Leverages existing client tracking infrastructure
+- ✅ **Monitoring**: Comprehensive session metrics and health monitoring
+
+#### For End Users
+- ✅ **Branded URLs**: Memorable paths like `/company/app`
+- ✅ **Fast Loading**: Direct routing after initial redirect
+- ✅ **Reliable**: Automatic session management and cleanup
+- ✅ **Compatible**: Works with all modern browsers
+
+### Use Cases
+
+#### Development and Testing
+```json
+// Agent WebSocket registration for local React app
+{
+  "type": "register",
+  "protocol": "http",
+  "custom_url": "dev/myapp",
+  "use_redirect": true
+}
+
+// Access via: https://server/dev/myapp
+// App loads as if running at root: /
+```
+
+#### Production Deployments
+```json
+// Customer-branded URLs
+{
+  "type": "register", 
+  "custom_url": "acme/dashboard",
+  "use_redirect": true
+}
+
+// Multiple versions
+{
+  "type": "register",
+  "custom_url": "acme/v2", 
+  "use_redirect": true
+}
+```
+
+#### Multi-tenant Applications
+```json
+// Tenant-specific SPAs
+{
+  "type": "register",
+  "custom_url": "customer1/app",
+  "use_redirect": true
+}
+
+{
+  "type": "register", 
+  "custom_url": "customer2/app",
+  "use_redirect": true
+}
+```
+
+### Troubleshooting
+
+#### Common Issues
+1. **Session Expiry**: Check 30-minute TTL in health endpoint
+2. **Fingerprint Changes**: Verify consistent User-Agent and IP
+3. **Multiple Tabs**: Each client gets separate session tracking
+4. **Redirection Loops**: Ensure tunnel serves app at root path (`/`)
+
+#### Debug Logging
+```bash
+# Server logs show detailed redirection flow
+Custom URL routing: /myapp -> tunnel abc123
+Redirecting /myapp to / for SPA routing (tunnel: abc123)
+Created redirection session: client=xyz, customURL=myapp, tunnel=abc123
+Smart routing: found active redirection session, routing /api/data to tunnel abc123
+Updated redirection session: customURL=myapp, tunnel=abc123, requests=15
+```
+
+The SPA redirection feature seamlessly integrates with the existing smart routing and custom URL systems, providing a comprehensive solution for serving modern web applications through reverse tunnels.
 
 ## Security Features
 

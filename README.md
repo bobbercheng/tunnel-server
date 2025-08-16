@@ -17,15 +17,23 @@ This is faster and simpler than the Firestore/Cloud Functions long-polling appro
 
 ### 2.1 Server (Cloud Run)
 - **Endpoints:**
-  - `POST /__register__` → returns `{id, secret, public_url}`
-  - `GET /__ws__?id=...&secret=...` → WebSocket endpoint for agents
+  - `GET /__ws__` → WebSocket endpoint for agent connections and registration (supports custom URLs and SPA redirection)
   - `ANY /__pub__/{id}/...` → Public HTTP entrypoint, forwarded to the agent
+  - `ANY /{custom-url}/...` → Custom URL routing with optional SPA redirection support
+  - `GET /__health__` → Health check and tunnel status
+- **Registration:** Now happens over encrypted WebSocket connection, not HTTP POST
+- **Features:**
+  - Enhanced Smart Routing with multi-header client fingerprinting
+  - Custom URL support (e.g., `/bob/chatbot` instead of `/__pub__/{uuid}`)
+  - **SPA Redirection Support**: Opt-in redirection for React/Vue/Angular apps with base path issues
+  - ChaCha20-Poly1305 encryption for all tunnel communication
 - Keeps in-memory maps for tunnels and active agents (PoC). For production, use Redis/Memorystore or Pub/Sub/NATS to share state across instances.
 
 ### 2.2 Agent (runs near your internal HTTP service)
-- Registers to get tunnel id/secret/public_url
-- Opens a WebSocket to `/__ws__`
+- Connects to WebSocket at `/__ws__` and registers over encrypted connection
+- Registration supports custom URLs and optional SPA redirection
 - For each request frame, forwards to the local HTTP service and returns the response over the WebSocket
+- **SPA Support**: Can enable redirection mode to solve React Router base path issues
 
 ### 2.3 Message protocol (JSON over WebSocket)
 
@@ -181,7 +189,74 @@ WantedBy=multi-user.target
 
 ---
 
-## 8. Security Notes
+## 8. SPA Redirection Support (React/Vue/Angular)
+
+### 8.1 Problem Solved
+
+Single Page Applications (SPAs) often fail when served under custom URLs because they expect to run at the root path (`/`) but are actually served under a custom path like `/myapp`. This causes:
+
+- React Router failing to match routes
+- Blank pages instead of the expected application
+- Asset loading issues
+
+### 8.2 Solution: Hybrid Redirection
+
+The server provides an opt-in **hybrid redirection solution** that:
+
+1. **Redirects initial requests** from custom URL to root (`/myapp` → `/`) 
+2. **Tracks client sessions** using sophisticated fingerprinting
+3. **Routes subsequent requests** directly to the correct tunnel without redirection
+4. **Preserves content** (no HTML modification required)
+
+### 8.3 Usage
+
+#### Enable during WebSocket registration:
+```json
+{
+  "type": "register",
+  "protocol": "http", 
+  "custom_url": "myapp",
+  "use_redirect": true
+}
+```
+
+**Note:** Registration is now exclusively via encrypted WebSocket connection. HTTP POST registration has been removed.
+
+### 8.4 How It Works
+
+1. **First request** to `/myapp` → Server returns `307 Temporary Redirect` to `/`
+2. **Client session created** mapping the client to the tunnel 
+3. **Subsequent requests** (`/`, `/api/data`, `/assets/app.js`) route directly to tunnel
+4. **React app runs normally** as it thinks it's at root path
+
+### 8.5 Benefits
+
+- ✅ **No code changes** required in your SPA
+- ✅ **Works with all frameworks** (React, Vue, Angular, etc.)
+- ✅ **Preserves performance** (only first request redirected)
+- ✅ **Session-based** (different users get separate sessions)
+- ✅ **Automatic cleanup** (30-minute TTL)
+
+### 8.6 Monitoring
+
+Check redirection status via health endpoint:
+```bash
+curl https://your-server/__health__ | jq '.redirection_sessions'
+```
+
+```json
+{
+  "active_sessions": 1,
+  "total_sessions": 5, 
+  "total_requests": 127,
+  "sessions_by_tunnel": {"abc123": 1},
+  "sessions_by_custom_url": {"myapp": 1}
+}
+```
+
+---
+
+## 9. Security Notes
 
 - Protect `/register` (IAM, mTLS, an API key, or a signed token).
 - Consider signing every frame (HMAC) to prevent tampering.

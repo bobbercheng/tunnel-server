@@ -21,7 +21,6 @@ import (
 
 // Utility functions and helpers
 
-
 // randHex generates a random hex string of the specified length
 func randHex(n int) string {
 	bytes := make([]byte, n)
@@ -49,30 +48,30 @@ func isAssetRequest(path string) bool {
 		".txt", ".pdf", ".zip", ".tar.gz", ".mp4", ".mp3", ".wav",
 		".webp", ".avif", ".webm", ".ogg", ".flv", ".swf",
 	}
-	
+
 	// Common asset path prefixes
 	assetPrefixes := []string{
 		"/assets/", "/static/", "/public/", "/dist/", "/build/",
 		"/js/", "/css/", "/images/", "/img/", "/fonts/", "/media/",
 		"/_next/", "/_nuxt/", "/webpack/", "/vite/",
 	}
-	
+
 	pathLower := strings.ToLower(path)
-	
+
 	// Check extensions
 	for _, ext := range assetExtensions {
 		if strings.HasSuffix(pathLower, ext) {
 			return true
 		}
 	}
-	
+
 	// Check prefixes
 	for _, prefix := range assetPrefixes {
 		if strings.HasPrefix(pathLower, prefix) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -83,15 +82,15 @@ func isAPIRequest(path string) bool {
 		"/webhook/", "/callback/", "/auth/", "/oauth/", "/login/", "/logout/",
 		"/health", "/status", "/ping", "/metrics", "/admin/",
 	}
-	
+
 	pathLower := strings.ToLower(path)
-	
+
 	for _, prefix := range apiPrefixes {
 		if strings.HasPrefix(pathLower, prefix) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -99,10 +98,10 @@ func isAPIRequest(path string) bool {
 
 var (
 	// Asset mapping cache
-	assetCache      = make(map[string]string) // path -> tunnelID
-	assetCacheMu    sync.RWMutex
-	clientAssetMap  = make(map[string]string) // clientKey -> tunnelID
-	clientAssetMu   sync.RWMutex
+	assetCache     = make(map[string]string) // path -> tunnelID
+	assetCacheMu   sync.RWMutex
+	clientAssetMap = make(map[string]string) // clientKey -> tunnelID
+	clientAssetMu  sync.RWMutex
 
 	// IP-based geographical routing
 	ipTunnelMappings = make(map[string]*IPTunnelMapping) // clientIP -> mapping
@@ -172,7 +171,7 @@ func recordIPTunnelMapping(clientIP, tunnelID string) {
 		mapping.LastTunnelID = tunnelID
 		mapping.LastSuccess = time.Now()
 		mapping.UsageCount++
-		
+
 		// Update success rate using exponential moving average
 		mapping.SuccessRate = mapping.SuccessRate*0.9 + 1.0*0.1
 	}
@@ -211,7 +210,7 @@ func initGeoIP() {
 			"./GeoLite2-City.mmdb",
 			"./geolite/GeoLite2-City.mmdb",
 		}
-		
+
 		for _, path := range commonPaths {
 			if _, err := os.Stat(path); err == nil {
 				geoDBPath = path
@@ -323,9 +322,9 @@ func getGeoRoutingStats() map[string]interface{} {
 	defer geoRoutingMu.RUnlock()
 
 	stats := map[string]interface{}{
-		"ip_mappings":       len(ipTunnelMappings),
-		"geo_preferences":   len(geoRouting),
-		"geoip_available":   geoReader != nil,
+		"ip_mappings":     len(ipTunnelMappings),
+		"geo_preferences": len(geoRouting),
+		"geoip_available": geoReader != nil,
 	}
 
 	// IP mapping statistics
@@ -345,9 +344,9 @@ func getGeoRoutingStats() map[string]interface{} {
 		}
 
 		stats["ip_stats"] = map[string]interface{}{
-			"total_usage":      totalUsage,
-			"high_success":     highSuccessRate,
-			"recent_mappings":  recentMappings,
+			"total_usage":     totalUsage,
+			"high_success":    highSuccessRate,
+			"recent_mappings": recentMappings,
 		}
 	}
 
@@ -370,7 +369,6 @@ func getGeoRoutingStats() map[string]interface{} {
 func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Skip if this is already a system endpoint (avoid infinite loops)
 	if strings.HasPrefix(r.URL.Path, "/__pub__/") ||
-		strings.HasPrefix(r.URL.Path, "/__register__") ||
 		strings.HasPrefix(r.URL.Path, "/__ws__") ||
 		strings.HasPrefix(r.URL.Path, "/__tcp__/") ||
 		strings.HasPrefix(r.URL.Path, "/__health__") {
@@ -384,6 +382,20 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	isAPI := isAPIRequest(r.URL.Path)
 
 	log.Printf("Smart routing: handling request %s (asset: %v, api: %v, client: %s)", r.URL.Path, isAsset, isAPI, clientKey)
+
+	// Check for active redirection sessions - route redirected clients to their assigned tunnels
+	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
+		log.Printf("Smart routing: found active redirection session, routing %s to tunnel %s", r.URL.Path, redirectSession.TunnelID)
+
+		if tryTunnelRouteWithTimeout(w, r, redirectSession.TunnelID, isAsset) {
+			updateRedirectSession(redirectSession)
+			return
+		}
+
+		// If redirection tunnel failed, deactivate the session and continue with normal routing
+		log.Printf("Smart routing: redirection tunnel %s failed, deactivating session", redirectSession.TunnelID)
+		redirectSession.Active = false
+	}
 
 	// PRIORITY: Single tunnel optimization for ALL requests when only one tunnel exists
 	tunnelIDs := getActiveTunnelIDs()
@@ -771,6 +783,6 @@ func init() {
 			os.Setenv("GEOIP_DB_PATH", files[0])
 		}
 	}
-	
+
 	initGeoIP()
 }

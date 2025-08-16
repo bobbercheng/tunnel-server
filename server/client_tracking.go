@@ -717,3 +717,128 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 		return false
 	}
 }
+
+// Redirection session management for SPA routing
+
+// getRedirectSession retrieves an active redirection session for a client and custom URL
+func getRedirectSession(clientKey, customURL string) *RedirectSession {
+	clientTracker.mu.RLock()
+	defer clientTracker.mu.RUnlock()
+	
+	session, exists := clientTracker.clientSessions[clientKey]
+	if !exists || session.RedirectSession == nil {
+		return nil
+	}
+	
+	// Check if the redirection session matches the custom URL and is still active
+	if session.RedirectSession.CustomURL == customURL && session.RedirectSession.Active {
+		// Check TTL
+		if time.Since(session.RedirectSession.RedirectTime) > session.RedirectSession.TTL {
+			return nil // Expired
+		}
+		return session.RedirectSession
+	}
+	
+	return nil
+}
+
+// createRedirectSession creates a new redirection session for SPA routing
+func createRedirectSession(clientKey, customURL, tunnelID string) {
+	clientTracker.mu.Lock()
+	defer clientTracker.mu.Unlock()
+	
+	// Get or create client session
+	session, exists := clientTracker.clientSessions[clientKey]
+	if !exists {
+		session = &ClientSession{
+			ID:             uuid.NewString(),
+			LastSeen:       time.Now(),
+			TunnelMappings: make(map[string]int),
+			SuccessRate:    make(map[string]float64),
+		}
+		clientTracker.clientSessions[clientKey] = session
+	}
+	
+	// Create redirection session with 30-minute TTL
+	session.RedirectSession = &RedirectSession{
+		CustomURL:    customURL,
+		TunnelID:     tunnelID,
+		RedirectTime: time.Now(),
+		LastUsed:     time.Now(),
+		RequestCount: 1,
+		Active:       true,
+		TTL:          30 * time.Minute,
+	}
+	
+	session.LastSeen = time.Now()
+	
+	log.Printf("Created redirection session: client=%s, customURL=%s, tunnel=%s", clientKey, customURL, tunnelID)
+}
+
+// updateRedirectSession updates the usage statistics for an active redirection session
+func updateRedirectSession(redirectSession *RedirectSession) {
+	redirectSession.LastUsed = time.Now()
+	redirectSession.RequestCount++
+	
+	log.Printf("Updated redirection session: customURL=%s, tunnel=%s, requests=%d", 
+		redirectSession.CustomURL, redirectSession.TunnelID, redirectSession.RequestCount)
+}
+
+// getActiveRedirectSession retrieves any active redirection session for a client (regardless of custom URL)
+func getActiveRedirectSession(clientKey string) *RedirectSession {
+	clientTracker.mu.RLock()
+	defer clientTracker.mu.RUnlock()
+	
+	session, exists := clientTracker.clientSessions[clientKey]
+	if !exists || session.RedirectSession == nil {
+		return nil
+	}
+	
+	// Check if the redirection session is still active and not expired
+	if session.RedirectSession.Active {
+		// Check TTL
+		if time.Since(session.RedirectSession.RedirectTime) > session.RedirectSession.TTL {
+			// Mark as inactive but don't modify under read lock
+			return nil
+		}
+		return session.RedirectSession
+	}
+	
+	return nil
+}
+
+// getRedirectionStats returns statistics about active redirection sessions
+func getRedirectionStats() map[string]interface{} {
+	clientTracker.mu.RLock()
+	defer clientTracker.mu.RUnlock()
+	
+	activeCount := 0
+	totalSessions := 0
+	sessionsByTunnel := make(map[string]int)
+	sessionsByCustomURL := make(map[string]int)
+	totalRequests := 0
+	
+	for _, session := range clientTracker.clientSessions {
+		if session.RedirectSession != nil {
+			totalSessions++
+			totalRequests += session.RedirectSession.RequestCount
+			
+			if session.RedirectSession.Active {
+				// Check if not expired
+				if time.Since(session.RedirectSession.RedirectTime) <= session.RedirectSession.TTL {
+					activeCount++
+					sessionsByTunnel[session.RedirectSession.TunnelID]++
+					sessionsByCustomURL[session.RedirectSession.CustomURL]++
+				}
+			}
+		}
+	}
+	
+	return map[string]interface{}{
+		"active_sessions":        activeCount,
+		"total_sessions":         totalSessions,
+		"total_requests":         totalRequests,
+		"sessions_by_tunnel":     sessionsByTunnel,
+		"sessions_by_custom_url": sessionsByCustomURL,
+	}
+}

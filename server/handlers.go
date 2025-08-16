@@ -61,11 +61,12 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tunnelInfo := &TunnelInfo{
-		Secret:    secret,
-		Protocol:  req.Protocol,
-		Port:      req.Port,
-		Created:   time.Now(),
-		CustomURL: normalizedCustomURL,
+		Secret:      secret,
+		Protocol:    req.Protocol,
+		Port:        req.Port,
+		Created:     time.Now(),
+		CustomURL:   normalizedCustomURL,
+		UseRedirect: req.UseRedirect,
 	}
 
 	// Register in memory (Cloud Run stateless)
@@ -111,12 +112,13 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := RegisterResp{
-		ID:        id,
-		Secret:    secret,
-		PublicURL: publicURL,
-		CustomURL: customURLResponse,
-		Protocol:  req.Protocol,
-		TcpPort:   tcpPort,
+		ID:          id,
+		Secret:      secret,
+		PublicURL:   publicURL,
+		CustomURL:   customURLResponse,
+		Protocol:    req.Protocol,
+		TcpPort:     tcpPort,
+		UseRedirect: req.UseRedirect,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -131,6 +133,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		ConnectedAt string `json:"connected_at"`
 		Encrypted   bool   `json:"encrypted"`
 		CustomURL   string `json:"custom_url,omitempty"`
+		UseRedirect bool   `json:"use_redirect,omitempty"`
 		ClientIP    string `json:"client_ip,omitempty"`
 		Country     string `json:"country,omitempty"`
 		Region      string `json:"region,omitempty"`
@@ -143,12 +146,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		ClientTracking      map[string]interface{} `json:"client_tracking"`
 		GeographicalRouting map[string]interface{} `json:"geographical_routing"`
 		CustomURLs          map[string]interface{} `json:"custom_urls"`
+		RedirectionSessions map[string]interface{} `json:"redirection_sessions"`
 	}{
 		ActiveConnections:   make([]agentInfo, 0, len(agents)),
 		ConnectionCount:     len(agents),
 		ClientTracking:      clientTracker.GetClientStats(),
 		GeographicalRouting: getGeoRoutingStats(),
 		CustomURLs:          getCustomURLStats(),
+		RedirectionSessions: getRedirectionStats(),
 	}
 
 	for id, conn := range agents {
@@ -156,12 +161,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		tunnelsMu.RLock()
 		tunnel := tunnels[id]
 		tunnelsMu.RUnlock()
-		
+
 		customURL := ""
 		if tunnel != nil && tunnel.CustomURL != "" {
 			customURL = tunnel.CustomURL
 		}
-		
+
 		// Extract geolocation info
 		country := ""
 		region := ""
@@ -177,6 +182,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			ConnectedAt: conn.connectedAt.Format(time.RFC3339),
 			Encrypted:   conn.cipher != nil,
 			CustomURL:   customURL,
+			UseRedirect: tunnel != nil && tunnel.UseRedirect,
 			ClientIP:    conn.clientIP,
 			Country:     country,
 			Region:      region,
@@ -274,7 +280,6 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	// Skip if this is already a system endpoint
 	if strings.HasPrefix(r.URL.Path, "/__pub__/") ||
-		strings.HasPrefix(r.URL.Path, "/__register__") ||
 		strings.HasPrefix(r.URL.Path, "/__ws__") ||
 		strings.HasPrefix(r.URL.Path, "/__tcp__/") ||
 		strings.HasPrefix(r.URL.Path, "/__health__") {
@@ -283,17 +288,16 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := strings.Trim(r.URL.Path, "/")
-	
+
 	// Try exact custom URL match first (case-sensitive)
 	customURLsMu.RLock()
 	tunnelID := customURLs[path]
 	customURLsMu.RUnlock()
-	
+
 	if tunnelID != "" {
 		log.Printf("Custom URL routing: %s -> tunnel %s", r.URL.Path, tunnelID)
-		
-		// Route to tunnel - the agent will receive request for "/"
-		// For paths like /bob/chatbot/api/data, the agent gets /api/data
+
+		// Calculate forward path first
 		var forwardPath string
 		if path == strings.Trim(r.URL.Path, "/") {
 			forwardPath = "/"
@@ -306,49 +310,83 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 				forwardPath = remaining
 			}
 		}
-		
+
+		// Check if this tunnel has redirection enabled
+		tunnelsMu.RLock()
+		tunnel := tunnels[tunnelID]
+		useRedirect := tunnel != nil && tunnel.UseRedirect
+		tunnelsMu.RUnlock()
+
+		// Handle redirection for SPA base path issues
+		if useRedirect && forwardPath == "/" {
+			// This is a request to the custom URL root - check if we should redirect
+			clientKey := generateClientKey(r)
+
+			// Check if this client already has a redirection session
+			redirectSession := getRedirectSession(clientKey, path)
+
+			if redirectSession == nil || !redirectSession.Active {
+				// Create new redirection session and redirect to root
+				createRedirectSession(clientKey, path, tunnelID)
+
+				log.Printf("Redirecting %s to / for SPA routing (tunnel: %s)", r.URL.Path, tunnelID)
+
+				// Use 307 Temporary Redirect to preserve method and body
+				redirectURL := "/"
+				if r.URL.RawQuery != "" {
+					redirectURL += "?" + r.URL.RawQuery
+				}
+
+				http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+				return
+			}
+
+			// Client has active redirection session, update usage
+			updateRedirectSession(redirectSession)
+		}
+
 		// Create modified request with new path
 		newReq := r.Clone(r.Context())
 		newReq.URL.Path = forwardPath
-		
+
 		if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 			return
 		}
-		
+
 		// If tunnel failed, fall through to smart routing
 		log.Printf("Custom URL routing: tunnel %s failed, falling back to smart routing", tunnelID)
 	}
-	
+
 	// Try prefix matching for nested custom URLs (e.g., /bob/chatbot -> /bob)
 	if strings.Contains(path, "/") {
 		segments := strings.Split(path, "/")
 		for i := len(segments) - 1; i > 0; i-- {
 			parentPath := strings.Join(segments[:i], "/")
-			
+
 			customURLsMu.RLock()
 			tunnelID := customURLs[parentPath]
 			customURLsMu.RUnlock()
-			
+
 			if tunnelID != "" {
 				log.Printf("Custom URL prefix routing: %s -> tunnel %s (prefix: %s)", r.URL.Path, tunnelID, parentPath)
-				
+
 				// Extract remaining path after the custom URL prefix
 				remainingPath := "/" + strings.Join(segments[i:], "/")
-				
+
 				// Create modified request with remaining path
 				newReq := r.Clone(r.Context())
 				newReq.URL.Path = remainingPath
-				
+
 				if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 					return
 				}
-				
+
 				log.Printf("Custom URL prefix routing: tunnel %s failed, falling back to smart routing", tunnelID)
 				break
 			}
 		}
 	}
-	
+
 	// No custom URL match found, fall back to smart routing
 	smartFallbackHandler(w, r)
 }
