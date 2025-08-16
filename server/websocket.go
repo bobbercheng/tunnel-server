@@ -599,31 +599,50 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// Check immediately on startup for already expired connections (timeout check only, no ping)
+	ac.pingMu.RLock()
+	lastPong := ac.lastPong
+	ac.pingMu.RUnlock()
+
+	if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
+		log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
+		// Force close the WebSocket to trigger cleanup
+		ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
+		return
+	}
+
+	checkAndPing := func() bool {
+		// Check if we haven't received a pong in too long
+		ac.pingMu.RLock()
+		lastPong := ac.lastPong
+		ac.pingMu.RUnlock()
+
+		if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
+			log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
+			// Force close the WebSocket to trigger cleanup
+			ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
+			return false // Signal to stop
+		}
+
+		// Send ping
+		ping := &PingFrame{
+			Type:      "ping",
+			Timestamp: time.Now(),
+		}
+
+		if err := ac.writeEncrypted(ctx, ping); err != nil {
+			log.Printf("Failed to send ping to agent %s: %v", ac.id, err)
+			return false // Signal to stop
+		}
+		return true // Continue
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Check if we haven't received a pong in too long
-			ac.pingMu.RLock()
-			lastPong := ac.lastPong
-			ac.pingMu.RUnlock()
-
-			if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
-				log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
-				// Force close the WebSocket to trigger cleanup
-				ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
-				return
-			}
-
-			// Send ping
-			ping := &PingFrame{
-				Type:      "ping",
-				Timestamp: time.Now(),
-			}
-
-			if err := ac.writeEncrypted(ctx, ping); err != nil {
-				log.Printf("Failed to send ping to agent %s: %v", ac.id, err)
+			if !checkAndPing() {
 				return
 			}
 		}

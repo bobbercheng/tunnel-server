@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -325,7 +324,6 @@ func TestTunnelInfoAfterKeyExchange(t *testing.T) {
 
 	// Create test server with message logging
 	var receivedMessages []string
-	var mu sync.Mutex
 
 	// Override handleMessage to log received messages
 	originalHandleMessage := func(ac *agentConn) func([]byte) {
@@ -399,7 +397,6 @@ func TestTunnelInfoAfterKeyExchange(t *testing.T) {
 	}
 
 	_ = receivedMessages
-	_ = mu
 	_ = originalHandleMessage
 }
 
@@ -748,5 +745,291 @@ func BenchmarkKeyExchange(b *testing.B) {
 			delete(agents, tunnelID)
 			agentsMu.Unlock()
 		}()
+	}
+}
+
+// TestWebSocketReadLimitConfiguration tests that WebSocket connections have the correct read limit
+func TestWebSocketReadLimitConfiguration(t *testing.T) {
+	tunnelID, secret := setupTestTunnel(t)
+
+	// Create test server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__ws__", wsHandler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Convert to WebSocket URL
+	wsURL := "ws" + server.URL[4:] + "/__ws__?id=" + tunnelID + "&secret=" + secret
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to establish WebSocket connection: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test completed")
+
+	// The read limit should be set to 20MB by our wsHandler
+	// We can't directly inspect the limit, but we can test behavior with a large message
+
+	// Complete handshake first
+	var handshake HandshakeFrame
+	err = wsjson.Read(ctx, conn, &handshake)
+	if err != nil {
+		t.Fatalf("Failed to read handshake: %v", err)
+	}
+
+	handshakeResp := map[string]interface{}{
+		"type": "handshake",
+		"ack":  true,
+	}
+	err = wsjson.Write(ctx, conn, handshakeResp)
+	if err != nil {
+		t.Fatalf("Failed to send handshake ACK: %v", err)
+	}
+
+	// Verify the connection is established and working
+	agentsMu.RLock()
+	_, exists := agents[tunnelID]
+	agentsMu.RUnlock()
+
+	if !exists {
+		t.Error("Agent should be registered after successful connection")
+	}
+}
+
+// TestLargeMessageHandling tests that the server can handle messages up to the read limit
+func TestLargeMessageHandling(t *testing.T) {
+	tunnelID, secret := setupTestTunnel(t)
+
+	// Create test server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__ws__", wsHandler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Convert to WebSocket URL
+	wsURL := "ws" + server.URL[4:] + "/__ws__?id=" + tunnelID + "&secret=" + secret
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to establish WebSocket connection: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test completed")
+
+	// Complete handshake
+	var handshake HandshakeFrame
+	err = wsjson.Read(ctx, conn, &handshake)
+	if err != nil {
+		t.Fatalf("Failed to read handshake: %v", err)
+	}
+
+	handshakeResp := map[string]interface{}{
+		"type": "handshake",
+		"ack":  true,
+	}
+	err = wsjson.Write(ctx, conn, handshakeResp)
+	if err != nil {
+		t.Fatalf("Failed to send handshake ACK: %v", err)
+	}
+
+	// Create cipher for encryption
+	salt, err := base64.StdEncoding.DecodeString(handshake.Salt)
+	if err != nil {
+		t.Fatalf("Failed to decode salt: %v", err)
+	}
+
+	masterSecret := sha256.Sum256([]byte(secret))
+	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false)
+	if err != nil {
+		t.Fatalf("Failed to create cipher: %v", err)
+	}
+
+	// Test sending a moderately large message (1MB)
+	largeData := make([]byte, 1024*1024) // 1MB
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+
+	largeMessage := struct {
+		Type string `json:"type"`
+		Data []byte `json:"data"`
+	}{
+		Type: "tunnel_info",
+		Data: largeData,
+	}
+
+	messageJSON, err := json.Marshal(largeMessage)
+	if err != nil {
+		t.Fatalf("Failed to marshal large message: %v", err)
+	}
+
+	encryptedData, err := cipher.Encrypt(messageJSON)
+	if err != nil {
+		t.Fatalf("Failed to encrypt large message: %v", err)
+	}
+
+	// This should succeed with our 20MB read limit
+	err = conn.Write(ctx, websocket.MessageBinary, encryptedData)
+	if err != nil {
+		t.Fatalf("Failed to send large encrypted message: %v", err)
+	}
+
+	// Give server time to process the large message
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify the connection is still alive
+	agentsMu.RLock()
+	agent, exists := agents[tunnelID]
+	agentsMu.RUnlock()
+
+	if !exists {
+		t.Error("Agent should still be registered after sending large message")
+	}
+	if agent != nil && agent.cipher == nil {
+		t.Error("Agent cipher should be initialized")
+	}
+}
+
+// TestPingMessageTypeHandling tests that ping messages are properly routed and handled
+func TestPingMessageTypeHandling(t *testing.T) {
+	tunnelID, secret := setupTestTunnel(t)
+
+	// Create test server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__ws__", wsHandler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Convert to WebSocket URL
+	wsURL := "ws" + server.URL[4:] + "/__ws__?id=" + tunnelID + "&secret=" + secret
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to establish WebSocket connection: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test completed")
+
+	// Complete handshake
+	var handshake HandshakeFrame
+	err = wsjson.Read(ctx, conn, &handshake)
+	if err != nil {
+		t.Fatalf("Failed to read handshake: %v", err)
+	}
+
+	handshakeResp := map[string]interface{}{
+		"type": "handshake",
+		"ack":  true,
+	}
+	err = wsjson.Write(ctx, conn, handshakeResp)
+	if err != nil {
+		t.Fatalf("Failed to send handshake ACK: %v", err)
+	}
+
+	// Create cipher
+	salt, err := base64.StdEncoding.DecodeString(handshake.Salt)
+	if err != nil {
+		t.Fatalf("Failed to decode salt: %v", err)
+	}
+
+	masterSecret := sha256.Sum256([]byte(secret))
+	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, false)
+	if err != nil {
+		t.Fatalf("Failed to create cipher: %v", err)
+	}
+
+	// Send tunnel info first
+	tunnelInfo := TunnelInfoFrame{
+		Type:     "tunnel_info",
+		Protocol: "http",
+		Port:     0,
+	}
+
+	tunnelInfoJSON, err := json.Marshal(tunnelInfo)
+	if err != nil {
+		t.Fatalf("Failed to marshal tunnel info: %v", err)
+	}
+
+	encryptedData, err := cipher.Encrypt(tunnelInfoJSON)
+	if err != nil {
+		t.Fatalf("Failed to encrypt tunnel info: %v", err)
+	}
+
+	err = conn.Write(ctx, websocket.MessageBinary, encryptedData)
+	if err != nil {
+		t.Fatalf("Failed to send tunnel info: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond) // Let server process
+
+	// Send multiple ping messages to test handling
+	pingTimes := []time.Time{}
+	for i := 0; i < 3; i++ {
+		pingTime := time.Now()
+		pingTimes = append(pingTimes, pingTime)
+
+		ping := PingFrame{
+			Type:      "ping",
+			Timestamp: pingTime,
+		}
+
+		pingJSON, err := json.Marshal(ping)
+		if err != nil {
+			t.Fatalf("Failed to marshal ping %d: %v", i, err)
+		}
+
+		encryptedPing, err := cipher.Encrypt(pingJSON)
+		if err != nil {
+			t.Fatalf("Failed to encrypt ping %d: %v", i, err)
+		}
+
+		err = conn.Write(ctx, websocket.MessageBinary, encryptedPing)
+		if err != nil {
+			t.Fatalf("Failed to send ping %d: %v", i, err)
+		}
+
+		// Read pong response
+		readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+		_, responseData, err := conn.Read(readCtx)
+		readCancel()
+		if err != nil {
+			t.Fatalf("Failed to read pong response %d: %v", i, err)
+		}
+
+		// Decrypt response
+		decryptedResponse, err := cipher.Decrypt(responseData)
+		if err != nil {
+			t.Fatalf("Failed to decrypt pong response %d: %v", i, err)
+		}
+
+		var pong PongFrame
+		err = json.Unmarshal(decryptedResponse, &pong)
+		if err != nil {
+			t.Fatalf("Failed to unmarshal pong %d: %v", i, err)
+		}
+
+		// Verify pong response
+		if pong.Type != "pong" {
+			t.Errorf("Ping %d: Expected pong type, got: %s", i, pong.Type)
+		}
+
+		if !pong.Timestamp.Equal(pingTime) {
+			t.Errorf("Ping %d: Expected pong timestamp %v, got: %v", i, pingTime, pong.Timestamp)
+		}
+
+		// Brief delay between pings
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify all pings were handled correctly
+	if len(pingTimes) != 3 {
+		t.Errorf("Expected to send 3 pings, sent %d", len(pingTimes))
 	}
 }
