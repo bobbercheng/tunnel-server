@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -85,16 +86,21 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Agent %s connected with encrypted tunnel (protocol: %s)", id, tunnel.Protocol)
 
-	// Start ping routine for connection health monitoring
-	go ac.pingRoutine(r.Context())
+	// Create connection-specific context for proper cleanup coordination
+	connCtx, connCancel := context.WithCancel(context.Background())
+	defer connCancel() // Ensure all goroutines are cancelled when connection closes
 
-	// Handle messages
+	// Start ping routine for connection health monitoring
+	go ac.pingRoutine(connCtx)
+
+	// Handle messages with connection context for proper cleanup
 	for {
 		var msgType websocket.MessageType
 		var data []byte
-		msgType, data, err = conn.Read(r.Context())
+		msgType, data, err = conn.Read(context.Background()) // Use background to avoid context cancellation issues
 		if err != nil {
 			log.Printf("WebSocket read error for agent %s: %v", id, err)
+			connCancel() // Cancel our connection context to stop all related goroutines
 			break
 		}
 
@@ -125,8 +131,9 @@ func performKeyExchange(ctx context.Context, ac *agentConn) error {
 		return fmt.Errorf("failed to send handshake: %w", err)
 	}
 
-	// Create cipher with derived keys
-	cipher, err := crypto.NewStreamCipher([]byte(ac.secret), salt, true)
+	// Create cipher with derived keys (hash the secret like the agent does)
+	masterSecret := sha256.Sum256([]byte(ac.secret))
+	cipher, err := crypto.NewStreamCipher(masterSecret[:], salt, true)
 	if err != nil {
 		return fmt.Errorf("failed to create cipher: %w", err)
 	}
@@ -179,7 +186,9 @@ func (ac *agentConn) writeEncrypted(ctx context.Context, msg interface{}) error 
 		return fmt.Errorf("failed to encrypt message: %w", err)
 	}
 
-	return ac.ws.Write(ctx, websocket.MessageBinary, encryptedData)
+	// Use background context for WebSocket writes to avoid connection closure
+	// from request timeout contexts
+	return ac.ws.Write(context.Background(), websocket.MessageBinary, encryptedData)
 }
 
 // handleMessage processes incoming messages from the agent
@@ -406,8 +415,10 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 			ac.pingMu.RUnlock()
 
 			if time.Since(lastPong) > 2*time.Minute {
-				log.Printf("Agent %s appears to be unresponsive (no pong in %v)", ac.id, time.Since(lastPong))
-				// Could implement connection reset here
+				log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
+				// Force close the WebSocket to trigger cleanup
+				ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
+				return
 			}
 
 			// Send ping

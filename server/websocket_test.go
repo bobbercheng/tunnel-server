@@ -603,6 +603,106 @@ func TestKeyExchangeProtocolRegression(t *testing.T) {
 	}
 }
 
+// TestCipherKeyDerivation tests that server and agent use the same key derivation
+// This test ensures the fix for the cipher mismatch bug
+func TestCipherKeyDerivation(t *testing.T) {
+	tunnelID, secret := setupTestTunnel(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__ws__", wsHandler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[4:] + "/__ws__?id=" + tunnelID + "&secret=" + secret
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to establish WebSocket connection: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test completed")
+
+	// Complete key exchange
+	var handshake HandshakeFrame
+	err = wsjson.Read(ctx, conn, &handshake)
+	if err != nil {
+		t.Fatalf("Failed to read handshake: %v", err)
+	}
+
+	handshakeResp := map[string]interface{}{
+		"type": "handshake",
+		"ack":  true,
+	}
+	err = wsjson.Write(ctx, conn, handshakeResp)
+	if err != nil {
+		t.Fatalf("Failed to send handshake ACK: %v", err)
+	}
+
+	// Create agent-side cipher (same as agent does)
+	salt, _ := base64.StdEncoding.DecodeString(handshake.Salt)
+	masterSecret := sha256.Sum256([]byte(secret)) // Hash the secret like agent does
+	agentCipher, _ := crypto.NewStreamCipher(masterSecret[:], salt, false)
+
+	// Send encrypted message from agent side
+	testMessage := map[string]interface{}{
+		"type": "test_cipher",
+		"data": "cipher_test_message",
+	}
+	testJSON, _ := json.Marshal(testMessage)
+	encryptedData, err := agentCipher.Encrypt(testJSON)
+	if err != nil {
+		t.Fatalf("Failed to encrypt test message: %v", err)
+	}
+
+	err = conn.Write(ctx, websocket.MessageBinary, encryptedData)
+	if err != nil {
+		t.Fatalf("Failed to send encrypted test message: %v", err)
+	}
+
+	// Verify agent was registered and cipher works
+	time.Sleep(100 * time.Millisecond)
+
+	agentsMu.RLock()
+	agent, exists := agents[tunnelID]
+	agentsMu.RUnlock()
+
+	if !exists {
+		t.Fatal("Agent should be registered")
+	}
+
+	// Test that server can encrypt messages that agent can decrypt
+	serverMessage := map[string]interface{}{
+		"type": "server_test",
+		"data": "server_to_agent_message",
+	}
+	serverJSON, _ := json.Marshal(serverMessage)
+	serverEncrypted, err := agent.cipher.Encrypt(serverJSON)
+	if err != nil {
+		t.Fatalf("Server failed to encrypt message: %v", err)
+	}
+
+	// Agent should be able to decrypt server's message
+	decrypted, err := agentCipher.Decrypt(serverEncrypted)
+	if err != nil {
+		t.Errorf("Agent failed to decrypt server message (cipher mismatch): %v", err)
+	}
+
+	var decryptedMessage map[string]interface{}
+	if err := json.Unmarshal(decrypted, &decryptedMessage); err != nil {
+		t.Errorf("Failed to parse decrypted message: %v", err)
+	}
+
+	if decryptedMessage["type"] != "server_test" {
+		t.Errorf("Expected 'server_test', got: %v", decryptedMessage["type"])
+	}
+
+	if decryptedMessage["data"] != "server_to_agent_message" {
+		t.Errorf("Expected 'server_to_agent_message', got: %v", decryptedMessage["data"])
+	}
+}
+
 // Benchmark key exchange performance
 func BenchmarkKeyExchange(b *testing.B) {
 	tunnelID, secret := setupTestTunnel(&testing.T{})
