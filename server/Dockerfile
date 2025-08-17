@@ -2,8 +2,9 @@
 FROM golang:1.23 AS build
 WORKDIR /src
 
-# Copy crypto package first
+# Copy required packages first
 COPY pkg/crypto/ ./pkg/crypto/
+COPY pkg/metrics/ ./pkg/metrics/
 
 # Copy server files
 COPY server/ ./server/

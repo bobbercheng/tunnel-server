@@ -27,7 +27,7 @@ type RegisterResp struct {
 	ID          string `json:"id"`
 	Secret      string `json:"secret"`
 	PublicURL   string `json:"public_url"`
-	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	CustomURL   string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol    string `json:"protocol"`
 	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
 	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled
@@ -82,8 +82,8 @@ type RegisterResponseFrame struct {
 	Type        string `json:"type"` // "register_response"
 	ID          string `json:"id"`
 	Secret      string `json:"secret"`
-	PublicURL   string `json:"public_url"`             // Default /__pub__/{id} or /__tcp__/{id}
-	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	PublicURL   string `json:"public_url"`           // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL   string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol    string `json:"protocol"`
 	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
 	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled
@@ -193,7 +193,15 @@ func (a *Agent) Run() {
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			a.ID, a.Secret = reg.ID, reg.Secret
+			// Update all configuration from server response
+			a.ID = reg.ID
+			a.Secret = reg.Secret
+			a.CustomURL = reg.CustomURL
+			a.UseRedirect = reg.UseRedirect
+			a.Protocol = reg.Protocol
+			if reg.TcpPort > 0 {
+				a.Port = reg.TcpPort
+			}
 			// Reset failure counters after successful re-registration
 			a.consecutiveDNSFailures = 0
 			a.consecutiveNetworkFailures = 0
@@ -201,9 +209,9 @@ func (a *Agent) Run() {
 			fmt.Println("  ID:", a.ID)
 			fmt.Println("  Secret:", a.Secret)
 			fmt.Println("  New Public URL:", reg.PublicURL)
-			if reg.CustomURL != "" {
-				fmt.Println("  Custom URL:", reg.CustomURL)
-				if reg.UseRedirect {
+			if a.CustomURL != "" {
+				fmt.Println("  Custom URL:", a.CustomURL)
+				if a.UseRedirect {
 					fmt.Println("  SPA Redirection: Enabled")
 				}
 			}
@@ -694,15 +702,21 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 		return fmt.Errorf("registration failed: %s", regResp.Error)
 	}
 
-	// Store the registration details
+	// Store all registration details from server response
 	a.ID = regResp.ID
 	a.Secret = regResp.Secret
+	a.CustomURL = regResp.CustomURL
+	a.UseRedirect = regResp.UseRedirect
+	a.Protocol = regResp.Protocol
+	if regResp.TcpPort > 0 {
+		a.Port = regResp.TcpPort
+	}
 
 	// Log the URLs
 	fmt.Println("  Public URL:", regResp.PublicURL)
-	if regResp.CustomURL != "" {
-		fmt.Println("  Custom URL:", regResp.CustomURL)
-		if regResp.UseRedirect {
+	if a.CustomURL != "" {
+		fmt.Println("  Custom URL:", a.CustomURL)
+		if a.UseRedirect {
 			fmt.Println("  SPA Redirection: Enabled")
 		}
 	}
@@ -713,7 +727,7 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 func (a *Agent) register() (*RegisterResp, error) {
 	// Create WebSocket connection for registration (without existing credentials)
 	wsURL := strings.Replace(a.ServerURL, "http", "ws", 1) + "/__ws__"
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
