@@ -814,6 +814,29 @@ func updateRedirectSession(redirectSession *RedirectSession) {
 		redirectSession.CustomURL, redirectSession.TunnelID, redirectSession.RequestCount)
 }
 
+// getActiveRedirectSessionForCustomURL retrieves active redirection session for a specific custom URL
+func getActiveRedirectSessionForCustomURL(clientKey, customURL string) *RedirectSession {
+	clientTracker.mu.RLock()
+	defer clientTracker.mu.RUnlock()
+	
+	session, exists := clientTracker.clientSessions[clientKey]
+	if !exists || session.RedirectSessions == nil {
+		return nil
+	}
+	
+	redirectSession, exists := session.RedirectSessions[customURL]
+	if !exists || !redirectSession.Active {
+		return nil
+	}
+	
+	// Check TTL
+	if time.Since(redirectSession.RedirectTime) > redirectSession.TTL {
+		return nil
+	}
+	
+	return redirectSession
+}
+
 // getActiveRedirectSession retrieves any active redirection session for a client (regardless of custom URL)
 func getActiveRedirectSession(clientKey string) *RedirectSession {
 	clientTracker.mu.RLock()
@@ -836,6 +859,10 @@ func getActiveRedirectSession(clientKey string) *RedirectSession {
 					mostRecentSession = redirectSession
 					mostRecentTime = redirectSession.LastUsed
 				}
+			} else {
+				// Deactivate expired sessions
+				redirectSession.Active = false
+				log.Printf("[REDIRECT SESSION] Deactivated expired session | ClientKey: %s | CustomURL: %s | Age: %v", clientKey, redirectSession.CustomURL, time.Since(redirectSession.RedirectTime))
 			}
 		}
 	}

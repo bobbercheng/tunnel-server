@@ -367,35 +367,29 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Handle redirection for SPA base path issues
 		if useRedirect && forwardPath == "/" {
-			// This is a request to the custom URL root - check if we should redirect
+			// Always redirect when use_redirect is enabled to ensure consistent SPA behavior
 			clientKey := generateClientKey(r)
-			log.Printf("[REDIRECT CHECK] UseRedirect: %t | ForwardPath: %s | ClientKey: %s | RequestURL: %s", useRedirect, forwardPath, clientKey, r.URL.Path)
+			log.Printf("[REDIRECT ALWAYS] UseRedirect: %t | ForwardPath: %s | ClientKey: %s | RequestURL: %s", useRedirect, forwardPath, clientKey, r.URL.Path)
 
-			// Check if this client already has a redirection session
+			// Create or update redirection session for analytics tracking
 			redirectSession := getRedirectSession(clientKey, path)
-			log.Printf("[REDIRECT SESSION] ClientKey: %s | CustomURL: %s | Found session: %v", clientKey, path, redirectSession != nil)
-
 			if redirectSession == nil || !redirectSession.Active {
-				// Create new redirection session and redirect to root
 				createRedirectSession(clientKey, path, tunnelID)
-
-				log.Printf("[REDIRECT CREATE] Creating redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s | Redirecting %s to /", clientKey, path, tunnelID, r.URL.Path)
-
-				// Use 307 Temporary Redirect to preserve method and body
-				redirectURL := "/"
-				if r.URL.RawQuery != "" {
-					redirectURL += "?" + r.URL.RawQuery
-				}
-
-				log.Printf("[REDIRECT EXECUTE] Issuing 307 redirect from %s to %s for ClientKey: %s", r.URL.Path, redirectURL, clientKey)
-				http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
-				return
+				log.Printf("[REDIRECT SESSION] Created new redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, path, tunnelID)
+			} else {
+				updateRedirectSession(redirectSession)
+				log.Printf("[REDIRECT SESSION] Updated existing redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, path, redirectSession.TunnelID)
 			}
 
-			log.Printf("[REDIRECT USE] Using existing redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s | NO REDIRECT - Direct tunnel routing", clientKey, path, redirectSession.TunnelID)
+			// Always redirect to root for consistent SPA behavior
+			redirectURL := "/"
+			if r.URL.RawQuery != "" {
+				redirectURL += "?" + r.URL.RawQuery
+			}
 
-			// Client has active redirection session, update usage
-			updateRedirectSession(redirectSession)
+			log.Printf("[REDIRECT EXECUTE] Always redirecting %s to %s for ClientKey: %s | CustomURL: %s", r.URL.Path, redirectURL, clientKey, path)
+			http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+			return
 		} else if useRedirect {
 			log.Printf("[REDIRECT SKIP] UseRedirect=%t but ForwardPath=%s (not '/'), skipping redirect logic | RequestURL: %s", useRedirect, forwardPath, r.URL.Path)
 		}

@@ -363,6 +363,7 @@ func getGeoRoutingStats() map[string]interface{} {
 	return stats
 }
 
+
 // smartFallbackHandler handles requests that don't match existing routes
 func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Skip if this is already a system endpoint (avoid infinite loops)
@@ -382,6 +383,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[SMART ROUTING] Request received | URL: %s | Method: %s | Asset: %v | API: %v | ClientKey: %s | RemoteAddr: %s", r.URL.Path, r.Method, isAsset, isAPI, clientKey, r.RemoteAddr)
 
 	// Check for active redirection sessions - route redirected clients to their assigned tunnels
+	// CRITICAL FIX: If a redirect session is active, we must enforce strict routing.
+	// We cannot allow fallback to other strategies, as this causes misrouting when multiple tunnels are present.
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
 		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
@@ -392,17 +395,24 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Only deactivate session for genuine failures, not temporary issues
-		// Check if the tunnel is still connected before deactivating
+		// Handle failure for the redirect session tunnel. We must not fall back.
+
+		// Check if the tunnel is still connected
 		ac := getAgent(redirectSession.TunnelID)
 		if ac == nil {
-			// Tunnel is completely disconnected - deactivate session
-			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
+			// Tunnel is completely disconnected. Deactivate the session and return 503.
+			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session. Returning 503.", clientKey, r.URL.Path, redirectSession.TunnelID)
 			redirectSession.Active = false
+			http.Error(w, "Service Unavailable: The dedicated tunnel is disconnected.", http.StatusServiceUnavailable)
+			return // Stop processing, do not fall back.
 		} else {
-			// Tunnel is connected but request failed - could be temporary, don't deactivate immediately
-			log.Printf("[SMART ROUTING] Redirect session tunnel failed but still connected | ClientKey: %s | URL: %s | TunnelID: %s | Keeping session active", clientKey, r.URL.Path, redirectSession.TunnelID)
-			// Continue to fallback routing but keep session active for next request
+			// Tunnel is connected but request failed (e.g., timeout, error from agent).
+			// We must stop here to prevent fallback logic from trying other tunnels.
+			log.Printf("[SMART ROUTING] CRITICAL: Redirect session tunnel failed but still connected | ClientKey: %s | URL: %s | TunnelID: %s | Stopping routing (no fallback).", clientKey, r.URL.Path, redirectSession.TunnelID)
+
+			// We assume tryTunnelRouteWithTimeout handles writing the appropriate error response (e.g., 504 Gateway Timeout or 502 Bad Gateway)
+			// if the failure occurred during proxying. We simply return to stop further processing.
+			return // Stop processing, do not fall back.
 		}
 	}
 
