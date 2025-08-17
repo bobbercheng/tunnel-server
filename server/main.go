@@ -7,6 +7,9 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"tunnel.local/metrics"
 )
 
 // Global state and configuration
@@ -25,6 +28,9 @@ var (
 
 	// Client tracking for smart routing
 	clientTracker = NewClientTracker()
+
+	// Metrics for usage tracking
+	tunnelMetrics = metrics.NewTunnelMetrics()
 )
 
 func main() {
@@ -51,6 +57,7 @@ func main() {
 	mux.HandleFunc("/__pub__/", publicHandler)
 	mux.HandleFunc("/__tcp__/", tcpHandler)
 	mux.HandleFunc("/__health__", healthHandler)
+	mux.Handle("/__metrics__", promhttp.Handler()) // Prometheus metrics endpoint
 	// Custom URL handler with smart fallback - must be last (catch-all)
 	mux.HandleFunc("/", customURLHandler)
 

@@ -80,6 +80,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		agentsMu.Lock()
 		agents[id] = ac
 		agentsMu.Unlock()
+		// Record WebSocket connection metric
+		tunnelMetrics.IncrementWSConnection(id)
 	}
 
 	defer func() {
@@ -87,6 +89,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			agentsMu.Lock()
 			delete(agents, ac.id)
 			agentsMu.Unlock()
+
+			// Record WebSocket disconnection metric
+			tunnelMetrics.DecrementWSConnection(ac.id)
 
 			// Clean up custom URL mappings for this tunnel
 			cleanupCustomURLsForTunnel(ac.id)
@@ -317,6 +322,9 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 	agentsMu.Lock()
 	agents[id] = ac
 	agentsMu.Unlock()
+	
+	// Record WebSocket connection metric
+	tunnelMetrics.IncrementWSConnection(id)
 
 	// Build URLs
 	publicBase := os.Getenv("PUBLIC_BASE_URL")
@@ -394,7 +402,12 @@ func (ac *agentConn) writeEncrypted(ctx context.Context, msg interface{}) error 
 
 	// Use background context for WebSocket writes to avoid connection closure
 	// from request timeout contexts
-	return ac.ws.Write(context.Background(), websocket.MessageBinary, encryptedData)
+	err = ac.ws.Write(context.Background(), websocket.MessageBinary, encryptedData)
+	if err == nil && ac.id != "" {
+		// Record outbound WebSocket message metric
+		tunnelMetrics.RecordWSMessage(ac.id, "sent")
+	}
+	return err
 }
 
 // handleMessage processes incoming messages from the agent
@@ -402,6 +415,11 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 	if ac.cipher == nil {
 		log.Printf("Received message before key exchange completed for agent %s", ac.id)
 		return
+	}
+	
+	// Record inbound WebSocket message metric
+	if ac.id != "" {
+		tunnelMetrics.RecordWSMessage(ac.id, "received")
 	}
 
 	// Decrypt message

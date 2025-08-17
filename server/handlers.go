@@ -8,11 +8,21 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// getCountryFromIP extracts country from IP address using existing geo functionality
+func getCountryFromIP(clientIP string) string {
+	geoData := lookupIPGeoData(clientIP)
+	if geoData != nil {
+		return geoData.Country
+	}
+	return ""
+}
 
 // registerHandler handles agent registration requests
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +205,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 // publicHandler handles public HTTP requests through tunnels
 func publicHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
 	// /__pub__/{id}/<rest>
 	path := strings.TrimPrefix(r.URL.Path, "/__pub__/")
 	parts := strings.SplitN(path, "/", 2)
@@ -210,6 +222,7 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 
 	ac := getAgent(id)
 	if ac == nil {
+		tunnelMetrics.RecordError(id, "agent_not_connected")
 		http.Error(w, "agent not connected", http.StatusBadGateway)
 		return
 	}
@@ -242,18 +255,35 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Send encrypted request
 	if err := ac.writeEncrypted(ctx, req); err != nil {
+		tunnelMetrics.RecordError(id, "write_failed")
 		http.Error(w, "failed to write to agent: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
 	select {
 	case resp := <-respCh:
+		// Record metrics
+		duration := time.Since(startTime).Seconds()
+		requestSize := int64(len(body))
+		responseSize := int64(len(resp.Body))
+		statusCode := resp.Status
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+		
+		tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, responseSize)
+		
+		// Record geographic request if we have geolocation data
+		clientIP := extractRealClientIP(r)
+		if country := getCountryFromIP(clientIP); country != "" {
+			tunnelMetrics.RecordGeographicRequest(id, country)
+		}
+		
 		// Record successful tunnel access for smart routing learning
 		clientKey := generateClientKey(r)
 		clientTracker.RecordSuccess(clientKey, id)
 
 		// Record IP-based geographical routing
-		clientIP := extractRealClientIP(r)
 		recordIPTunnelMapping(clientIP, id)
 
 		// For non-asset requests (main pages), record asset mapping
@@ -266,12 +296,10 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 				w.Header().Add(k, v)
 			}
 		}
-		if resp.Status == 0 {
-			resp.Status = http.StatusOK
-		}
-		w.WriteHeader(resp.Status)
+		w.WriteHeader(statusCode)
 		_, _ = w.Write(resp.Body)
 	case <-ctx.Done():
+		tunnelMetrics.RecordError(id, "timeout")
 		http.Error(w, "timeout waiting agent", http.StatusGatewayTimeout)
 	}
 }
@@ -350,6 +378,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		newReq.URL.Path = forwardPath
 
 		if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
+			// Record successful custom URL usage
+			tunnelMetrics.RecordCustomURLRequest(path, "200")
 			return
 		}
 
@@ -378,6 +408,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 				newReq.URL.Path = remainingPath
 
 				if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
+					// Record successful custom URL prefix usage
+					tunnelMetrics.RecordCustomURLRequest(parentPath, "200")
 					return
 				}
 

@@ -125,9 +125,9 @@ This path relies on the server code's fallback to `r.Host` when `PUBLIC_BASE_URL
      --local  http://127.0.0.1:8080
    ```
    The agent will:
-   - POST `/register` to get `{id, secret, public_url}`
+   - Connect to WebSocket at `/__ws__` and register over encrypted connection
    - Print `public_url` (e.g. `https://tunnel-server-abc123-uc.a.run.app/__pub__/<id>`)
-   - Open a WebSocket to `/__ws__`
+   - Maintain persistent encrypted tunnel
 
 5. **Test**
    ```bash
@@ -179,7 +179,9 @@ After=network-online.target
 User=youruser
 ExecStart=/usr/local/bin/agent \
   --server https://tunnel-server-abc123-uc.a.run.app \
-  --local  http://127.0.0.1:8080
+  --local  http://127.0.0.1:8080 \
+  --custom-url myapp \
+  --use-redirect
 Restart=always
 RestartSec=2
 
@@ -208,28 +210,89 @@ The server provides an opt-in **hybrid redirection solution** that:
 3. **Routes subsequent requests** directly to the correct tunnel without redirection
 4. **Preserves content** (no HTML modification required)
 
-### 8.3 Usage
+### 8.3 Agent Usage
 
-#### Enable during WebSocket registration:
-```json
-{
-  "type": "register",
-  "protocol": "http", 
-  "custom_url": "myapp",
-  "use_redirect": true
-}
+#### Enable SPA redirection with agent command line:
+```bash
+# React/Vue/Angular app with SPA redirection
+cd agent
+go run . \
+  --server https://tunnel-server-abc123-uc.a.run.app \
+  --local http://localhost:3000 \
+  --custom-url myapp \
+  --use-redirect
 ```
 
-**Note:** Registration is now exclusively via encrypted WebSocket connection. HTTP POST registration has been removed.
+#### Agent flags for SPA support:
+- `--custom-url`: Custom URL path (required for redirection)
+- `--use-redirect`: Enable SPA redirection mode (optional, requires custom URL)
 
-### 8.4 How It Works
+#### Example registration output:
+```
+Connection established successfully with encryption.
+No tunnel id/secret provided, registering new tunnel...
+Registered successfully!
+  ID: abc123-def456-789abc-012def
+  Secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  Public URL: https://tunnel-server-abc123-uc.a.run.app/__pub__/abc123-def456-789abc-012def
+  Custom URL: https://tunnel-server-abc123-uc.a.run.app/myapp
+  SPA Redirection: Enabled
+```
+
+**Note:** Agent registration happens exclusively via encrypted WebSocket connection.
+
+### 8.4 Real-World Examples
+
+#### React App (Create React App / Vite):
+```bash
+# Local React dev server
+npm start  # runs on http://localhost:3000
+
+# Agent with SPA redirection
+./agent-bin \
+  --server https://tunnel-server-abc123-uc.a.run.app \
+  --local http://localhost:3000 \
+  --custom-url company/dashboard \
+  --use-redirect
+
+# Access via: https://tunnel-server-abc123-uc.a.run.app/company/dashboard
+# React Router works normally - no code changes needed!
+```
+
+#### Vue.js App:
+```bash
+# Local Vue dev server
+npm run serve  # runs on http://localhost:8080
+
+# Agent for Vue SPA
+./agent-bin \
+  --server https://tunnel-server-abc123-uc.a.run.app \
+  --local http://localhost:8080 \
+  --custom-url client/app \
+  --use-redirect
+```
+
+#### Angular App:
+```bash
+# Local Angular dev server
+ng serve  # runs on http://localhost:4200
+
+# Agent for Angular SPA
+./agent-bin \
+  --server https://tunnel-server-abc123-uc.a.run.app \
+  --local http://localhost:4200 \
+  --custom-url demo/angular \
+  --use-redirect
+```
+
+### 8.5 How It Works
 
 1. **First request** to `/myapp` → Server returns `307 Temporary Redirect` to `/`
 2. **Client session created** mapping the client to the tunnel 
 3. **Subsequent requests** (`/`, `/api/data`, `/assets/app.js`) route directly to tunnel
 4. **React app runs normally** as it thinks it's at root path
 
-### 8.5 Benefits
+### 8.6 Benefits
 
 - ✅ **No code changes** required in your SPA
 - ✅ **Works with all frameworks** (React, Vue, Angular, etc.)
@@ -237,7 +300,40 @@ The server provides an opt-in **hybrid redirection solution** that:
 - ✅ **Session-based** (different users get separate sessions)
 - ✅ **Automatic cleanup** (30-minute TTL)
 
-### 8.6 Monitoring
+### 8.7 Agent Command Reference
+
+#### Full agent help:
+```bash
+./agent-bin --help
+```
+
+#### Common agent configurations:
+```bash
+# Basic tunnel (no custom URL)
+./agent-bin --server https://server.run.app --local http://localhost:8080
+
+# Custom URL (no redirection)
+./agent-bin --server https://server.run.app --local http://localhost:8080 --custom-url myapi
+
+# SPA with redirection (requires custom URL)
+./agent-bin --server https://server.run.app --local http://localhost:3000 --custom-url myapp --use-redirect
+
+# TCP tunnel (for databases, SSH, etc.)
+./agent-bin --server https://server.run.app --local tcp://localhost:3306 --protocol tcp --port 3306
+```
+
+#### Validation and errors:
+```bash
+# Error: redirection requires custom URL
+./agent-bin --server https://server.run.app --local http://localhost:3000 --use-redirect
+# Output: --use-redirect requires a --custom-url
+
+# Error: TCP requires port
+./agent-bin --server https://server.run.app --local tcp://localhost:3306 --protocol tcp
+# Output: --port is required for TCP tunnels
+```
+
+### 8.8 Monitoring
 
 Check redirection status via health endpoint:
 ```bash
@@ -252,6 +348,23 @@ curl https://your-server/__health__ | jq '.redirection_sessions'
   "sessions_by_tunnel": {"abc123": 1},
   "sessions_by_custom_url": {"myapp": 1}
 }
+```
+
+#### Health endpoint shows agent redirection status:
+```bash
+curl https://your-server/__health__ | jq '.active_connections'
+```
+
+```json
+[
+  {
+    "id": "abc123-def456",
+    "connected_at": "2024-01-01T00:00:00Z",
+    "encrypted": true,
+    "custom_url": "myapp",
+    "use_redirect": true
+  }
+]
 ```
 
 ---
@@ -300,6 +413,29 @@ curl https://your-server/__health__ | jq '.redirection_sessions'
 | "timeout waiting agent" | Internal HTTP service slow or not reachable | Increase timeouts or verify service |
 | 401 unauthorized on `/__ws__` | Wrong id/secret pair | Delete the tunnel, register again |
 | Multiple agents for the same id bouncing | PoC doesn't coordinate multi-connect properly | Avoid multiple agents for the same id or implement locking with Redis |
+
+### SPA Redirection Troubleshooting
+
+| Symptom | Cause | Solution |
+|---------|--------|----------|
+| Agent error: "--use-redirect requires a --custom-url" | Using `--use-redirect` without `--custom-url` | Add `--custom-url yourapp` flag |
+| SPA shows blank page under custom URL | Redirection not enabled | Add `--use-redirect` flag to agent |
+| Assets (JS/CSS) not loading | SPA redirection not triggered | Check client session in `/__health__` endpoint |
+| 404 on custom URL | Custom URL not registered | Verify agent connected with custom URL |
+| Redirection loops | Local app redirecting internally | Ensure local app serves from root path `/` |
+
+#### Debug SPA redirection:
+```bash
+# Check if agent has redirection enabled
+curl https://your-server/__health__ | jq '.active_connections[] | select(.use_redirect == true)'
+
+# Monitor redirection sessions
+curl https://your-server/__health__ | jq '.redirection_sessions'
+
+# Test redirection flow manually
+curl -I https://your-server/myapp  # Should return 307 redirect
+curl -I https://your-server/       # Should return 200 from your app
+```
 
 ---
 

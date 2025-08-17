@@ -6,6 +6,7 @@ use (
 	./agent
 	./pkg/agentlib
 	./pkg/crypto
+	./pkg/metrics
 	./reverse-proxy-agent
 	./server
 )
