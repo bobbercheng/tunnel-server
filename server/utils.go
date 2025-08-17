@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,6 +364,53 @@ func getGeoRoutingStats() map[string]interface{} {
 	return stats
 }
 
+// detectCustomURLFromRedirect attempts to identify the custom URL that likely caused this redirect
+func detectCustomURLFromRedirect(r *http.Request, clientKey string) string {
+	// Check if this is a root path request that could be from a custom URL redirect
+	if r.URL.Path != "/" && r.URL.Path != "" {
+		return ""
+	}
+
+	// Look for referer that indicates a custom URL redirect
+	referer := r.Header.Get("Referer")
+	if referer != "" {
+		// Extract the path from referer
+		if refURL, err := url.Parse(referer); err == nil {
+			refPath := strings.Trim(refURL.Path, "/")
+			if refPath != "" {
+				// Check if this referer path matches any custom URL
+				customURLsMu.RLock()
+				if tunnelID, exists := customURLs[refPath]; exists {
+					customURLsMu.RUnlock()
+					log.Printf("[CUSTOM URL DETECTION] Detected redirect from custom URL | Referer: %s | CustomURL: %s | TunnelID: %s | ClientKey: %s", referer, refPath, tunnelID, clientKey)
+					return refPath
+				}
+				customURLsMu.RUnlock()
+			}
+		}
+	}
+
+	// Check if client has recent redirect sessions for any custom URL
+	if activeSession := getActiveRedirectSession(clientKey); activeSession != nil {
+		log.Printf("[CUSTOM URL DETECTION] Detected from active redirect session | CustomURL: %s | ClientKey: %s | RedirectTime: %v", activeSession.CustomURL, clientKey, activeSession.RedirectTime)
+		return activeSession.CustomURL
+	}
+
+	return ""
+}
+
+// getCustomURLTunnel returns the tunnel ID for a given custom URL
+func getCustomURLTunnel(customURL string) string {
+	if customURL == "" {
+		return ""
+	}
+	
+	customURLsMu.RLock()
+	tunnelID := customURLs[customURL]
+	customURLsMu.RUnlock()
+	
+	return tunnelID
+}
 
 // smartFallbackHandler handles requests that don't match existing routes
 func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
@@ -382,9 +430,24 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[SMART ROUTING] Request received | URL: %s | Method: %s | Asset: %v | API: %v | ClientKey: %s | RemoteAddr: %s", r.URL.Path, r.Method, isAsset, isAPI, clientKey, r.RemoteAddr)
 
+	// PRIORITY: Custom URL redirect detection - handle requests that come from custom URL redirects
+	if detectedCustomURL := detectCustomURLFromRedirect(r, clientKey); detectedCustomURL != "" {
+		if tunnelID := getCustomURLTunnel(detectedCustomURL); tunnelID != "" {
+			log.Printf("[SMART ROUTING] Custom URL redirect detected | URL: %s | CustomURL: %s | TunnelID: %s | ClientKey: %s", r.URL.Path, detectedCustomURL, tunnelID, clientKey)
+			
+			if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
+				// Create or update redirect session for future requests
+				createRedirectSession(clientKey, detectedCustomURL, tunnelID)
+				clientTracker.RecordSuccess(clientKey, tunnelID)
+				log.Printf("[SMART ROUTING] Custom URL redirect routing successful | URL: %s | CustomURL: %s | TunnelID: %s", r.URL.Path, detectedCustomURL, tunnelID)
+				return
+			} else {
+				log.Printf("[SMART ROUTING] Custom URL redirect routing failed | URL: %s | CustomURL: %s | TunnelID: %s", r.URL.Path, detectedCustomURL, tunnelID)
+			}
+		}
+	}
+
 	// Check for active redirection sessions - route redirected clients to their assigned tunnels
-	// CRITICAL FIX: If a redirect session is active, we must enforce strict routing.
-	// We cannot allow fallback to other strategies, as this causes misrouting when multiple tunnels are present.
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
 		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
@@ -395,24 +458,17 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Handle failure for the redirect session tunnel. We must not fall back.
-
-		// Check if the tunnel is still connected
+		// Only deactivate session for genuine failures, not temporary issues
+		// Check if the tunnel is still connected before deactivating
 		ac := getAgent(redirectSession.TunnelID)
 		if ac == nil {
-			// Tunnel is completely disconnected. Deactivate the session and return 503.
-			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session. Returning 503.", clientKey, r.URL.Path, redirectSession.TunnelID)
+			// Tunnel is completely disconnected - deactivate session
+			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
 			redirectSession.Active = false
-			http.Error(w, "Service Unavailable: The dedicated tunnel is disconnected.", http.StatusServiceUnavailable)
-			return // Stop processing, do not fall back.
 		} else {
-			// Tunnel is connected but request failed (e.g., timeout, error from agent).
-			// We must stop here to prevent fallback logic from trying other tunnels.
-			log.Printf("[SMART ROUTING] CRITICAL: Redirect session tunnel failed but still connected | ClientKey: %s | URL: %s | TunnelID: %s | Stopping routing (no fallback).", clientKey, r.URL.Path, redirectSession.TunnelID)
-
-			// We assume tryTunnelRouteWithTimeout handles writing the appropriate error response (e.g., 504 Gateway Timeout or 502 Bad Gateway)
-			// if the failure occurred during proxying. We simply return to stop further processing.
-			return // Stop processing, do not fall back.
+			// Tunnel is connected but request failed - could be temporary, don't deactivate immediately
+			log.Printf("[SMART ROUTING] Redirect session tunnel failed but still connected | ClientKey: %s | URL: %s | TunnelID: %s | Keeping session active", clientKey, r.URL.Path, redirectSession.TunnelID)
+			// Continue to fallback routing but keep session active for next request
 		}
 	}
 
@@ -539,6 +595,43 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		log.Printf("[SMART ROUTING] Skipping client tracker due to active redirect sessions | ClientKey: %s | URL: %s", clientKey, r.URL.Path)
+	}
+
+	// Strategy 1.4: Custom URL fallback - try all custom URLs with use_redirect that might match this client
+	if r.URL.Path == "/" || r.URL.Path == "" {
+		// This is a root request, possibly from a redirect - try to find matching custom URLs
+		customURLsMu.RLock()
+		var redirectCustomURLs []string
+		for customURL, tunnelID := range customURLs {
+			// Check if this custom URL has use_redirect enabled
+			tunnelsMu.RLock()
+			if tunnel, exists := tunnels[tunnelID]; exists && tunnel.UseRedirect {
+				redirectCustomURLs = append(redirectCustomURLs, customURL)
+			}
+			tunnelsMu.RUnlock()
+		}
+		customURLsMu.RUnlock()
+
+		if len(redirectCustomURLs) > 0 {
+			log.Printf("[SMART ROUTING] Custom URL fallback | Found %d redirect-enabled custom URLs | ClientKey: %s | URLs: %v", len(redirectCustomURLs), clientKey, redirectCustomURLs)
+			
+			// Try each redirect-enabled custom URL to see if it works for this client
+			for _, customURL := range redirectCustomURLs {
+				if tunnelID := getCustomURLTunnel(customURL); tunnelID != "" {
+					log.Printf("[SMART ROUTING] Trying custom URL fallback | CustomURL: %s | TunnelID: %s | ClientKey: %s", customURL, tunnelID, clientKey)
+					
+					if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
+						// Success! Create redirect session for future requests
+						createRedirectSession(clientKey, customURL, tunnelID)
+						clientTracker.RecordSuccess(clientKey, tunnelID)
+						log.Printf("[SMART ROUTING] Custom URL fallback successful | URL: %s | CustomURL: %s | TunnelID: %s", r.URL.Path, customURL, tunnelID)
+						return
+					} else {
+						log.Printf("[SMART ROUTING] Custom URL fallback failed | CustomURL: %s | TunnelID: %s", customURL, tunnelID)
+					}
+				}
+			}
+		}
 	}
 
 	// Strategy 1.5: IP-based Geographical Routing (NEW)
