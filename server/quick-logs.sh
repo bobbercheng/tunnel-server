@@ -56,7 +56,7 @@ case "${1:-help}" in
     
     "all"|"a")
         echo -e "${GREEN}📜 Showing all recent logs...${NC}"
-        "$SCRIPT_DIR/logs.sh" -l 100 -t 2h
+        "$SCRIPT_DIR/logs.sh" -l 200 -t 2h
         ;;
     
     "help"|"h"|*)

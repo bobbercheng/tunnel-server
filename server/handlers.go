@@ -362,13 +362,14 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		tunnelsMu.RLock()
 		tunnel := tunnels[tunnelID]
 		useRedirect := tunnel != nil && tunnel.UseRedirect
+		log.Printf("[TUNNEL REDIRECT CONFIG] TunnelID: %s | Tunnel exists: %v | UseRedirect: %v", tunnelID, tunnel != nil, useRedirect)
 		tunnelsMu.RUnlock()
 
 		// Handle redirection for SPA base path issues
 		if useRedirect && forwardPath == "/" {
 			// This is a request to the custom URL root - check if we should redirect
 			clientKey := generateClientKey(r)
-			log.Printf("[REDIRECT CHECK] UseRedirect: %t | ForwardPath: %s | ClientKey: %s", useRedirect, forwardPath, clientKey)
+			log.Printf("[REDIRECT CHECK] UseRedirect: %t | ForwardPath: %s | ClientKey: %s | RequestURL: %s", useRedirect, forwardPath, clientKey, r.URL.Path)
 
 			// Check if this client already has a redirection session
 			redirectSession := getRedirectSession(clientKey, path)
@@ -386,14 +387,17 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 					redirectURL += "?" + r.URL.RawQuery
 				}
 
+				log.Printf("[REDIRECT EXECUTE] Issuing 307 redirect from %s to %s for ClientKey: %s", r.URL.Path, redirectURL, clientKey)
 				http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 				return
 			}
 
-			log.Printf("[REDIRECT USE] Using existing redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, path, redirectSession.TunnelID)
+			log.Printf("[REDIRECT USE] Using existing redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s | NO REDIRECT - Direct tunnel routing", clientKey, path, redirectSession.TunnelID)
 
 			// Client has active redirection session, update usage
 			updateRedirectSession(redirectSession)
+		} else if useRedirect {
+			log.Printf("[REDIRECT SKIP] UseRedirect=%t but ForwardPath=%s (not '/'), skipping redirect logic | RequestURL: %s", useRedirect, forwardPath, r.URL.Path)
 		}
 
 		// Create modified request with new path
