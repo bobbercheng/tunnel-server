@@ -387,15 +387,25 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
 		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
+		// Try the redirect session tunnel with detailed status checking
 		if tryTunnelRouteWithTimeout(w, r, redirectSession.TunnelID, isAsset) {
 			updateRedirectSession(redirectSession)
 			log.Printf("[SMART ROUTING] Redirect session routing successful | ClientKey: %s | URL: %s | TunnelID: %s", clientKey, r.URL.Path, redirectSession.TunnelID)
 			return
 		}
 
-		// If redirection tunnel failed, deactivate the session and continue with normal routing
-		log.Printf("[SMART ROUTING] Redirect session tunnel failed | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
-		redirectSession.Active = false
+		// Only deactivate session for genuine failures, not temporary issues
+		// Check if the tunnel is still connected before deactivating
+		ac := getAgent(redirectSession.TunnelID)
+		if ac == nil {
+			// Tunnel is completely disconnected - deactivate session
+			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
+			redirectSession.Active = false
+		} else {
+			// Tunnel is connected but request failed - could be temporary, don't deactivate immediately
+			log.Printf("[SMART ROUTING] Redirect session tunnel failed but still connected | ClientKey: %s | URL: %s | TunnelID: %s | Keeping session active", clientKey, r.URL.Path, redirectSession.TunnelID)
+			// Continue to fallback routing but keep session active for next request
+		}
 	}
 
 	// PRIORITY: Single tunnel optimization for ALL requests when only one tunnel exists
@@ -505,33 +515,51 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Strategy 1: Enhanced Client Tracking (EXISTING)
-	if tunnelID := clientTracker.GetBestTunnel(clientKey); tunnelID != "" {
-		confidence := clientTracker.GetConfidence(clientKey, tunnelID)
-		// Lower confidence threshold for API endpoints since they're critical
-		minConfidence := 0.7
-		if isAPIRequest(r.URL.Path) {
-			minConfidence = 0.3 // Lower threshold for API calls
+	// Strategy 1: Enhanced Client Tracking (EXISTING) - but skip if we have redirect sessions for this client
+	// Check if client has any active redirect sessions first
+	hasActiveRedirectSession := false
+	clientTracker.mu.RLock()
+	if session, exists := clientTracker.clientSessions[clientKey]; exists && session.RedirectSessions != nil {
+		for _, redirectSession := range session.RedirectSessions {
+			if redirectSession.Active && time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
+				hasActiveRedirectSession = true
+				break
+			}
 		}
+	}
+	clientTracker.mu.RUnlock()
 
-		if confidence > minConfidence && tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
-			clientTracker.RecordSuccess(clientKey, tunnelID)
-
-			// Record geographical routing success (NEW)
-			clientIP := extractRealClientIP(r)
-			recordIPTunnelMapping(clientIP, tunnelID)
-
-			// Record asset mapping for non-asset requests (main pages)
-			if !isAsset {
-				recordClientAssetMapping(clientKey, tunnelID)
+	// Only use client tracker if no redirect sessions are active (prevents contamination)
+	if !hasActiveRedirectSession {
+		if tunnelID := clientTracker.GetBestTunnel(clientKey); tunnelID != "" {
+			confidence := clientTracker.GetConfidence(clientKey, tunnelID)
+			// Lower confidence threshold for API endpoints since they're critical
+			minConfidence := 0.7
+			if isAPIRequest(r.URL.Path) {
+				minConfidence = 0.3 // Lower threshold for API calls
 			}
 
-			log.Printf("Smart routing: %s -> tunnel %s (client-tracker, conf=%.2f)", r.URL.Path, tunnelID, confidence)
-			return
-		} else if confidence > minConfidence {
-			// High confidence but failed - record failure
-			clientTracker.RecordFailure(clientKey, tunnelID)
+			if confidence > minConfidence && tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
+				clientTracker.RecordSuccess(clientKey, tunnelID)
+
+				// Record geographical routing success (NEW)
+				clientIP := extractRealClientIP(r)
+				recordIPTunnelMapping(clientIP, tunnelID)
+
+				// Record asset mapping for non-asset requests (main pages)
+				if !isAsset {
+					recordClientAssetMapping(clientKey, tunnelID)
+				}
+
+				log.Printf("Smart routing: %s -> tunnel %s (client-tracker, conf=%.2f)", r.URL.Path, tunnelID, confidence)
+				return
+			} else if confidence > minConfidence {
+				// High confidence but failed - record failure
+				clientTracker.RecordFailure(clientKey, tunnelID)
+			}
 		}
+	} else {
+		log.Printf("[SMART ROUTING] Skipping client tracker due to active redirect sessions | ClientKey: %s | URL: %s", clientKey, r.URL.Path)
 	}
 
 	// Strategy 1.5: IP-based Geographical Routing (NEW)
@@ -639,12 +667,30 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Learn from all results
+	// Learn from all results - but avoid contamination if client has active redirect sessions
+	clientTracker.mu.RLock()
+	hasActiveRedirectSessionForLearning := false
+	if session, exists := clientTracker.clientSessions[clientKey]; exists && session.RedirectSessions != nil {
+		for _, redirectSession := range session.RedirectSessions {
+			if redirectSession.Active && time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
+				hasActiveRedirectSessionForLearning = true
+				break
+			}
+		}
+	}
+	clientTracker.mu.RUnlock()
+
 	for _, result := range results {
 		if result.success {
-			clientTracker.LearnMapping(clientKey, result.tunnelID)
-			// Record geographical mapping for successful results (NEW)
-			recordIPTunnelMapping(clientIP, result.tunnelID)
+			// Only learn mapping if no active redirect sessions (prevents contamination)
+			if !hasActiveRedirectSessionForLearning {
+				clientTracker.LearnMapping(clientKey, result.tunnelID)
+				// Record geographical mapping for successful results (NEW)
+				recordIPTunnelMapping(clientIP, result.tunnelID)
+				log.Printf("[SMART ROUTING] Learning new mapping | ClientKey: %s | TunnelID: %s | URL: %s", clientKey, result.tunnelID, r.URL.Path)
+			} else {
+				log.Printf("[SMART ROUTING] Skipping mapping learning due to active redirect sessions | ClientKey: %s | TunnelID: %s | URL: %s", clientKey, result.tunnelID, r.URL.Path)
+			}
 		} else {
 			clientTracker.RecordFailure(clientKey, result.tunnelID)
 		}
