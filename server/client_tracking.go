@@ -720,38 +720,58 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 
 // Redirection session management for SPA routing
 
+// getSessionKeys returns the keys of a RedirectSessions map for logging
+func getSessionKeys(sessions map[string]*RedirectSession) []string {
+	keys := make([]string, 0, len(sessions))
+	for k := range sessions {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // getRedirectSession retrieves an active redirection session for a client and custom URL
 func getRedirectSession(clientKey, customURL string) *RedirectSession {
+	log.Printf("[SESSION LOOKUP] Looking up redirect session | ClientKey: %s | CustomURL: %s", clientKey, customURL)
+	
 	clientTracker.mu.RLock()
 	defer clientTracker.mu.RUnlock()
 	
 	session, exists := clientTracker.clientSessions[clientKey]
 	if !exists || session.RedirectSessions == nil {
+		log.Printf("[SESSION LOOKUP] No client session found | ClientKey: %s | Exists: %t", clientKey, exists)
 		return nil
 	}
+	
+	log.Printf("[SESSION LOOKUP] Client session found | ClientKey: %s | Available sessions: %v", clientKey, getSessionKeys(session.RedirectSessions))
 	
 	// Get the redirect session for this specific custom URL
 	redirectSession, exists := session.RedirectSessions[customURL]
 	if !exists || !redirectSession.Active {
+		log.Printf("[SESSION LOOKUP] No active redirect session | ClientKey: %s | CustomURL: %s | Exists: %t | Active: %t", clientKey, customURL, exists, exists && redirectSession.Active)
 		return nil
 	}
 	
 	// Check TTL
 	if time.Since(redirectSession.RedirectTime) > redirectSession.TTL {
+		log.Printf("[SESSION LOOKUP] Redirect session expired | ClientKey: %s | CustomURL: %s | Age: %v | TTL: %v", clientKey, customURL, time.Since(redirectSession.RedirectTime), redirectSession.TTL)
 		return nil // Expired
 	}
 	
+	log.Printf("[SESSION LOOKUP] Found active redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, customURL, redirectSession.TunnelID)
 	return redirectSession
 }
 
 // createRedirectSession creates a new redirection session for SPA routing
 func createRedirectSession(clientKey, customURL, tunnelID string) {
+	log.Printf("[SESSION CREATE] Starting redirect session creation | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, customURL, tunnelID)
+	
 	clientTracker.mu.Lock()
 	defer clientTracker.mu.Unlock()
 	
 	// Get or create client session
 	session, exists := clientTracker.clientSessions[clientKey]
 	if !exists {
+		log.Printf("[SESSION CREATE] Creating new client session | ClientKey: %s", clientKey)
 		session = &ClientSession{
 			ID:               uuid.NewString(),
 			LastSeen:         time.Now(),
@@ -760,11 +780,18 @@ func createRedirectSession(clientKey, customURL, tunnelID string) {
 			RedirectSessions: make(map[string]*RedirectSession),
 		}
 		clientTracker.clientSessions[clientKey] = session
+	} else {
+		log.Printf("[SESSION CREATE] Using existing client session | ClientKey: %s | Existing sessions: %v", clientKey, getSessionKeys(session.RedirectSessions))
 	}
 	
 	// Initialize RedirectSessions map if nil
 	if session.RedirectSessions == nil {
 		session.RedirectSessions = make(map[string]*RedirectSession)
+	}
+	
+	// Check if session already exists for this custom URL
+	if existingSession, exists := session.RedirectSessions[customURL]; exists {
+		log.Printf("[SESSION CREATE] Overwriting existing session | ClientKey: %s | CustomURL: %s | OldTunnelID: %s | NewTunnelID: %s", clientKey, customURL, existingSession.TunnelID, tunnelID)
 	}
 	
 	// Create redirection session with 30-minute TTL for this specific custom URL
@@ -780,7 +807,7 @@ func createRedirectSession(clientKey, customURL, tunnelID string) {
 	
 	session.LastSeen = time.Now()
 	
-	log.Printf("Created redirection session: client=%s, customURL=%s, tunnel=%s", clientKey, customURL, tunnelID)
+	log.Printf("[SESSION CREATE] Created redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s | Total sessions: %d", clientKey, customURL, tunnelID, len(session.RedirectSessions))
 }
 
 // updateRedirectSession updates the usage statistics for an active redirection session

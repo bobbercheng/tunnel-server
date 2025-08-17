@@ -82,6 +82,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		agentsMu.Unlock()
 		// Record WebSocket connection metric
 		tunnelMetrics.IncrementWSConnection(id)
+		
+		// CRITICAL FIX: Restore custom URL mapping for reconnection
+		if existingTunnel.CustomURL != "" {
+			customURLsMu.Lock()
+			customURLs[existingTunnel.CustomURL] = id
+			customURLsMu.Unlock()
+			log.Printf("[RECONNECTION] Restored custom URL mapping | TunnelID: %s | CustomURL: %s | ClientIP: %s", id, existingTunnel.CustomURL, clientIP)
+		}
 	}
 
 	defer func() {
@@ -308,17 +316,18 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 	if normalizedCustomURL != "" {
 		customURLsMu.Lock()
 		// Atomic check: verify custom URL is still available
-		if _, exists := customURLs[normalizedCustomURL]; exists {
+		if existingTunnelID, exists := customURLs[normalizedCustomURL]; exists {
 			customURLsMu.Unlock()
 			// Clean up the tunnel that was already registered
 			tunnelsMu.Lock()
 			delete(tunnels, id)
 			tunnelsMu.Unlock()
+			log.Printf("[REGISTRATION CONFLICT] Custom URL: %s already taken by tunnel: %s | Rejected tunnel: %s | Method: WebSocket | Client IP: %s", normalizedCustomURL, existingTunnelID, id, ac.clientIP)
 			return sendRegistrationError(ac, "custom URL is already taken")
 		}
 		customURLs[normalizedCustomURL] = id
 		customURLsMu.Unlock()
-		log.Printf("Registered tunnel %s with custom URL: %s (WebSocket)", id, normalizedCustomURL)
+		log.Printf("[REGISTRATION] Tunnel ID: %s | Custom URL: %s | Method: WebSocket | Client IP: %s", id, normalizedCustomURL, ac.clientIP)
 	} else {
 		log.Printf("Registered tunnel %s (WebSocket)", id)
 	}
@@ -652,6 +661,16 @@ func (ac *agentConn) handleTunnelInfo(data []byte) {
 		tunnel.Protocol = tunnelInfo.Protocol
 		tunnel.Port = tunnelInfo.Port
 		log.Printf("Updated tunnel info for agent %s: protocol=%s, port=%d", ac.id, tunnelInfo.Protocol, tunnelInfo.Port)
+		
+		// CRITICAL FIX: Restore custom URL mapping when tunnel info is updated
+		if tunnel.CustomURL != "" {
+			tunnelsMu.Unlock() // Unlock tunnels before locking customURLs to avoid deadlock
+			customURLsMu.Lock()
+			customURLs[tunnel.CustomURL] = ac.id
+			customURLsMu.Unlock()
+			log.Printf("[TUNNEL INFO] Restored custom URL mapping | TunnelID: %s | CustomURL: %s | ClientIP: %s", ac.id, tunnel.CustomURL, ac.clientIP)
+			tunnelsMu.Lock() // Re-lock for the deferred unlock
+		}
 	}
 	tunnelsMu.Unlock()
 }

@@ -87,18 +87,19 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if normalizedCustomURL != "" {
 		customURLsMu.Lock()
 		// Atomic check: verify custom URL is still available
-		if _, exists := customURLs[normalizedCustomURL]; exists {
+		if existingTunnelID, exists := customURLs[normalizedCustomURL]; exists {
 			customURLsMu.Unlock()
 			// Clean up the tunnel that was already registered
 			tunnelsMu.Lock()
 			delete(tunnels, id)
 			tunnelsMu.Unlock()
+			log.Printf("[REGISTRATION CONFLICT] Custom URL: %s already taken by tunnel: %s | Rejected tunnel: %s | Client IP: %s", normalizedCustomURL, existingTunnelID, id, r.RemoteAddr)
 			http.Error(w, "custom URL is already taken", http.StatusConflict)
 			return
 		}
 		customURLs[normalizedCustomURL] = id
 		customURLsMu.Unlock()
-		log.Printf("Registered tunnel %s with custom URL: %s (stateless)", id, normalizedCustomURL)
+		log.Printf("[REGISTRATION] Tunnel ID: %s | Custom URL: %s | Method: HTTP | Client IP: %s", id, normalizedCustomURL, r.RemoteAddr)
 	} else {
 		log.Printf("Registered tunnel %s (stateless)", id)
 	}
@@ -315,11 +316,14 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 
 // customURLHandler handles custom URL routing with case-sensitive matching
 func customURLHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[ROUTING REQUEST] URL: %s | Method: %s | Client IP: %s | User-Agent: %s", r.URL.Path, r.Method, r.RemoteAddr, r.Header.Get("User-Agent"))
+	
 	// Skip if this is already a system endpoint
 	if strings.HasPrefix(r.URL.Path, "/__pub__/") ||
 		strings.HasPrefix(r.URL.Path, "/__ws__") ||
 		strings.HasPrefix(r.URL.Path, "/__tcp__/") ||
 		strings.HasPrefix(r.URL.Path, "/__health__") {
+		log.Printf("[ROUTING DECISION] System endpoint detected: %s | Forwarding to smartFallbackHandler", r.URL.Path)
 		smartFallbackHandler(w, r)
 		return
 	}
@@ -329,10 +333,16 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	// Try exact custom URL match first (case-sensitive)
 	customURLsMu.RLock()
 	tunnelID := customURLs[path]
+	allCustomURLs := make(map[string]string)
+	for k, v := range customURLs {
+		allCustomURLs[k] = v
+	}
 	customURLsMu.RUnlock()
 
+	log.Printf("[ROUTING LOOKUP] Trimmed path: '%s' | Found tunnel: %s | All custom URLs: %v", path, tunnelID, allCustomURLs)
+
 	if tunnelID != "" {
-		log.Printf("Custom URL routing: %s -> tunnel %s", r.URL.Path, tunnelID)
+		log.Printf("[ROUTING MATCH] Custom URL: %s matched tunnel: %s | Original URL: %s", path, tunnelID, r.URL.Path)
 
 		// Calculate forward path first
 		var forwardPath string
@@ -358,15 +368,17 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		if useRedirect && forwardPath == "/" {
 			// This is a request to the custom URL root - check if we should redirect
 			clientKey := generateClientKey(r)
+			log.Printf("[REDIRECT CHECK] UseRedirect: %t | ForwardPath: %s | ClientKey: %s", useRedirect, forwardPath, clientKey)
 
 			// Check if this client already has a redirection session
 			redirectSession := getRedirectSession(clientKey, path)
+			log.Printf("[REDIRECT SESSION] ClientKey: %s | CustomURL: %s | Found session: %v", clientKey, path, redirectSession != nil)
 
 			if redirectSession == nil || !redirectSession.Active {
 				// Create new redirection session and redirect to root
 				createRedirectSession(clientKey, path, tunnelID)
 
-				log.Printf("Redirecting %s to / for SPA routing (tunnel: %s)", r.URL.Path, tunnelID)
+				log.Printf("[REDIRECT CREATE] Creating redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s | Redirecting %s to /", clientKey, path, tunnelID, r.URL.Path)
 
 				// Use 307 Temporary Redirect to preserve method and body
 				redirectURL := "/"
@@ -378,6 +390,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			log.Printf("[REDIRECT USE] Using existing redirect session | ClientKey: %s | CustomURL: %s | TunnelID: %s", clientKey, path, redirectSession.TunnelID)
+
 			// Client has active redirection session, update usage
 			updateRedirectSession(redirectSession)
 		}
@@ -385,15 +399,17 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		// Create modified request with new path
 		newReq := r.Clone(r.Context())
 		newReq.URL.Path = forwardPath
+		log.Printf("[TUNNEL ROUTE] Attempting tunnel route | TunnelID: %s | OriginalPath: %s | ForwardPath: %s", tunnelID, r.URL.Path, forwardPath)
 
 		if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 			// Record successful custom URL usage
 			tunnelMetrics.RecordCustomURLRequest(path, "200")
+			log.Printf("[TUNNEL SUCCESS] Custom URL routing successful | CustomURL: %s | TunnelID: %s | ForwardPath: %s", path, tunnelID, forwardPath)
 			return
 		}
 
 		// If tunnel failed, fall through to smart routing
-		log.Printf("Custom URL routing: tunnel %s failed, falling back to smart routing", tunnelID)
+		log.Printf("[TUNNEL FAILED] Custom URL routing failed | CustomURL: %s | TunnelID: %s | Falling back to smart routing", path, tunnelID)
 	}
 
 	// Try prefix matching for nested custom URLs (e.g., /bob/chatbot -> /bob)
@@ -429,5 +445,6 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// No custom URL match found, fall back to smart routing
+	log.Printf("[ROUTING FALLBACK] No custom URL match found | Path: %s | Falling back to smart routing", r.URL.Path)
 	smartFallbackHandler(w, r)
 }

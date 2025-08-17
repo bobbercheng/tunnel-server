@@ -381,25 +381,26 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	isAsset := isAssetRequest(r.URL.Path)
 	isAPI := isAPIRequest(r.URL.Path)
 
-	log.Printf("Smart routing: handling request %s (asset: %v, api: %v, client: %s)", r.URL.Path, isAsset, isAPI, clientKey)
+	log.Printf("[SMART ROUTING] Request received | URL: %s | Method: %s | Asset: %v | API: %v | ClientKey: %s | RemoteAddr: %s", r.URL.Path, r.Method, isAsset, isAPI, clientKey, r.RemoteAddr)
 
 	// Check for active redirection sessions - route redirected clients to their assigned tunnels
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
-		log.Printf("Smart routing: found active redirection session, routing %s to tunnel %s", r.URL.Path, redirectSession.TunnelID)
+		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
 		if tryTunnelRouteWithTimeout(w, r, redirectSession.TunnelID, isAsset) {
 			updateRedirectSession(redirectSession)
+			log.Printf("[SMART ROUTING] Redirect session routing successful | ClientKey: %s | URL: %s | TunnelID: %s", clientKey, r.URL.Path, redirectSession.TunnelID)
 			return
 		}
 
 		// If redirection tunnel failed, deactivate the session and continue with normal routing
-		log.Printf("Smart routing: redirection tunnel %s failed, deactivating session", redirectSession.TunnelID)
+		log.Printf("[SMART ROUTING] Redirect session tunnel failed | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
 		redirectSession.Active = false
 	}
 
 	// PRIORITY: Single tunnel optimization for ALL requests when only one tunnel exists
 	tunnelIDs := getActiveTunnelIDs()
-	log.Printf("Smart routing: active tunnels count: %d", len(tunnelIDs))
+	log.Printf("[SMART ROUTING] Active tunnels check | Count: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
 
 	// If only one tunnel exists, route ALL requests to it (much simpler and more reliable)
 	if len(tunnelIDs) == 1 {
@@ -411,17 +412,18 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			requestType = "asset"
 		}
 
-		log.Printf("Smart routing: SINGLE TUNNEL - routing %s request %s to tunnel %s", requestType, r.URL.Path, tunnelID)
+		log.Printf("[SMART ROUTING] SINGLE TUNNEL optimization | Type: %s | URL: %s | TunnelID: %s | ClientKey: %s", requestType, r.URL.Path, tunnelID, clientKey)
 
 		// Add extra logging for API requests to help debug 404 issues
 		if isAPI {
-			log.Printf("Smart routing: API REQUEST DETAILS - Method: %s, Path: %s, Headers: %v", r.Method, r.URL.Path, r.Header)
+			log.Printf("[SMART ROUTING] API REQUEST DETAILS | Method: %s | Path: %s | User-Agent: %s", r.Method, r.URL.Path, r.Header.Get("User-Agent"))
 		}
 
 		if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
 			// Learn this mapping for future requests
 			clientTracker.LearnMapping(clientKey, tunnelID)
 			clientTracker.RecordSuccess(clientKey, tunnelID)
+			log.Printf("[SMART ROUTING] Single tunnel routing successful | URL: %s | TunnelID: %s | ClientKey: %s", r.URL.Path, tunnelID, clientKey)
 
 			// Cache assets and record mappings
 			if isAsset {
