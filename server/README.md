@@ -92,12 +92,7 @@ Asset Request: /assets/file.js
 
 ### Enhanced Detection Strategies
 
-#### 1. Asset Mapping Cache
-- **Purpose**: Performance optimization for repeated requests
-- **Mechanism**: In-memory cache of `assetPath → tunnelID` mappings
-- **Cleanup**: Automatically removes invalid cache entries
-
-#### 2. Multi-Header Client Fingerprinting (NEW)
+#### 1. Multi-Header Client Fingerprinting
 - **Purpose**: Intelligent client identification with 95%+ accuracy
 - **Authentication Layer**: Authorization headers, session cookies, API keys
 - **Browser Layer**: User-Agent, Accept headers, Client Hints API
@@ -105,7 +100,7 @@ Asset Request: /assets/file.js
 - **Framework Layer**: React/Vue/Angular detection, CSRF tokens
 - **Privacy**: SHA-256 hashing of sensitive authentication data
 
-#### 3. Enhanced Referer Analysis  
+#### 2. Enhanced Referer Analysis  
 - **Purpose**: Fallback detection with learning integration
 - **Mechanism**: Extract tunnel ID from `Referer: https://server.../__pub__/{tunnelID}/page`
 - **Regex**: `^/__pub__/([a-f0-9\-]+)(/.*)?$`
@@ -118,6 +113,33 @@ Asset Request: /assets/file.js
 - **Learning**: Records success/failure for all tunnel attempts
 - **Selection**: First tunnel returning 2xx status code
 - **Usage**: Reduced from ~20% to <5% of requests
+
+### Asset Routing Strategy
+
+#### Multi-Tunnel Asset Handling
+For applications with identical asset paths (e.g., multiple Next.js apps), asset routing uses a **client-scoped approach** to prevent conflicts:
+
+1. **Redirect Sessions** (Highest Priority)
+   - Clients accessing custom URLs (e.g., `/librechat`) establish redirect sessions
+   - All follow-up requests (including assets) route to the same tunnel
+   - Session-based isolation prevents cross-tunnel contamination
+
+2. **Client Asset Mapping** (Secondary)
+   - Per-client tunnel preferences: `clientKey → tunnelID`
+   - Tracks which tunnel each client should use for assets
+   - Isolated mappings prevent conflicts between different applications
+
+3. **Fallback Strategies** (Last Resort)
+   - IP-based geographical routing
+   - Referer header analysis
+   - Parallel tunnel testing
+
+#### Why Global Asset Cache Was Removed
+- **Path Conflicts**: Multiple Next.js apps share identical paths (`/_next/static/`, `/assets/`)
+- **Cache Contamination**: First tunnel to serve `/assets/main.js` "owns" it globally
+- **Routing Errors**: Wrong tunnel serves assets, causing 404s or incorrect content
+- **Complexity**: Cache invalidation, cleanup, and synchronization overhead
+- **Redundancy**: Redirect sessions and client mapping already solve the problem effectively
 
 ### Implementation Details
 

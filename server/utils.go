@@ -97,9 +97,7 @@ func isAPIRequest(path string) bool {
 // Asset mapping and geographical routing support
 
 var (
-	// Asset mapping cache
-	assetCache     = make(map[string]string) // path -> tunnelID
-	assetCacheMu   sync.RWMutex
+	// Client asset mapping (per-client tunnel preference)
 	clientAssetMap = make(map[string]string) // clientKey -> tunnelID
 	clientAssetMu  sync.RWMutex
 
@@ -435,11 +433,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			clientTracker.RecordSuccess(clientKey, tunnelID)
 			log.Printf("[SMART ROUTING] Single tunnel routing successful | URL: %s | TunnelID: %s | ClientKey: %s", r.URL.Path, tunnelID, clientKey)
 
-			// Cache assets and record mappings
+			// Record client asset mappings
 			if isAsset {
-				assetCacheMu.Lock()
-				assetCache[r.URL.Path] = tunnelID
-				assetCacheMu.Unlock()
 				recordClientAssetMapping(clientKey, tunnelID)
 			} else if !isAPI {
 				// Record asset mapping for regular pages
@@ -456,33 +451,12 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Smart routing: multiple tunnels detected (%d), using advanced routing", len(tunnelIDs))
 	}
 
-	// Check asset cache first
-	assetCacheMu.RLock()
-	if cachedTunnelID, exists := assetCache[r.URL.Path]; exists {
-		assetCacheMu.RUnlock()
-		if tryTunnelRouteWithTimeout(w, r, cachedTunnelID, isAsset) {
-			// Record success in client tracker
-			clientTracker.RecordSuccess(clientKey, cachedTunnelID)
-			log.Printf("Smart routing: %s -> tunnel %s (cached)", r.URL.Path, cachedTunnelID)
-			return
-		}
-		// Remove invalid cache entry
-		assetCacheMu.Lock()
-		delete(assetCache, r.URL.Path)
-		assetCacheMu.Unlock()
-	} else {
-		assetCacheMu.RUnlock()
-	}
+	// Asset cache removed - proceed directly to client asset mapping and other strategies
 
 	// Enhanced Strategy: Check client asset mapping for asset requests
 	if isAsset {
 		if mappedTunnelID := getClientAssetMappingWithFallback(r, clientKey); mappedTunnelID != "" {
 			if tryTunnelRouteWithTimeout(w, r, mappedTunnelID, isAsset) {
-				// Cache successful mapping
-				assetCacheMu.Lock()
-				assetCache[r.URL.Path] = mappedTunnelID
-				assetCacheMu.Unlock()
-
 				clientTracker.RecordSuccess(clientKey, mappedTunnelID)
 				log.Printf("Smart routing: %s -> tunnel %s (client-asset-mapping)", r.URL.Path, mappedTunnelID)
 				return
@@ -498,11 +472,6 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			tunnelID := tunnelIDs[0]
 			log.Printf("Smart routing: RETRY - asset %s with single tunnel %s", r.URL.Path, tunnelID)
 			if tryTunnelRouteWithTimeout(w, r, tunnelID, isAsset) {
-				// Cache successful mapping
-				assetCacheMu.Lock()
-				assetCache[r.URL.Path] = tunnelID
-				assetCacheMu.Unlock()
-
 				// Record asset mapping for this client
 				recordClientAssetMapping(clientKey, tunnelID)
 				clientTracker.RecordSuccess(clientKey, tunnelID)
@@ -761,11 +730,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 					// Record geographical mapping (NEW)
 					recordIPTunnelMapping(clientIP, tunnelID)
 
-					// Cache assets and record mappings
+					// Record client asset mappings
 					if isAsset {
-						assetCacheMu.Lock()
-						assetCache[r.URL.Path] = tunnelID
-						assetCacheMu.Unlock()
 						recordClientAssetMapping(clientKey, tunnelID)
 					} else if !isAPI {
 						recordClientAssetMapping(clientKey, tunnelID)

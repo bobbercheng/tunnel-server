@@ -690,12 +690,7 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 	case resp := <-respCh:
 		// Check if response is successful (2xx status)
 		if resp.Status >= 200 && resp.Status < 300 {
-			// Cache successful mapping for assets
-			if isAsset {
-				assetCacheMu.Lock()
-				assetCache[r.URL.Path] = tunnelID
-				assetCacheMu.Unlock()
-			}
+			// Asset cache removed - no global caching needed
 			
 			// Write response
 			for k, vs := range resp.Headers {
