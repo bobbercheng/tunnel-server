@@ -193,15 +193,11 @@ func (a *Agent) Run() {
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			// Update all configuration from server response
+			// Update only ID and Secret from server response
+			// Keep original configuration (CustomURL, UseRedirect, etc.) to avoid
+			// sending back server-formatted URLs that fail validation
 			a.ID = reg.ID
 			a.Secret = reg.Secret
-			a.CustomURL = reg.CustomURL
-			a.UseRedirect = reg.UseRedirect
-			a.Protocol = reg.Protocol
-			if reg.TcpPort > 0 {
-				a.Port = reg.TcpPort
-			}
 			// Reset failure counters after successful re-registration
 			a.consecutiveDNSFailures = 0
 			a.consecutiveNetworkFailures = 0
@@ -702,21 +698,17 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 		return fmt.Errorf("registration failed: %s", regResp.Error)
 	}
 
-	// Store all registration details from server response
+	// Store only ID and Secret from server response
+	// Agent configuration (CustomURL, UseRedirect, Protocol, Port) should remain
+	// as originally provided to avoid sending back server-formatted values
 	a.ID = regResp.ID
 	a.Secret = regResp.Secret
-	a.CustomURL = regResp.CustomURL
-	a.UseRedirect = regResp.UseRedirect
-	a.Protocol = regResp.Protocol
-	if regResp.TcpPort > 0 {
-		a.Port = regResp.TcpPort
-	}
 
-	// Log the URLs
+	// Log the URLs from server response
 	fmt.Println("  Public URL:", regResp.PublicURL)
-	if a.CustomURL != "" {
-		fmt.Println("  Custom URL:", a.CustomURL)
-		if a.UseRedirect {
+	if regResp.CustomURL != "" {
+		fmt.Println("  Custom URL:", regResp.CustomURL)
+		if regResp.UseRedirect {
 			fmt.Println("  SPA Redirection: Enabled")
 		}
 	}

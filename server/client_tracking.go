@@ -726,20 +726,22 @@ func getRedirectSession(clientKey, customURL string) *RedirectSession {
 	defer clientTracker.mu.RUnlock()
 	
 	session, exists := clientTracker.clientSessions[clientKey]
-	if !exists || session.RedirectSession == nil {
+	if !exists || session.RedirectSessions == nil {
 		return nil
 	}
 	
-	// Check if the redirection session matches the custom URL and is still active
-	if session.RedirectSession.CustomURL == customURL && session.RedirectSession.Active {
-		// Check TTL
-		if time.Since(session.RedirectSession.RedirectTime) > session.RedirectSession.TTL {
-			return nil // Expired
-		}
-		return session.RedirectSession
+	// Get the redirect session for this specific custom URL
+	redirectSession, exists := session.RedirectSessions[customURL]
+	if !exists || !redirectSession.Active {
+		return nil
 	}
 	
-	return nil
+	// Check TTL
+	if time.Since(redirectSession.RedirectTime) > redirectSession.TTL {
+		return nil // Expired
+	}
+	
+	return redirectSession
 }
 
 // createRedirectSession creates a new redirection session for SPA routing
@@ -751,16 +753,22 @@ func createRedirectSession(clientKey, customURL, tunnelID string) {
 	session, exists := clientTracker.clientSessions[clientKey]
 	if !exists {
 		session = &ClientSession{
-			ID:             uuid.NewString(),
-			LastSeen:       time.Now(),
-			TunnelMappings: make(map[string]int),
-			SuccessRate:    make(map[string]float64),
+			ID:               uuid.NewString(),
+			LastSeen:         time.Now(),
+			TunnelMappings:   make(map[string]int),
+			SuccessRate:      make(map[string]float64),
+			RedirectSessions: make(map[string]*RedirectSession),
 		}
 		clientTracker.clientSessions[clientKey] = session
 	}
 	
-	// Create redirection session with 30-minute TTL
-	session.RedirectSession = &RedirectSession{
+	// Initialize RedirectSessions map if nil
+	if session.RedirectSessions == nil {
+		session.RedirectSessions = make(map[string]*RedirectSession)
+	}
+	
+	// Create redirection session with 30-minute TTL for this specific custom URL
+	session.RedirectSessions[customURL] = &RedirectSession{
 		CustomURL:    customURL,
 		TunnelID:     tunnelID,
 		RedirectTime: time.Now(),
@@ -790,21 +798,27 @@ func getActiveRedirectSession(clientKey string) *RedirectSession {
 	defer clientTracker.mu.RUnlock()
 	
 	session, exists := clientTracker.clientSessions[clientKey]
-	if !exists || session.RedirectSession == nil {
+	if !exists || session.RedirectSessions == nil {
 		return nil
 	}
 	
-	// Check if the redirection session is still active and not expired
-	if session.RedirectSession.Active {
-		// Check TTL
-		if time.Since(session.RedirectSession.RedirectTime) > session.RedirectSession.TTL {
-			// Mark as inactive but don't modify under read lock
-			return nil
+	// Find any active redirect session (return the most recently used one)
+	var mostRecentSession *RedirectSession
+	var mostRecentTime time.Time
+	
+	for _, redirectSession := range session.RedirectSessions {
+		if redirectSession.Active {
+			// Check TTL
+			if time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
+				if mostRecentSession == nil || redirectSession.LastUsed.After(mostRecentTime) {
+					mostRecentSession = redirectSession
+					mostRecentTime = redirectSession.LastUsed
+				}
+			}
 		}
-		return session.RedirectSession
 	}
 	
-	return nil
+	return mostRecentSession
 }
 
 // getRedirectionStats returns statistics about active redirection sessions
@@ -819,16 +833,18 @@ func getRedirectionStats() map[string]interface{} {
 	totalRequests := 0
 	
 	for _, session := range clientTracker.clientSessions {
-		if session.RedirectSession != nil {
-			totalSessions++
-			totalRequests += session.RedirectSession.RequestCount
-			
-			if session.RedirectSession.Active {
-				// Check if not expired
-				if time.Since(session.RedirectSession.RedirectTime) <= session.RedirectSession.TTL {
-					activeCount++
-					sessionsByTunnel[session.RedirectSession.TunnelID]++
-					sessionsByCustomURL[session.RedirectSession.CustomURL]++
+		if session.RedirectSessions != nil {
+			for _, redirectSession := range session.RedirectSessions {
+				totalSessions++
+				totalRequests += redirectSession.RequestCount
+				
+				if redirectSession.Active {
+					// Check if not expired
+					if time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
+						activeCount++
+						sessionsByTunnel[redirectSession.TunnelID]++
+						sessionsByCustomURL[redirectSession.CustomURL]++
+					}
 				}
 			}
 		}

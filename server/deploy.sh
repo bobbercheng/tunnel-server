@@ -28,6 +28,39 @@ URL=$(gcloud run deploy $SERVICE \
   --format='value(status.url)') \
 && gcloud run services update $SERVICE \
   --platform managed --region $REGION \
-  --set-env-vars PUBLIC_BASE_URL=$URL
+  --set-env-vars PUBLIC_BASE_URL=$URL \
+  --update-annotations="prometheus.io/scrape=true,prometheus.io/path=/__metrics__,prometheus.io/port=8080"
 
 echo "Deployment complete! Service URL: $URL"
+
+# Verify metrics endpoint is working
+echo ""
+echo "🔍 Verifying metrics endpoint..."
+sleep 5  # Give the service a moment to start
+
+METRICS_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/__metrics__")
+if [ "$METRICS_RESPONSE" = "200" ]; then
+    echo "✅ Metrics endpoint is working: $URL/__metrics__"
+    
+    # Check if tunnel metrics are available
+    TUNNEL_METRICS=$(curl -s "$URL/__metrics__" | grep -c "tunnel_" || true)
+    if [ "$TUNNEL_METRICS" -gt 0 ]; then
+        echo "✅ Found $TUNNEL_METRICS tunnel metric types"
+    else
+        echo "ℹ️  No tunnel metrics yet (will appear with tunnel activity)"
+    fi
+else
+    echo "❌ Metrics endpoint check failed (HTTP $METRICS_RESPONSE)"
+fi
+
+echo ""
+echo "📊 Google Cloud Monitoring setup:"
+echo "   • Prometheus scraping: ENABLED"
+echo "   • Metrics path: /__metrics__"
+echo "   • Metrics should appear in Cloud Monitoring within 10-20 minutes"
+echo ""
+echo "🔗 Useful links:"
+echo "   • Service URL: $URL"
+echo "   • Health check: $URL/__health__"
+echo "   • Metrics endpoint: $URL/__metrics__"
+echo "   • Cloud Monitoring: https://console.cloud.google.com/monitoring/metrics-explorer?project=$PROJECT_ID"

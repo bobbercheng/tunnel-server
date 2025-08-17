@@ -235,8 +235,8 @@ type ClientSession struct {
 	SuccessRate    map[string]float64 // tunnelID -> success_rate
 	Confidence     float64            // Overall routing confidence
 	
-	// Redirection tracking for SPA routing
-	RedirectSession *RedirectSession `json:"redirect_session,omitempty"`
+	// Redirection tracking for SPA routing - support multiple custom URLs per client
+	RedirectSessions map[string]*RedirectSession `json:"redirect_sessions,omitempty"` // customURL -> RedirectSession
 }
 
 // RedirectSession tracks redirection-based tunnel mappings for SPAs

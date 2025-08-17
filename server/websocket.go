@@ -274,9 +274,9 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 		return sendRegistrationError(ac, fmt.Sprintf("invalid custom URL: %s", err.Error()))
 	}
 
-	// Check if custom URL is available
-	if regFrame.CustomURL != "" && !isCustomURLAvailable(regFrame.CustomURL) {
-		return sendRegistrationError(ac, "custom URL is already taken")
+	// Check if custom URL is available (will do atomic check during registration)
+	if regFrame.CustomURL != "" {
+		// Do atomic availability check and registration later
 	}
 
 	// Generate tunnel ID and secret
@@ -304,9 +304,18 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 	tunnels[id] = tunnelInfo
 	tunnelsMu.Unlock()
 
-	// Register custom URL mapping if provided
+	// Register custom URL mapping if provided (atomic check and registration)
 	if normalizedCustomURL != "" {
 		customURLsMu.Lock()
+		// Atomic check: verify custom URL is still available
+		if _, exists := customURLs[normalizedCustomURL]; exists {
+			customURLsMu.Unlock()
+			// Clean up the tunnel that was already registered
+			tunnelsMu.Lock()
+			delete(tunnels, id)
+			tunnelsMu.Unlock()
+			return sendRegistrationError(ac, "custom URL is already taken")
+		}
 		customURLs[normalizedCustomURL] = id
 		customURLsMu.Unlock()
 		log.Printf("Registered tunnel %s with custom URL: %s (WebSocket)", id, normalizedCustomURL)

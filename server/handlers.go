@@ -55,10 +55,9 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if custom URL is available
-	if req.CustomURL != "" && !isCustomURLAvailable(req.CustomURL) {
-		http.Error(w, "custom URL is already taken", http.StatusConflict)
-		return
+	// Check if custom URL is available (will do atomic check during registration)
+	if req.CustomURL != "" {
+		// Do atomic availability check and registration later
 	}
 
 	id := uuid.NewString()
@@ -84,9 +83,19 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	tunnels[id] = tunnelInfo
 	tunnelsMu.Unlock()
 
-	// Register custom URL mapping if provided
+	// Register custom URL mapping if provided (atomic check and registration)
 	if normalizedCustomURL != "" {
 		customURLsMu.Lock()
+		// Atomic check: verify custom URL is still available
+		if _, exists := customURLs[normalizedCustomURL]; exists {
+			customURLsMu.Unlock()
+			// Clean up the tunnel that was already registered
+			tunnelsMu.Lock()
+			delete(tunnels, id)
+			tunnelsMu.Unlock()
+			http.Error(w, "custom URL is already taken", http.StatusConflict)
+			return
+		}
 		customURLs[normalizedCustomURL] = id
 		customURLsMu.Unlock()
 		log.Printf("Registered tunnel %s with custom URL: %s (stateless)", id, normalizedCustomURL)
