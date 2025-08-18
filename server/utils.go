@@ -464,28 +464,23 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
 		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
-		// Try the redirect session tunnel using buffered body
-		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, redirectSession.TunnelID, isAsset) {
+		// Try the redirect session tunnel using specialized function that preserves tunnel stickiness
+		if tryTunnelRouteForRedirectSession(w, r, bodyBytes, redirectSession.TunnelID, isAsset) {
 			updateRedirectSession(redirectSession)
 			log.Printf("[SMART ROUTING] Redirect session routing successful | ClientKey: %s | URL: %s | TunnelID: %s", clientKey, r.URL.Path, redirectSession.TunnelID)
 			return
 		}
 
-		// CONSULTANT FIX: Conditional fallback logic based on tunnel count
+		// If we reach here, there was an actual connection failure (timeout, agent disconnected)
+		// Deactivate the redirect session and continue to fallback routing
+		log.Printf("[SMART ROUTING] Redirect session connection failed | ClientKey: %s | TunnelID: %s | Deactivating session", clientKey, redirectSession.TunnelID)
+		redirectSession.Active = false
+
+		// Check tunnel count for conditional fallback logic
 		tunnelIDs = getActiveTunnelIDs()
-		log.Printf("[SMART ROUTING] Redirect session failed | ClientKey: %s | TunnelID: %s | ActiveTunnels: %d | TunnelIDs: %v", clientKey, redirectSession.TunnelID, len(tunnelIDs), tunnelIDs)
+		log.Printf("[SMART ROUTING] Redirect tunnel failed, checking fallback options | ActiveTunnels: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
 
-		// Check if the tunnel is still connected
-		ac := getAgent(redirectSession.TunnelID)
-		if ac == nil {
-			// Tunnel is completely disconnected - deactivate session
-			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
-			redirectSession.Active = false
-		} else {
-			log.Printf("[SMART ROUTING] Redirect session tunnel still connected | ClientKey: %s | TunnelID: %s | Keeping session active", clientKey, redirectSession.TunnelID)
-		}
-
-		// CRITICAL: Conditional fallback logic to prevent misrouting
+		// CONSULTANT FIX: Prevent misrouting when multiple tunnels are active
 		if len(tunnelIDs) > 1 {
 			// Multiple tunnels active - STOP processing to prevent misrouting to wrong tunnel
 			log.Printf("[SMART ROUTING] STOPPING - Multiple tunnels active, preventing redirect session fallback | ActiveTunnels: %d | ClientKey: %s | SessionTunnel: %s", len(tunnelIDs), clientKey, redirectSession.TunnelID)
@@ -743,9 +738,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		go func(tid string) {
 			// Create a new request with the same body for each attempt
 			newReq := r.Clone(r.Context())
-			newReq.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 
-			success := tryTunnelRouteWithTimeout(&discardResponseWriter{}, newReq, tid, isAsset)
+			success := tryTunnelRouteWithBufferedBody(&discardResponseWriter{}, newReq, bodyBytes, tid, isAsset)
 			resultCh <- tunnelResult{tunnelID: tid, success: success}
 		}(tunnelID)
 	}
@@ -795,9 +789,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if successfulTunnelID != "" {
 		// Create final request with original body
 		finalReq := r.Clone(r.Context())
-		finalReq.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 
-		if tryTunnelRouteWithTimeout(w, finalReq, successfulTunnelID, isAsset) {
+		if tryTunnelRouteWithBufferedBody(w, finalReq, bodyBytes, successfulTunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, successfulTunnelID)
 
 			// Record geographical mapping (NEW)
