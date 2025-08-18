@@ -471,16 +471,21 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// If we reach here, there was an actual connection failure (timeout, agent disconnected)
-		// Deactivate the redirect session and continue to fallback routing
-		log.Printf("[SMART ROUTING] Redirect session connection failed | ClientKey: %s | TunnelID: %s | Deactivating session", clientKey, redirectSession.TunnelID)
-		redirectSession.Active = false
-
-		// Check tunnel count for conditional fallback logic
+		// CONSULTANT FIX: Conditional fallback logic based on tunnel count
 		tunnelIDs = getActiveTunnelIDs()
-		log.Printf("[SMART ROUTING] Redirect tunnel failed, checking fallback options | ActiveTunnels: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
+		log.Printf("[SMART ROUTING] Redirect session failed | ClientKey: %s | TunnelID: %s | ActiveTunnels: %d | TunnelIDs: %v", clientKey, redirectSession.TunnelID, len(tunnelIDs), tunnelIDs)
 
-		// CONSULTANT FIX: Prevent misrouting when multiple tunnels are active
+		// Check if the tunnel is still connected
+		ac := getAgent(redirectSession.TunnelID)
+		if ac == nil {
+			// Tunnel is completely disconnected - deactivate session
+			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
+			redirectSession.Active = false
+		} else {
+			log.Printf("[SMART ROUTING] Redirect session tunnel still connected | ClientKey: %s | TunnelID: %s | Keeping session active", clientKey, redirectSession.TunnelID)
+		}
+
+		// CRITICAL: Conditional fallback logic to prevent misrouting
 		if len(tunnelIDs) > 1 {
 			// Multiple tunnels active - STOP processing to prevent misrouting to wrong tunnel
 			log.Printf("[SMART ROUTING] STOPPING - Multiple tunnels active, preventing redirect session fallback | ActiveTunnels: %d | ClientKey: %s | SessionTunnel: %s", len(tunnelIDs), clientKey, redirectSession.TunnelID)
