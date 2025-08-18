@@ -50,6 +50,16 @@ func main() {
 			clientTracker.CleanupExpiredSessions()
 		}
 	}()
+	
+	// Start recent mappings cleanup routine (more frequent for 2-second window)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second) // Clean every 10 seconds
+		defer ticker.Stop()
+
+		for range ticker.C {
+			clientTracker.CleanupExpiredRecentMappings()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	// mux.HandleFunc("/__register__", registerHandler) // Disabled: Registration now happens over WebSocket

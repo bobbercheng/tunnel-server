@@ -250,6 +250,13 @@ type RedirectSession struct {
 	TTL            time.Duration `json:"ttl"`          // Time-to-live for this redirection session
 }
 
+// RecentMapping represents a time-stamped tunnel mapping for immediate affinity
+type RecentMapping struct {
+	TunnelID   string    `json:"tunnel_id"`   // The tunnel ID to route to
+	Timestamp  time.Time `json:"timestamp"`   // When this mapping was created
+	AccessType string    `json:"access_type"` // "custom_url", "public_url", "redirect", etc.
+}
+
 // ClientTracker manages client sessions and tunnel mappings
 type ClientTracker struct {
 	// Primary tracking
@@ -257,8 +264,8 @@ type ClientTracker struct {
 	ipMappings     map[string][]string       // clientIP -> clientKeys
 	tunnelClients  map[string][]string       // tunnelID -> clientKeys
 
-	// Performance optimization
-	recentMappings map[string]string // clientKey -> tunnelID (LRU-like)
+	// Performance optimization - 2-second tunnel affinity
+	recentMappings map[string]*RecentMapping // clientKey -> RecentMapping (time-based)
 
 	// Configuration
 	maxSessions     int

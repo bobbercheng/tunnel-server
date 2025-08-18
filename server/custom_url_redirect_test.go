@@ -1,11 +1,12 @@
 package main
 
 import (
+	"net/http/httptest"
 	"testing"
 	"time"
 )
 
-func TestStrictRoutingWithRedirectSession(t *testing.T) {
+func TestCustomURLRedirectWithMultipleTunnels(t *testing.T) {
 	// Setup: Reset global state
 	tunnelsMu.Lock()
 	agentsMu.Lock()
@@ -54,48 +55,76 @@ func TestStrictRoutingWithRedirectSession(t *testing.T) {
 	agentsMu.Unlock()
 	tunnelsMu.Unlock()
 	
-	t.Run("RedirectSessionEnforcesStrictRouting", func(t *testing.T) {
-		clientKey := "test-client-strict-routing"
-		customURL := "librechat"
-		tunnelID := tunnel1ID
+	t.Run("DetectCustomURLFromRedirect", func(t *testing.T) {
+		// Test 1: Referer-based detection
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Referer", "https://example.com/librechat")
 		
-		// Create a redirect session
-		createRedirectSession(clientKey, customURL, tunnelID)
+		clientKey := generateClientKey(req)
+		detectedURL := detectCustomURLFromRedirect(req, clientKey)
 		
-		// Verify the session exists and is active
-		session := getActiveRedirectSession(clientKey)
-		if session == nil {
-			t.Fatal("Expected to find active redirect session")
-		}
-		if session.TunnelID != tunnelID {
-			t.Errorf("Expected tunnel ID '%s', got '%s'", tunnelID, session.TunnelID)
-		}
-		if !session.Active {
-			t.Error("Expected session to be active")
+		if detectedURL != "librechat" {
+			t.Errorf("Expected to detect 'librechat', got '%s'", detectedURL)
 		}
 		
-		// Verify that when multiple tunnels exist, we should still have strict routing
-		tunnelIDs := getActiveTunnelIDs()
-		if len(tunnelIDs) != 2 {
-			t.Errorf("Expected 2 tunnels, got %d", len(tunnelIDs))
-		}
+		// Test 2: Non-root path should not detect
+		req2 := httptest.NewRequest("GET", "/assets/style.css", nil)
+		req2.Header.Set("Referer", "https://example.com/librechat")
 		
-		// The key point: even with multiple tunnels, redirect session should be respected
-		// This test verifies the session exists and is properly configured
+		clientKey2 := generateClientKey(req2)
+		detectedURL2 := detectCustomURLFromRedirect(req2, clientKey2)
+		
+		if detectedURL2 != "" {
+			t.Errorf("Expected empty string for non-root path, got '%s'", detectedURL2)
+		}
 	})
 	
-	t.Run("RedirectSessionWithSpecificCustomURL", func(t *testing.T) {
-		clientKey := "test-client-custom-url"
+	t.Run("CustomURLFallbackLogic", func(t *testing.T) {
+		// Create a request to root that should trigger fallback
+		req := httptest.NewRequest("GET", "/", nil)
+		
+		// Since we can't easily mock the tunnel routing, we'll test the detection logic
+		_ = generateClientKey(req)
+		
+		// Verify we can find redirect-enabled custom URLs
+		customURLsMu.RLock()
+		var redirectCustomURLs []string
+		for customURL, tunnelID := range customURLs {
+			tunnelsMu.RLock()
+			if tunnel, exists := tunnels[tunnelID]; exists && tunnel.UseRedirect {
+				redirectCustomURLs = append(redirectCustomURLs, customURL)
+			}
+			tunnelsMu.RUnlock()
+		}
+		customURLsMu.RUnlock()
+		
+		if len(redirectCustomURLs) != 1 {
+			t.Errorf("Expected 1 redirect custom URL, got %d", len(redirectCustomURLs))
+		}
+		
+		if len(redirectCustomURLs) > 0 && redirectCustomURLs[0] != "librechat" {
+			t.Errorf("Expected 'librechat', got '%s'", redirectCustomURLs[0])
+		}
+		
+		// Test that we can get the tunnel for the custom URL
+		tunnelID := getCustomURLTunnel("librechat")
+		if tunnelID != tunnel1ID {
+			t.Errorf("Expected tunnel ID '%s', got '%s'", tunnel1ID, tunnelID)
+		}
+	})
+	
+	t.Run("RedirectSessionManagement", func(t *testing.T) {
+		clientKey := "test-client-key"
 		customURL := "librechat"
 		tunnelID := tunnel1ID
 		
 		// Create a redirect session
 		createRedirectSession(clientKey, customURL, tunnelID)
 		
-		// Test getting the session by specific custom URL
+		// Test getting the session
 		session := getActiveRedirectSessionForCustomURL(clientKey, customURL)
 		if session == nil {
-			t.Error("Expected to find redirect session for specific custom URL")
+			t.Error("Expected to find redirect session")
 		} else {
 			if session.CustomURL != customURL {
 				t.Errorf("Expected custom URL '%s', got '%s'", customURL, session.CustomURL)
@@ -107,42 +136,14 @@ func TestStrictRoutingWithRedirectSession(t *testing.T) {
 				t.Error("Expected session to be active")
 			}
 		}
-	})
-	
-	t.Run("MultipleTunnelScenario", func(t *testing.T) {
-		// Verify we have multiple tunnels active
-		tunnelIDs := getActiveTunnelIDs()
-		if len(tunnelIDs) != 2 {
-			t.Errorf("Expected 2 tunnels for this test, got %d", len(tunnelIDs))
-		}
 		
-		// Verify tunnel IDs are what we expect
-		foundTunnel1 := false
-		foundTunnel2 := false
-		for _, id := range tunnelIDs {
-			if id == tunnel1ID {
-				foundTunnel1 = true
-			}
-			if id == tunnel2ID {
-				foundTunnel2 = true
-			}
+		// Test getting any active session
+		anySession := getActiveRedirectSession(clientKey)
+		if anySession == nil {
+			t.Error("Expected to find any active redirect session")
+		} else if anySession.CustomURL != customURL {
+			t.Errorf("Expected custom URL '%s', got '%s'", customURL, anySession.CustomURL)
 		}
-		
-		if !foundTunnel1 {
-			t.Errorf("Expected to find tunnel1 (%s) in active tunnels: %v", tunnel1ID, tunnelIDs)
-		}
-		if !foundTunnel2 {
-			t.Errorf("Expected to find tunnel2 (%s) in active tunnels: %v", tunnel2ID, tunnelIDs)
-		}
-		
-		// Verify custom URL mapping is correct
-		customURLsMu.RLock()
-		if mappedTunnelID, exists := customURLs["librechat"]; !exists {
-			t.Error("Expected 'librechat' custom URL to be mapped")
-		} else if mappedTunnelID != tunnel1ID {
-			t.Errorf("Expected 'librechat' to map to '%s', got '%s'", tunnel1ID, mappedTunnelID)
-		}
-		customURLsMu.RUnlock()
 	})
 }
 

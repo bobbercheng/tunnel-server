@@ -292,6 +292,9 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		// Record successful tunnel access for smart routing learning
 		clientKey := generateClientKey(r)
 		clientTracker.RecordSuccess(clientKey, id)
+		
+		// Create immediate tunnel binding for 2-second affinity window
+		clientTracker.CreateImmediateBinding(clientKey, id, "public_url")
 
 		// Record IP-based geographical routing
 		recordIPTunnelMapping(clientIP, id)
@@ -402,6 +405,11 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 			// Record successful custom URL usage
 			tunnelMetrics.RecordCustomURLRequest(path, "200")
+			
+			// Create immediate tunnel binding for 2-second affinity window
+			clientKey := generateClientKey(r)
+			clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url")
+			
 			log.Printf("[TUNNEL SUCCESS] Custom URL routing successful | CustomURL: %s | TunnelID: %s | ForwardPath: %s", path, tunnelID, forwardPath)
 			return
 		}
@@ -433,6 +441,11 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 				if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 					// Record successful custom URL prefix usage
 					tunnelMetrics.RecordCustomURLRequest(parentPath, "200")
+					
+					// Create immediate tunnel binding for 2-second affinity window
+					clientKey := generateClientKey(r)
+					clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url_prefix")
+					
 					return
 				}
 

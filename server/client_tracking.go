@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -18,13 +19,19 @@ import (
 
 // Client tracking and smart routing functionality
 
+const (
+	// TunnelAffinityWindow is the time window for immediate tunnel affinity
+	// Based on user behavior: no one opens multiple custom/public URLs within 2 seconds
+	TunnelAffinityWindow = 2 * time.Second
+)
+
 // NewClientTracker creates a new client tracker with default settings
 func NewClientTracker() *ClientTracker {
 	return &ClientTracker{
 		clientSessions:  make(map[string]*ClientSession),
 		ipMappings:      make(map[string][]string),
 		tunnelClients:   make(map[string][]string),
-		recentMappings:  make(map[string]string),
+		recentMappings:  make(map[string]*RecentMapping),
 		maxSessions:     10000,
 		sessionTTL:      24 * time.Hour,
 		cleanupInterval: 1 * time.Hour,
@@ -212,43 +219,55 @@ func generateFingerprintHash(fp *ClientFingerprint) string {
 // calculateFingerprintConfidence calculates confidence score for fingerprint
 func calculateFingerprintConfidence(fp *ClientFingerprint) float64 {
 	confidence := 0.1 // Base confidence
+	var confidenceDetails []string
 	
 	// Authentication signals (highest weight)
 	if fp.Authorization != "" {
 		confidence += 0.4
+		confidenceDetails = append(confidenceDetails, "auth_header:+0.4")
 	}
 	if fp.SessionCookie != "" {
 		confidence += 0.3
+		confidenceDetails = append(confidenceDetails, "session_cookie:+0.3")
 	}
 	if len(fp.AuthCookies) > 0 {
 		confidence += 0.2
+		confidenceDetails = append(confidenceDetails, fmt.Sprintf("auth_cookies(%d):+0.2", len(fp.AuthCookies)))
 	}
 	if len(fp.SessionTokens) > 0 {
 		confidence += 0.2
+		confidenceDetails = append(confidenceDetails, fmt.Sprintf("session_tokens(%d):+0.2", len(fp.SessionTokens)))
 	}
 	
 	// IP consistency
 	if fp.ClientIP != "" && net.ParseIP(fp.ClientIP) != nil {
 		confidence += 0.1
+		confidenceDetails = append(confidenceDetails, "valid_ip:+0.1")
 	}
 	
 	// Browser fingerprinting
 	if fp.UserAgent != "" {
 		confidence += 0.1
+		confidenceDetails = append(confidenceDetails, "user_agent:+0.1")
 	}
 	if fp.AcceptLanguage != "" {
 		confidence += 0.05
+		confidenceDetails = append(confidenceDetails, "accept_lang:+0.05")
 	}
 	
 	// Application context
 	if fp.Origin != "" || fp.Referer != "" {
 		confidence += 0.05
+		confidenceDetails = append(confidenceDetails, "origin_referer:+0.05")
 	}
 	
 	// Cap at 1.0
 	if confidence > 1.0 {
 		confidence = 1.0
 	}
+	
+	log.Printf("[FINGERPRINT QUALITY] Confidence calculated | Hash: %s | IP: %s | Confidence: %.2f | Details: %v", 
+		fp.FingerprintHash, fp.ClientIP, confidence, confidenceDetails)
 	
 	return confidence
 }
@@ -335,23 +354,42 @@ func (ct *ClientTracker) GetBestTunnel(clientKey string) string {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
 	
-	// Check recent mappings first (fast path)
-	if tunnelID, exists := ct.recentMappings[clientKey]; exists {
-		return tunnelID
+	log.Printf("[TUNNEL SELECTION] Starting best tunnel selection | ClientKey: %s", clientKey)
+	
+	// PRIORITY 1: Check 2-second tunnel affinity window (immediate routing)
+	if recentMapping, exists := ct.recentMappings[clientKey]; exists {
+		age := time.Since(recentMapping.Timestamp)
+		if age <= TunnelAffinityWindow {
+			log.Printf("[TUNNEL AFFINITY] Using recent mapping | ClientKey: %s | TunnelID: %s | Age: %v | AccessType: %s", 
+				clientKey, recentMapping.TunnelID, age, recentMapping.AccessType)
+			return recentMapping.TunnelID
+		} else {
+			// Mapping expired, log for debugging
+			log.Printf("[TUNNEL AFFINITY] Recent mapping expired | ClientKey: %s | TunnelID: %s | Age: %v | Threshold: %v", 
+				clientKey, recentMapping.TunnelID, age, TunnelAffinityWindow)
+		}
+	} else {
+		log.Printf("[TUNNEL AFFINITY] No recent mapping found | ClientKey: %s", clientKey)
 	}
 	
 	// Check client session
 	session, exists := ct.clientSessions[clientKey]
 	if !exists {
+		log.Printf("[TUNNEL SELECTION] No client session found | ClientKey: %s", clientKey)
 		return ""
 	}
+	
+	log.Printf("[TUNNEL SELECTION] Client session found | ClientKey: %s | TunnelMappings: %v | SuccessRates: %v | Confidence: %.2f", 
+		clientKey, session.TunnelMappings, session.SuccessRate, session.Confidence)
 	
 	// Find tunnel with highest success rate and usage
 	var bestTunnel string
 	var bestScore float64
+	var allScores = make(map[string]float64)
 	
 	for tunnelID, usageCount := range session.TunnelMappings {
 		if usageCount == 0 {
+			log.Printf("[TUNNEL SELECTION] Skipping tunnel with zero usage | TunnelID: %s", tunnelID)
 			continue
 		}
 		
@@ -363,11 +401,22 @@ func (ct *ClientTracker) GetBestTunnel(clientKey string) string {
 		// Score = success_rate * log(usage_count + 1)
 		// This favors both reliable and frequently used tunnels
 		score := successRate * (1.0 + float64(usageCount)*0.1)
+		allScores[tunnelID] = score
+		
+		log.Printf("[TUNNEL SELECTION] Evaluating tunnel | TunnelID: %s | UsageCount: %d | SuccessRate: %.2f | Score: %.2f", 
+			tunnelID, usageCount, successRate, score)
 		
 		if score > bestScore {
 			bestScore = score
 			bestTunnel = tunnelID
 		}
+	}
+	
+	if bestTunnel != "" {
+		log.Printf("[TUNNEL SELECTION] Best tunnel selected | ClientKey: %s | TunnelID: %s | Score: %.2f | AllScores: %v", 
+			clientKey, bestTunnel, bestScore, allScores)
+	} else {
+		log.Printf("[TUNNEL SELECTION] No suitable tunnel found | ClientKey: %s | AllScores: %v", clientKey, allScores)
 	}
 	
 	return bestTunnel
@@ -403,13 +452,42 @@ func (ct *ClientTracker) GetConfidence(clientKey, tunnelID string) float64 {
 	return confidence
 }
 
+// CreateImmediateBinding creates a 2-second tunnel affinity for immediate follow-up requests
+func (ct *ClientTracker) CreateImmediateBinding(clientKey, tunnelID, accessType string) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	
+	// Check if there's an existing recent mapping
+	var previousMapping string
+	if existing, exists := ct.recentMappings[clientKey]; exists {
+		age := time.Since(existing.Timestamp)
+		previousMapping = fmt.Sprintf("previous:%s(age:%v)", existing.TunnelID, age)
+	}
+	
+	recentMapping := &RecentMapping{
+		TunnelID:   tunnelID,
+		Timestamp:  time.Now(),
+		AccessType: accessType,
+	}
+	
+	ct.recentMappings[clientKey] = recentMapping
+	
+	log.Printf("[TUNNEL AFFINITY] Created immediate binding | ClientKey: %s | TunnelID: %s | AccessType: %s | Window: %v | %s", 
+		clientKey, tunnelID, accessType, TunnelAffinityWindow, previousMapping)
+}
+
 // RecordSuccess updates tracking for successful routing
 func (ct *ClientTracker) RecordSuccess(clientKey, tunnelID string) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 	
-	// Update recent mappings
-	ct.recentMappings[clientKey] = tunnelID
+	// Update recent mappings with timestamp (extend existing or create new)
+	recentMapping := &RecentMapping{
+		TunnelID:   tunnelID,
+		Timestamp:  time.Now(),
+		AccessType: "success_routing",
+	}
+	ct.recentMappings[clientKey] = recentMapping
 	
 	// Update session tracking
 	session, exists := ct.clientSessions[clientKey]
@@ -457,8 +535,9 @@ func (ct *ClientTracker) RecordFailure(clientKey, tunnelID string) {
 	}
 	
 	// Remove from recent mappings if it was there
-	if ct.recentMappings[clientKey] == tunnelID {
+	if recentMapping, exists := ct.recentMappings[clientKey]; exists && recentMapping.TunnelID == tunnelID {
 		delete(ct.recentMappings, clientKey)
+		log.Printf("[TUNNEL AFFINITY] Removed failed mapping | ClientKey: %s | TunnelID: %s", clientKey, tunnelID)
 	}
 }
 
@@ -482,8 +561,13 @@ func (ct *ClientTracker) LearnMapping(clientKey, tunnelID string) {
 		session.TunnelMappings[tunnelID]++
 	}
 	
-	// Add to recent mappings
-	ct.recentMappings[clientKey] = tunnelID
+	// Add to recent mappings with timestamp
+	recentMapping := &RecentMapping{
+		TunnelID:   tunnelID,
+		Timestamp:  time.Now(),
+		AccessType: "learned_mapping",
+	}
+	ct.recentMappings[clientKey] = recentMapping
 	
 	// Update tunnel->clients mapping
 	ct.addTunnelClient(tunnelID, clientKey)
@@ -498,6 +582,33 @@ func (ct *ClientTracker) addTunnelClient(tunnelID, clientKey string) {
 		}
 	}
 	ct.tunnelClients[tunnelID] = append(clients, clientKey)
+}
+
+// CleanupExpiredRecentMappings removes recent mappings older than the affinity window
+func (ct *ClientTracker) CleanupExpiredRecentMappings() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	
+	now := time.Now()
+	var expiredKeys []string
+	
+	for clientKey, recentMapping := range ct.recentMappings {
+		age := now.Sub(recentMapping.Timestamp)
+		if age > TunnelAffinityWindow {
+			expiredKeys = append(expiredKeys, clientKey)
+		}
+	}
+	
+	for _, key := range expiredKeys {
+		mapping := ct.recentMappings[key]
+		delete(ct.recentMappings, key)
+		log.Printf("[TUNNEL AFFINITY] Cleaned up expired mapping | ClientKey: %s | TunnelID: %s | Age: %v | AccessType: %s", 
+			key, mapping.TunnelID, now.Sub(mapping.Timestamp), mapping.AccessType)
+	}
+	
+	if len(expiredKeys) > 0 {
+		log.Printf("[TUNNEL AFFINITY] Cleaned up %d expired recent mappings", len(expiredKeys))
+	}
 }
 
 // CleanupExpiredSessions removes old client sessions
@@ -640,11 +751,16 @@ func tryTunnelRoute(w http.ResponseWriter, r *http.Request, tunnelID string) boo
 
 // tryTunnelRouteWithTimeout attempts to route the request through a specific tunnel with configurable timeout
 func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID string, isAsset bool) bool {
+	startTime := time.Now()
 	ac := getAgent(tunnelID)
 	if ac == nil {
-		log.Printf("Smart routing: tryTunnelRoute FAILED - no agent found for tunnel %s (path: %s)", tunnelID, r.URL.Path)
+		log.Printf("[TUNNEL ROUTING] FAILED - no agent found | TunnelID: %s | Path: %s | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, r.Method, isAsset)
 		return false
 	}
+	
+	log.Printf("[TUNNEL ROUTING] Starting tunnel attempt | TunnelID: %s | Path: %s | Method: %s | Asset: %v | Agent connected: %v", 
+		tunnelID, r.URL.Path, r.Method, isAsset, ac.connectedAt)
 	
 	// Prepare the request path (remove leading slash if present)
 	requestPath := strings.TrimPrefix(r.URL.Path, "/")
@@ -682,15 +798,24 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 	
 	// Send encrypted request
 	if err := ac.writeEncrypted(ctx, req); err != nil {
-		log.Printf("Smart routing: FAILED to write encrypted request to tunnel %s for path %s: %v", tunnelID, r.URL.Path, err)
+		duration := time.Since(startTime)
+		log.Printf("[TUNNEL ROUTING] FAILED to write encrypted request | TunnelID: %s | Path: %s | Error: %v | Duration: %v", 
+			tunnelID, r.URL.Path, err, duration)
 		return false
 	}
 	
+	log.Printf("[TUNNEL ROUTING] Request sent, waiting for response | TunnelID: %s | Path: %s | Timeout: %v", 
+		tunnelID, r.URL.Path, timeout)
+	
 	select {
 	case resp := <-respCh:
+		duration := time.Since(startTime)
+		bodySize := len(resp.Body)
+		
 		// Check if response is successful (2xx status)
 		if resp.Status >= 200 && resp.Status < 300 {
-			// Asset cache removed - no global caching needed
+			log.Printf("[TUNNEL ROUTING] SUCCESS | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v", 
+				tunnelID, r.URL.Path, resp.Status, bodySize, duration)
 			
 			// Write response
 			for k, vs := range resp.Headers {
@@ -705,10 +830,13 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 			_, _ = w.Write(resp.Body)
 			return true
 		}
-		log.Printf("Smart routing: tunnel %s returned non-2xx status %d for %s (method: %s, isAsset: %v)", tunnelID, resp.Status, r.URL.Path, r.Method, isAsset)
+		log.Printf("[TUNNEL ROUTING] Non-2xx response | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, resp.Status, bodySize, duration, r.Method, isAsset)
 		return false
 	case <-ctx.Done():
-		log.Printf("Smart routing: TIMEOUT waiting for response from tunnel %s for %s (method: %s, timeout: %v)", tunnelID, r.URL.Path, r.Method, timeout)
+		duration := time.Since(startTime)
+		log.Printf("[TUNNEL ROUTING] TIMEOUT | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, duration, timeout, r.Method, isAsset)
 		return false
 	}
 }
