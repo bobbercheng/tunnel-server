@@ -749,6 +749,95 @@ func tryTunnelRoute(w http.ResponseWriter, r *http.Request, tunnelID string) boo
 	return tryTunnelRouteWithTimeout(w, r, tunnelID, false)
 }
 
+// tryTunnelRouteWithBufferedBody attempts to route the request through a specific tunnel using pre-buffered body
+func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, bodyBytes []byte, tunnelID string, isAsset bool) bool {
+	startTime := time.Now()
+	ac := getAgent(tunnelID)
+	if ac == nil {
+		log.Printf("[TUNNEL ROUTING] FAILED - no agent found | TunnelID: %s | Path: %s | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, r.Method, isAsset)
+		return false
+	}
+	
+	log.Printf("[TUNNEL ROUTING] Starting tunnel attempt (buffered body) | TunnelID: %s | Path: %s | Method: %s | Asset: %v | BodySize: %d | Agent connected: %v", 
+		tunnelID, r.URL.Path, r.Method, isAsset, len(bodyBytes), ac.connectedAt)
+	
+	// Prepare the request path (remove leading slash if present)
+	requestPath := strings.TrimPrefix(r.URL.Path, "/")
+	if requestPath == "" {
+		requestPath = "/"
+	} else {
+		requestPath = "/" + requestPath
+	}
+	
+	reqID := uuid.NewString()
+	req := &ReqFrame{
+		Type:    "req",
+		ReqID:   reqID,
+		Method:  r.Method,
+		Path:    requestPath,
+		Query:   r.URL.RawQuery,
+		Headers: r.Header,
+		Body:    bodyBytes, // Use buffered body instead of consuming r.Body
+	}
+	
+	respCh := make(chan *RespFrame, 1)
+	ac.registerWaiter(reqID, respCh)
+	
+	// Use different timeouts for assets vs regular requests
+	timeout := 5 * time.Second
+	if isAsset {
+		timeout = 15 * time.Second // Longer timeout for asset requests
+	}
+	
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	
+	// Send encrypted request
+	if err := ac.writeEncrypted(ctx, req); err != nil {
+		duration := time.Since(startTime)
+		log.Printf("[TUNNEL ROUTING] FAILED to write encrypted request (buffered) | TunnelID: %s | Path: %s | Error: %v | Duration: %v", 
+			tunnelID, r.URL.Path, err, duration)
+		return false
+	}
+	
+	log.Printf("[TUNNEL ROUTING] Request sent (buffered), waiting for response | TunnelID: %s | Path: %s | Timeout: %v", 
+		tunnelID, r.URL.Path, timeout)
+	
+	select {
+	case resp := <-respCh:
+		duration := time.Since(startTime)
+		bodySize := len(resp.Body)
+		
+		// Check if response is successful (2xx status)
+		if resp.Status >= 200 && resp.Status < 300 {
+			log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v", 
+				tunnelID, r.URL.Path, resp.Status, bodySize, duration)
+			
+			// Write response
+			for k, vs := range resp.Headers {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			if resp.Status == 0 {
+				resp.Status = http.StatusOK
+			}
+			w.WriteHeader(resp.Status)
+			_, _ = w.Write(resp.Body)
+			return true
+		}
+		log.Printf("[TUNNEL ROUTING] Non-2xx response (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, resp.Status, bodySize, duration, r.Method, isAsset)
+		return false
+	case <-ctx.Done():
+		duration := time.Since(startTime)
+		log.Printf("[TUNNEL ROUTING] TIMEOUT (buffered) | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v", 
+			tunnelID, r.URL.Path, duration, timeout, r.Method, isAsset)
+		return false
+	}
+}
+
 // tryTunnelRouteWithTimeout attempts to route the request through a specific tunnel with configurable timeout
 func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID string, isAsset bool) bool {
 	startTime := time.Now()
