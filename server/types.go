@@ -11,19 +11,19 @@ import (
 
 // Request and response frame types for the WebSocket protocol
 type RegisterReq struct {
-	Protocol     string `json:"protocol"`             // "http" or "tcp"
-	Port         int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
-	CustomURL    string `json:"custom_url,omitempty"`   // custom URL like "bob/chatbot"
-	UseRedirect  bool   `json:"use_redirect,omitempty"` // enable redirection for SPA base path issues
+	Protocol    string `json:"protocol"`               // "http" or "tcp"
+	Port        int    `json:"port"`                   // for TCP tunnels, the local port being tunneled
+	CustomURL   string `json:"custom_url,omitempty"`   // custom URL like "bob/chatbot"
+	UseRedirect bool   `json:"use_redirect,omitempty"` // enable redirection for SPA base path issues
 }
 
 type RegisterResp struct {
 	ID          string `json:"id"`
 	Secret      string `json:"secret"`
-	PublicURL   string `json:"public_url"`          // Default /__pub__/{id} or /__tcp__/{id}
-	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	PublicURL   string `json:"public_url"`           // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL   string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol    string `json:"protocol"`
-	TcpPort     int    `json:"tcp_port,omitempty"`   // for TCP tunnels
+	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
 	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled for this tunnel
 }
 
@@ -65,25 +65,25 @@ type HandshakeFrame struct {
 
 // RegisterFrame is used for agent registration over WebSocket (encrypted)
 type RegisterFrame struct {
-	Type        string `json:"type"`                 // "register"
-	Protocol    string `json:"protocol"`             // "http" or "tcp"
-	Port        int    `json:"port"`                 // for TCP tunnels, the local port being tunneled
+	Type        string `json:"type"`                   // "register"
+	Protocol    string `json:"protocol"`               // "http" or "tcp"
+	Port        int    `json:"port"`                   // for TCP tunnels, the local port being tunneled
 	CustomURL   string `json:"custom_url,omitempty"`   // custom URL like "bob/chatbot"
 	UseRedirect bool   `json:"use_redirect,omitempty"` // enable redirection for SPA base path issues
 }
 
 // RegisterResponseFrame is the server's response to registration (encrypted)
 type RegisterResponseFrame struct {
-	Type        string `json:"type"`                 // "register_response"
+	Type        string `json:"type"` // "register_response"
 	ID          string `json:"id"`
 	Secret      string `json:"secret"`
-	PublicURL   string `json:"public_url"`          // Default /__pub__/{id} or /__tcp__/{id}
-	CustomURL   string `json:"custom_url,omitempty"`   // custom URL if requested
+	PublicURL   string `json:"public_url"`           // Default /__pub__/{id} or /__tcp__/{id}
+	CustomURL   string `json:"custom_url,omitempty"` // custom URL if requested
 	Protocol    string `json:"protocol"`
-	TcpPort     int    `json:"tcp_port,omitempty"`   // for TCP tunnels
+	TcpPort     int    `json:"tcp_port,omitempty"`     // for TCP tunnels
 	UseRedirect bool   `json:"use_redirect,omitempty"` // redirection enabled for this tunnel
 	Success     bool   `json:"success"`
-	Error       string `json:"error,omitempty"`      // error message if Success is false
+	Error       string `json:"error,omitempty"` // error message if Success is false
 }
 
 // TCP Frame types for raw TCP tunneling
@@ -109,11 +109,13 @@ type TcpDisconnectFrame struct {
 type PingFrame struct {
 	Type      string    `json:"type"`      // "ping"
 	Timestamp time.Time `json:"timestamp"` // when ping was sent
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier
 }
 
 type PongFrame struct {
 	Type      string    `json:"type"`      // "pong"
 	Timestamp time.Time `json:"timestamp"` // original ping timestamp
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier (echoed from ping)
 }
 
 // TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
@@ -175,9 +177,9 @@ type TcpConn struct {
 // Tunnel metadata
 type TunnelInfo struct {
 	Secret      string    `json:"secret"`
-	Protocol    string    `json:"protocol"`             // "http" or "tcp"
-	Port        int       `json:"port"`                 // for TCP tunnels
-	Created     time.Time `json:"created"`              // when tunnel was created
+	Protocol    string    `json:"protocol"`               // "http" or "tcp"
+	Port        int       `json:"port"`                   // for TCP tunnels
+	Created     time.Time `json:"created"`                // when tunnel was created
 	CustomURL   string    `json:"custom_url,omitempty"`   // custom URL if set
 	UseRedirect bool      `json:"use_redirect,omitempty"` // redirection enabled for SPA routing
 }
@@ -234,20 +236,20 @@ type ClientSession struct {
 	TunnelMappings map[string]int     // tunnelID -> usage_count
 	SuccessRate    map[string]float64 // tunnelID -> success_rate
 	Confidence     float64            // Overall routing confidence
-	
+
 	// Redirection tracking for SPA routing - support multiple custom URLs per client
 	RedirectSessions map[string]*RedirectSession `json:"redirect_sessions,omitempty"` // customURL -> RedirectSession
 }
 
 // RedirectSession tracks redirection-based tunnel mappings for SPAs
 type RedirectSession struct {
-	CustomURL      string    `json:"custom_url"`       // Original custom URL that triggered redirect
-	TunnelID       string    `json:"tunnel_id"`        // Target tunnel for this redirection
-	RedirectTime   time.Time `json:"redirect_time"`    // When redirection was established
-	LastUsed       time.Time `json:"last_used"`        // Last time this redirection was used
-	RequestCount   int       `json:"request_count"`    // Number of requests through this redirection
-	Active         bool      `json:"active"`           // Whether redirection is still active
-	TTL            time.Duration `json:"ttl"`          // Time-to-live for this redirection session
+	CustomURL    string        `json:"custom_url"`    // Original custom URL that triggered redirect
+	TunnelID     string        `json:"tunnel_id"`     // Target tunnel for this redirection
+	RedirectTime time.Time     `json:"redirect_time"` // When redirection was established
+	LastUsed     time.Time     `json:"last_used"`     // Last time this redirection was used
+	RequestCount int           `json:"request_count"` // Number of requests through this redirection
+	Active       bool          `json:"active"`        // Whether redirection is still active
+	TTL          time.Duration `json:"ttl"`           // Time-to-live for this redirection session
 }
 
 // RecentMapping represents a time-stamped tunnel mapping for immediate affinity

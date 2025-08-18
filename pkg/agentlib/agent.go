@@ -114,11 +114,13 @@ type TcpDisconnectFrame struct {
 type PingFrame struct {
 	Type      string    `json:"type"`      // "ping"
 	Timestamp time.Time `json:"timestamp"` // when ping was sent
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier
 }
 
 type PongFrame struct {
 	Type      string    `json:"type"`      // "pong"
 	Timestamp time.Time `json:"timestamp"` // original ping timestamp
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier (echoed from ping)
 }
 
 // TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
@@ -132,6 +134,7 @@ var (
 	ErrUnauthorized   = errors.New("unauthorized: credentials rejected by server")
 	ErrNetworkFailure = errors.New("network failure: unable to reach server")
 	ErrDNSFailure     = errors.New("dns failure: unable to resolve server hostname")
+	ErrTunnelMismatch = errors.New("tunnel mismatch: server expects different tunnel ID")
 )
 
 type Agent struct {
@@ -184,8 +187,12 @@ func (a *Agent) Run() {
 			continue
 		}
 
-		if errors.Is(err, ErrUnauthorized) {
-			fmt.Println("Credentials rejected, re-registering for a new tunnel...")
+		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrTunnelMismatch) {
+			if errors.Is(err, ErrUnauthorized) {
+				fmt.Println("Credentials rejected, re-registering for a new tunnel...")
+			} else {
+				fmt.Println("Tunnel ID mismatch detected (server may have restarted), re-registering for a new tunnel...")
+			}
 			reg, regErr := a.register()
 			if regErr != nil {
 				fmt.Println("Failed to re-register:", regErr)
@@ -369,6 +376,9 @@ func (a *Agent) runOnce() error {
 	// Channel to signal connection closure
 	done := make(chan struct{})
 
+	// Channel to communicate specific errors
+	errChan := make(chan error, 1)
+
 	// Helper function to write encrypted messages
 	writeEncrypted := func(v any) error {
 		writeMu.Lock()
@@ -415,10 +425,11 @@ func (a *Agent) runOnce() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Send ping
+				// Send ping with tunnel ID
 				pingFrame := PingFrame{
 					Type:      "ping",
 					Timestamp: time.Now(),
+					TunnelID:  a.ID,
 				}
 
 				if err := writeEncrypted(pingFrame); err != nil {
@@ -506,14 +517,50 @@ func (a *Agent) runOnce() error {
 				if err := json.Unmarshal(plaintext, &pingFrame); err != nil {
 					continue
 				}
+
+				// Check if server's expected tunnel ID matches ours
+				if pingFrame.TunnelID != a.ID {
+					log.Printf("ERROR: Received ping with mismatched tunnel ID (expected: %s, got: %s). Server expects different tunnel. Disconnecting to re-register...", a.ID, pingFrame.TunnelID)
+					// Send tunnel mismatch error
+					select {
+					case errChan <- ErrTunnelMismatch:
+					default:
+					}
+					// Close the connection to trigger re-registration
+					cancelCtx()
+					return
+				}
+
+				// Echo back the tunnel ID from the ping
 				pongFrame := PongFrame{
 					Type:      "pong",
 					Timestamp: pingFrame.Timestamp,
+					TunnelID:  pingFrame.TunnelID,
 				}
 				if err := writeEncrypted(pongFrame); err != nil {
 					log.Printf("Failed to send pong: %v", err)
 				}
 			case "pong":
+				// Handle pong response from server
+				var pongFrame PongFrame
+				if err := json.Unmarshal(plaintext, &pongFrame); err != nil {
+					log.Printf("Failed to parse pong: %v", err)
+					continue
+				}
+
+				// Validate tunnel ID matches
+				if pongFrame.TunnelID != a.ID {
+					log.Printf("ERROR: Received pong with mismatched tunnel ID (expected: %s, got: %s). Server may have restarted. Disconnecting to re-register...", a.ID, pongFrame.TunnelID)
+					// Send tunnel mismatch error
+					select {
+					case errChan <- ErrTunnelMismatch:
+					default:
+					}
+					// Close the connection to trigger re-registration
+					cancelCtx()
+					return
+				}
+
 				// Update last pong time for connection health monitoring
 				a.pingMu.Lock()
 				a.lastPong = time.Now()
@@ -530,6 +577,15 @@ func (a *Agent) runOnce() error {
 	// Cancel context to stop all handlers
 	cancelCtx()
 
+	// Check if there was a specific error
+	var returnErr error
+	select {
+	case err := <-errChan:
+		returnErr = err
+	default:
+		// No specific error
+	}
+
 	// Wait for all request handlers to finish with a timeout
 	waitDone := make(chan struct{})
 	go func() {
@@ -545,7 +601,7 @@ func (a *Agent) runOnce() error {
 		fmt.Println("Warning: some request handlers did not finish in time")
 	}
 
-	return nil
+	return returnErr
 }
 
 func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) {

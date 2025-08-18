@@ -409,6 +409,7 @@ func TestPingPongCycle(t *testing.T) {
 	ping := &PingFrame{
 		Type:      "ping",
 		Timestamp: time.Now(),
+		TunnelID:  tunnelID,
 	}
 
 	err = ac.writeEncrypted(pingCtx, ping)
@@ -441,10 +442,11 @@ func TestPingPongCycle(t *testing.T) {
 		t.Errorf("Expected ping type, got: %s", receivedPing.Type)
 	}
 
-	// Send pong response
+	// Send pong response with tunnel ID
 	pong := PongFrame{
 		Type:      "pong",
 		Timestamp: receivedPing.Timestamp,
+		TunnelID:  receivedPing.TunnelID,
 	}
 
 	pongJSON, err := json.Marshal(pong)

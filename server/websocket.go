@@ -82,7 +82,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		agentsMu.Unlock()
 		// Record WebSocket connection metric
 		tunnelMetrics.IncrementWSConnection(id)
-		
+
 		// CRITICAL FIX: Restore custom URL mapping for reconnection
 		if existingTunnel.CustomURL != "" {
 			customURLsMu.Lock()
@@ -340,7 +340,7 @@ func handleWebSocketRegistration(ctx context.Context, ac *agentConn) error {
 	agentsMu.Lock()
 	agents[id] = ac
 	agentsMu.Unlock()
-	
+
 	// Record WebSocket connection metric
 	tunnelMetrics.IncrementWSConnection(id)
 
@@ -434,7 +434,7 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		log.Printf("Received message before key exchange completed for agent %s", ac.id)
 		return
 	}
-	
+
 	// Record inbound WebSocket message metric
 	if ac.id != "" {
 		tunnelMetrics.RecordWSMessage(ac.id, "received")
@@ -623,10 +623,17 @@ func (ac *agentConn) handlePing(data []byte) {
 		return
 	}
 
-	// Respond with pong
+	// Validate tunnel ID matches
+	if ping.TunnelID != ac.id {
+		log.Printf("Warning: Received ping with mismatched tunnel ID from agent %s (expected: %s, got: %s)", ac.id, ac.id, ping.TunnelID)
+		// Still respond to maintain connection, but log the mismatch
+	}
+
+	// Respond with pong, echoing the tunnel ID
 	pong := &PongFrame{
 		Type:      "pong",
 		Timestamp: ping.Timestamp,
+		TunnelID:  ping.TunnelID, // Echo back the tunnel ID from ping
 	}
 
 	if err := ac.writeEncrypted(context.Background(), pong); err != nil {
@@ -640,6 +647,12 @@ func (ac *agentConn) handlePong(data []byte) {
 	if err := json.Unmarshal(data, &pong); err != nil {
 		log.Printf("Failed to parse pong from agent %s: %v", ac.id, err)
 		return
+	}
+
+	// Validate tunnel ID matches
+	if pong.TunnelID != ac.id {
+		log.Printf("Warning: Received pong with mismatched tunnel ID from agent %s (expected: %s, got: %s)", ac.id, ac.id, pong.TunnelID)
+		// Still update last pong time to maintain connection, but log the mismatch
 	}
 
 	ac.pingMu.Lock()
@@ -661,7 +674,7 @@ func (ac *agentConn) handleTunnelInfo(data []byte) {
 		tunnel.Protocol = tunnelInfo.Protocol
 		tunnel.Port = tunnelInfo.Port
 		log.Printf("Updated tunnel info for agent %s: protocol=%s, port=%d", ac.id, tunnelInfo.Protocol, tunnelInfo.Port)
-		
+
 		// CRITICAL FIX: Restore custom URL mapping when tunnel info is updated
 		if tunnel.CustomURL != "" {
 			tunnelsMu.Unlock() // Unlock tunnels before locking customURLs to avoid deadlock
@@ -705,10 +718,11 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 			return false // Signal to stop
 		}
 
-		// Send ping
+		// Send ping with tunnel ID
 		ping := &PingFrame{
 			Type:      "ping",
 			Timestamp: time.Now(),
+			TunnelID:  ac.id,
 		}
 
 		if err := ac.writeEncrypted(ctx, ping); err != nil {
@@ -766,7 +780,7 @@ func validateAndCleanupStaleConnections() {
 	// Check each connection for staleness indicators
 	for id, conn := range agents {
 		if isConnectionStale(conn) {
-			log.Printf("Connection validation: Marking agent %s as stale (connected %v ago, last pong %v ago)", 
+			log.Printf("Connection validation: Marking agent %s as stale (connected %v ago, last pong %v ago)",
 				id, time.Since(conn.connectedAt), time.Since(conn.lastPong))
 			staleConnections = append(staleConnections, conn)
 		} else {
@@ -774,7 +788,7 @@ func validateAndCleanupStaleConnections() {
 		}
 	}
 
-	log.Printf("Connection validation: Found %d valid connections, %d stale connections", 
+	log.Printf("Connection validation: Found %d valid connections, %d stale connections",
 		validConnections, len(staleConnections))
 
 	// Close stale connections asynchronously to avoid blocking server startup
@@ -790,25 +804,25 @@ func validateAndCleanupStaleConnections() {
 // isConnectionStale determines if a connection should be considered stale
 func isConnectionStale(conn *agentConn) bool {
 	now := time.Now()
-	
+
 	// Connection is stale if:
 	// 1. Last pong is older than 30 seconds (likely disconnected during restart)
 	// 2. Connection time is more than 5 minutes old but no recent pong activity
 	// 3. Connection was made before the current server process started (if we could detect that)
-	
+
 	timeSinceLastPong := now.Sub(conn.lastPong)
 	timeSinceConnect := now.Sub(conn.connectedAt)
-	
+
 	// If last pong is older than 30 seconds, likely stale
 	if timeSinceLastPong > 30*time.Second {
 		return true
 	}
-	
+
 	// If connected more than 5 minutes ago but no pong in last minute, likely stale
 	if timeSinceConnect > 5*time.Minute && timeSinceLastPong > 1*time.Minute {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -817,7 +831,7 @@ func closeStaleConnection(conn *agentConn, reason string) {
 	if conn == nil || conn.ws == nil {
 		return
 	}
-	
+
 	// Close the WebSocket connection
 	err := conn.ws.Close(websocket.StatusGoingAway, reason)
 	if err != nil {
@@ -834,12 +848,12 @@ func schedulePeriodicConnectionValidation() {
 		// Run validation every 5 minutes
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-		
+
 		for range ticker.C {
 			agentsMu.RLock()
 			connectionCount := len(agents)
 			agentsMu.RUnlock()
-			
+
 			if connectionCount > 0 {
 				log.Printf("Periodic connection validation: Checking %d connections", connectionCount)
 				validateAndCleanupStaleConnections()
