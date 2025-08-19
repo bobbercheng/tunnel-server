@@ -5,39 +5,15 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"tunnel.local/metrics"
 )
 
-// Global state and configuration
-var (
-	// Agent connections
-	agents   = make(map[string]*agentConn) // id -> connection
-	agentsMu sync.RWMutex
-
-	// Tunnel metadata (for stateless Cloud Run)
-	tunnels   = make(map[string]*TunnelInfo) // id -> tunnel info
-	tunnelsMu sync.RWMutex
-
-	// Custom URL mappings (case-sensitive)
-	customURLs   = make(map[string]string) // custom_url -> tunnel_id
-	customURLsMu sync.RWMutex
-
-	// Client tracking for smart routing
-	clientTracker = NewClientTracker()
-
-	// Custom URL affinity manager
-	affinityManager *AffinityManager
-
-	// Metrics for usage tracking
-	tunnelMetrics = metrics.NewTunnelMetrics()
-)
 
 func main() {
-	// Initialize affinity manager
+	// Initialize global components
+	clientTracker = NewClientTracker()
 	affinityManager = NewAffinityManager()
 	log.Println("Initialized custom URL affinity manager")
 

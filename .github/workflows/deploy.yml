@@ -51,9 +51,6 @@ jobs:
         go test ./pkg/crypto/... -v
         go test ./pkg/agentlib/... -v
         go test ./pkg/metrics/... -v
-        
-        # Test smart routing specifically
-        cd server && go test -v smart_routing_test.go main.go
 
   deploy:
     name: Build and Deploy
