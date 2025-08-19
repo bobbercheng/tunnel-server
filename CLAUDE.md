@@ -19,6 +19,7 @@ The system uses encrypted WebSocket communication with ChaCha20-Poly1305 for sec
 - **reverse-proxy-agent/**: Alternative client that acts as HTTP/TCP proxy for local connections
 - **pkg/agentlib/**: Shared agent logic library
 - **pkg/crypto/**: Encryption/decryption utilities with ChaCha20-Poly1305
+- **pkg/metrics/**: Metrics collection and reporting utilities
 
 ### Key Components
 - **WebSocket Protocol**: JSON messages over encrypted WebSocket (server→agent: ReqFrame, agent→server: RespFrame)
@@ -74,32 +75,70 @@ go work sync && go test ./...
 cd server && go test -v smart_routing_test.go main.go
 ```
 
-### Docker
+### Docker & Deployment
 ```bash
 # Build server image
 cd server && docker build -f Dockerfile -t gcp-proxy-server ..
 
 # Deploy to GCP using deploy script (recommended)
 cd server && ./deploy.sh
+
+# Other useful scripts
+cd server && ./logs.sh          # View Cloud Run logs
+cd server && ./quick-logs.sh    # View recent logs
+cd server && ./restart.sh       # Restart Cloud Run service
+cd server && make build         # Build using Makefile
 ```
+
+## GitHub Actions
+
+### Setup
+The repository includes automated GitHub Actions workflow for deployment to GCP Cloud Run.
+
+#### Prerequisites
+1. **GCP Service Account**: Run the setup script to create a service account with minimal permissions:
+   ```bash
+   ./setup-gcp-service-account.sh
+   ```
+
+2. **GitHub Secrets**: Configure the following repository secret in GitHub (Settings > Secrets and variables > Actions):
+   - `GCP_SERVICE_ACCOUNT_KEY`: Base64-encoded service account key
+
+### Workflow Jobs
+1. **Test**: Run all Go module tests with caching
+2. **Deploy**: Build using Cloud Build and deploy to Cloud Run (main branch pushes only)
+3. **Deploy Staging**: Create per-PR staging environments (pull requests)
+4. **Cleanup Staging**: Remove staging environments when PRs are closed
+
+### Branch Strategy
+- **Main branch**: Automatic deployment to production
+- **Pull requests**: Deploy to isolated staging environment per PR
+- **All branches**: Run full test suite
+
+### Deployment Features
+- Zero-downtime deployments via Cloud Run
+- Automatic health verification (`/__health__` endpoint)
+- Prometheus metrics endpoint verification
+- Go module caching for faster builds
+- Per-PR staging environments with automatic cleanup
+- PR comments with staging URLs
 
 ## Message Flow
 
 ### HTTP Tunneling
-1. **Registration**: Agent POST `/register` → receives `{id, secret, public_url}`
-2. **WebSocket**: Agent connects to `/ws?id=...&secret=...`
-3. **Key Exchange**: Server sends handshake with salt, agent ACKs
-4. **Request Flow**: Public request to `/pub/{id}/...` → encrypted ReqFrame → agent forwards to local service → RespFrame back
+1. **Registration**: Agent connects to `/__ws__` and registers over encrypted WebSocket → receives `{id, secret, public_url}`
+2. **Key Exchange**: Server sends handshake with salt, agent ACKs
+3. **Request Flow**: Public request to `/__pub__/{id}/...` → encrypted ReqFrame → agent forwards to local service → RespFrame back
 
 ### TCP Tunneling
-1. **Registration**: Agent POST `/register` with `{"protocol":"tcp","port":3306}` → receives `{id, secret, public_url}`
-2. **WebSocket**: Agent connects to `/tcp/{id}` 
+1. **Registration**: Agent connects to `/__ws__` and registers with `{"protocol":"tcp","port":3306}` → receives `{id, secret, public_url}`
+2. **WebSocket**: Agent maintains connection at `/__ws__`
 3. **TCP Proxy**: Raw TCP connections forwarded through WebSocket tunnel
 
 ### Smart Routing (SPA Asset Handling)
 1. **Asset Request**: Browser requests `/assets/file.js` (missing tunnel prefix)
 2. **Client Fingerprinting**: Multi-header analysis to identify originating tunnel
-3. **Smart Routing**: Automatic redirect to `/pub/{detected-id}/assets/file.js`
+3. **Smart Routing**: Automatic redirect to `/__pub__/{detected-id}/assets/file.js`
 4. **Learning**: System learns and caches successful mappings for future requests
 
 ## Custom URLs
@@ -178,6 +217,7 @@ curl https://server/__pub__/abc123-def456/users
 - Health endpoint `/__health__` provides connection status and custom URL metrics
 - Custom URLs are case-sensitive and must be unique across the server
 - System endpoints use uncommon names (`__health__`, `__pub__`, etc.) to free up namespace
+- For server issue, please check GCP cloud run log for trouble shooting
 
 ## Client Updates Required
 
