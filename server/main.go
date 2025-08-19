@@ -29,11 +29,18 @@ var (
 	// Client tracking for smart routing
 	clientTracker = NewClientTracker()
 
+	// Custom URL affinity manager
+	affinityManager *AffinityManager
+
 	// Metrics for usage tracking
 	tunnelMetrics = metrics.NewTunnelMetrics()
 )
 
 func main() {
+	// Initialize affinity manager
+	affinityManager = NewAffinityManager()
+	log.Println("Initialized custom URL affinity manager")
+	
 	// Validate and cleanup any stale connections from previous server instance
 	log.Println("Performing connection validation on startup...")
 	validateAndCleanupStaleConnections()
@@ -58,6 +65,17 @@ func main() {
 
 		for range ticker.C {
 			clientTracker.CleanupExpiredRecentMappings()
+		}
+	}()
+
+	// Start affinity cleanup routine (less frequent for long-term affinities)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour) // Clean every hour
+		defer ticker.Stop()
+
+		for range ticker.C {
+			affinityManager.CleanupInactiveAffinities(24 * time.Hour) // Remove affinities unused for 24+ hours
+			affinityManager.CleanupDisconnectedTunnels()             // Remove affinities for disconnected tunnels
 		}
 	}()
 

@@ -104,6 +104,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// Clean up custom URL mappings for this tunnel
 			cleanupCustomURLsForTunnel(ac.id)
 
+			// Clean up affinities for this tunnel
+			affinityManager.ClearTunnelAffinities(ac.id)
+
 			// Close all TCP connections
 			ac.tcpConnsMu.Lock()
 			for _, tcpConn := range ac.tcpConns {

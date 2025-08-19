@@ -412,6 +412,34 @@ func getCustomURLTunnel(customURL string) string {
 	return tunnelID
 }
 
+// getTunnelCustomURL returns the custom URL for a given tunnel ID
+func getTunnelCustomURL(tunnelID string) string {
+	if tunnelID == "" {
+		return ""
+	}
+
+	// First check tunnel info for custom URL
+	tunnelsMu.RLock()
+	tunnel := tunnels[tunnelID]
+	tunnelsMu.RUnlock()
+
+	if tunnel != nil && tunnel.CustomURL != "" {
+		return tunnel.CustomURL
+	}
+
+	// Fallback: search through custom URL mappings
+	customURLsMu.RLock()
+	defer customURLsMu.RUnlock()
+	
+	for customURL, mappedTunnelID := range customURLs {
+		if mappedTunnelID == tunnelID {
+			return customURL
+		}
+	}
+
+	return ""
+}
+
 // smartFallbackHandler handles requests that don't match existing routes
 func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Skip if this is already a system endpoint (avoid infinite loops)
@@ -443,6 +471,37 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Declare tunnelIDs variable for reuse throughout function
 	var tunnelIDs []string
 
+	// PRIORITY: Check for custom URL affinity - route clients to their established tunnel
+	if affinity := affinityManager.GetValidatedAffinity(clientKey); affinity != nil {
+		log.Printf("[AFFINITY] Using custom URL affinity | ClientKey: %s | TunnelID: %s | CustomURL: %s | Source: %s | AccessCount: %d", 
+				   clientKey, affinity.TunnelID, affinity.CustomURL, affinity.Source, affinity.AccessCount)
+		
+		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, affinity.TunnelID, isAsset) {
+			affinityManager.UpdateAccess(clientKey) // Update last access time and count
+			log.Printf("[AFFINITY] Affinity routing successful | URL: %s | TunnelID: %s | CustomURL: %s", r.URL.Path, affinity.TunnelID, affinity.CustomURL)
+			return
+		} else {
+			// Tunnel failed - check if tunnel still exists before clearing affinity
+			tunnelIDs = getActiveTunnelIDs()
+			tunnelExists := false
+			for _, id := range tunnelIDs {
+				if id == affinity.TunnelID {
+					tunnelExists = true
+					break
+				}
+			}
+			
+			if !tunnelExists {
+				// Tunnel disconnected - clear affinity
+				affinityManager.ClearAffinity(clientKey)
+				log.Printf("[AFFINITY] Tunnel disconnected, cleared affinity | ClientKey: %s | TunnelID: %s", clientKey, affinity.TunnelID)
+			} else {
+				// Tunnel exists but failed - keep affinity for retry, but continue to fallbacks
+				log.Printf("[AFFINITY] Tunnel failed temporarily, keeping affinity | ClientKey: %s | TunnelID: %s", clientKey, affinity.TunnelID)
+			}
+		}
+	}
+
 	// PRIORITY: Custom URL redirect detection - handle requests that come from custom URL redirects
 	if detectedCustomURL := detectCustomURLFromRedirect(r, clientKey); detectedCustomURL != "" {
 		if tunnelID := getCustomURLTunnel(detectedCustomURL); tunnelID != "" {
@@ -471,21 +530,16 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// CONSULTANT FIX: Conditional fallback logic based on tunnel count
+		// If we reach here, there was an actual connection failure (timeout, agent disconnected)
+		// Deactivate the redirect session and continue to fallback routing
+		log.Printf("[SMART ROUTING] Redirect session connection failed | ClientKey: %s | TunnelID: %s | Deactivating session", clientKey, redirectSession.TunnelID)
+		redirectSession.Active = false
+
+		// Check tunnel count for conditional fallback logic
 		tunnelIDs = getActiveTunnelIDs()
-		log.Printf("[SMART ROUTING] Redirect session failed | ClientKey: %s | TunnelID: %s | ActiveTunnels: %d | TunnelIDs: %v", clientKey, redirectSession.TunnelID, len(tunnelIDs), tunnelIDs)
+		log.Printf("[SMART ROUTING] Redirect tunnel failed, checking fallback options | ActiveTunnels: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
 
-		// Check if the tunnel is still connected
-		ac := getAgent(redirectSession.TunnelID)
-		if ac == nil {
-			// Tunnel is completely disconnected - deactivate session
-			log.Printf("[SMART ROUTING] Redirect session tunnel disconnected | ClientKey: %s | URL: %s | TunnelID: %s | Deactivating session", clientKey, r.URL.Path, redirectSession.TunnelID)
-			redirectSession.Active = false
-		} else {
-			log.Printf("[SMART ROUTING] Redirect session tunnel still connected | ClientKey: %s | TunnelID: %s | Keeping session active", clientKey, redirectSession.TunnelID)
-		}
-
-		// CRITICAL: Conditional fallback logic to prevent misrouting
+		// CONSULTANT FIX: Prevent misrouting when multiple tunnels are active
 		if len(tunnelIDs) > 1 {
 			// Multiple tunnels active - STOP processing to prevent misrouting to wrong tunnel
 			log.Printf("[SMART ROUTING] STOPPING - Multiple tunnels active, preventing redirect session fallback | ActiveTunnels: %d | ClientKey: %s | SessionTunnel: %s", len(tunnelIDs), clientKey, redirectSession.TunnelID)
@@ -497,50 +551,9 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[SMART ROUTING] CONTINUING - Single tunnel, allowing redirect session fallback | ActiveTunnels: %d | ClientKey: %s", len(tunnelIDs), clientKey)
 	}
 
-	// PRIORITY: Single tunnel optimization for ALL requests when only one tunnel exists
+	// Initialize tunnelIDs for later routing strategies
 	tunnelIDs = getActiveTunnelIDs()
-	log.Printf("[SMART ROUTING] Active tunnels check | Count: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
-
-	// If only one tunnel exists, route ALL requests to it (much simpler and more reliable)
-	if len(tunnelIDs) == 1 {
-		tunnelID := tunnelIDs[0]
-		requestType := "regular"
-		if isAPI {
-			requestType = "api"
-		} else if isAsset {
-			requestType = "asset"
-		}
-
-		log.Printf("[SMART ROUTING] SINGLE TUNNEL optimization | Type: %s | URL: %s | TunnelID: %s | ClientKey: %s", requestType, r.URL.Path, tunnelID, clientKey)
-
-		// Add extra logging for API requests to help debug 404 issues
-		if isAPI {
-			log.Printf("[SMART ROUTING] API REQUEST DETAILS | Method: %s | Path: %s | User-Agent: %s", r.Method, r.URL.Path, r.Header.Get("User-Agent"))
-		}
-
-		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
-			// Learn this mapping for future requests
-			clientTracker.LearnMapping(clientKey, tunnelID)
-			clientTracker.RecordSuccess(clientKey, tunnelID)
-			log.Printf("[SMART ROUTING] Single tunnel routing successful | URL: %s | TunnelID: %s | ClientKey: %s", r.URL.Path, tunnelID, clientKey)
-
-			// Record client asset mappings
-			if isAsset {
-				recordClientAssetMapping(clientKey, tunnelID)
-			} else if !isAPI {
-				// Record asset mapping for regular pages
-				recordClientAssetMapping(clientKey, tunnelID)
-			}
-
-			log.Printf("Smart routing: %s -> tunnel %s (single-tunnel-%s-SUCCESS)", r.URL.Path, tunnelID, requestType)
-			return
-		} else {
-			log.Printf("Smart routing: SINGLE TUNNEL routing failed for %s %s -> %s", requestType, r.URL.Path, tunnelID)
-			// Don't return here - try other strategies below
-		}
-	} else {
-		log.Printf("Smart routing: multiple tunnels detected (%d), using advanced routing", len(tunnelIDs))
-	}
+	log.Printf("[SMART ROUTING] Active tunnels available | Count: %d | TunnelIDs: %v", len(tunnelIDs), tunnelIDs)
 
 	// Asset cache removed - proceed directly to client asset mapping and other strategies
 
@@ -556,23 +569,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// If we reached here and only have one tunnel, something went wrong above
-		// Let's try one more time with explicit handling
-		tunnelIDs = getActiveTunnelIDs()
-		if len(tunnelIDs) == 1 {
-			tunnelID := tunnelIDs[0]
-			log.Printf("Smart routing: RETRY - asset %s with single tunnel %s", r.URL.Path, tunnelID)
-			if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
-				// Record asset mapping for this client
-				recordClientAssetMapping(clientKey, tunnelID)
-				clientTracker.RecordSuccess(clientKey, tunnelID)
-
-				log.Printf("Smart routing: %s -> tunnel %s (asset-retry-SUCCESS)", r.URL.Path, tunnelID)
-				return
-			} else {
-				log.Printf("Smart routing: RETRY failed for asset %s -> %s", r.URL.Path, tunnelID)
-			}
-		}
+		// Asset retry logic has been removed - let parallel attempts handle asset routing consistently
 	}
 
 	// Strategy 1: Enhanced Client Tracking (EXISTING) - but skip if we have redirect sessions for this client
@@ -601,6 +598,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 			if confidence > minConfidence && tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
 				clientTracker.RecordSuccess(clientKey, tunnelID)
+				
+				// CRITICAL: Set smart routing affinity for successful requests
+				customURL := getTunnelCustomURL(tunnelID)
+				affinityManager.SetAffinity(clientKey, tunnelID, customURL, "client_tracker_route")
 
 				// Record geographical routing success (NEW)
 				clientIP := extractRealClientIP(r)
@@ -665,6 +666,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, tunnelID)
 			recordIPTunnelMapping(clientIP, tunnelID)
+			
+			// CRITICAL: Set smart routing affinity for successful requests
+			customURL := getTunnelCustomURL(tunnelID)
+			affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ip_mapping_route")
 
 			// Record asset mapping for non-asset requests (main pages)
 			if !isAsset {
@@ -797,6 +802,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 		if tryTunnelRouteWithBufferedBody(w, finalReq, bodyBytes, successfulTunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, successfulTunnelID)
+			
+			// CRITICAL: Set smart routing affinity for successful requests
+			customURL := getTunnelCustomURL(successfulTunnelID)
+			affinityManager.SetAffinity(clientKey, successfulTunnelID, customURL, "parallel_route")
 
 			// Record geographical mapping (NEW)
 			recordIPTunnelMapping(clientIP, successfulTunnelID)
@@ -811,10 +820,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ULTIMATE FALLBACK: Single tunnel catch-all for any missed requests
-	if len(tunnelIDs) == 1 {
+	// ULTIMATE FALLBACK: Try each tunnel with extended timeout for any missed requests
+	if len(tunnelIDs) > 0 {
 		tunnelID := tunnelIDs[0]
-		log.Printf("Smart routing: ULTIMATE FALLBACK - trying single tunnel %s for %s", tunnelID, r.URL.Path)
+		log.Printf("Smart routing: ULTIMATE FALLBACK - trying tunnel %s for %s", tunnelID, r.URL.Path)
 
 		// Create final request with original body
 		finalReq := r.Clone(r.Context())
@@ -850,6 +859,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 				select {
 				case resp := <-respCh:
 					clientTracker.RecordSuccess(clientKey, tunnelID)
+					
+					// CRITICAL: Set smart routing affinity for successful requests
+					customURL := getTunnelCustomURL(tunnelID)
+					affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ultimate_fallback_route")
 
 					// Record geographical mapping (NEW)
 					recordIPTunnelMapping(clientIP, tunnelID)

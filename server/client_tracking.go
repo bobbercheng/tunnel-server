@@ -752,10 +752,33 @@ func tryTunnelRoute(w http.ResponseWriter, r *http.Request, tunnelID string) boo
 // tryTunnelRouteWithBufferedBody attempts to route the request through a specific tunnel using pre-buffered body
 func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, bodyBytes []byte, tunnelID string, isAsset bool) bool {
 	startTime := time.Now()
-	ac := getAgent(tunnelID)
+	
+	// RACE CONDITION FIX: Retry getting agent during tunnel reconnection window
+	var ac *agentConn
+	maxRetries := 3
+	retryDelay := 50 * time.Millisecond
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		ac = getAgent(tunnelID)
+		if ac != nil {
+			if attempt > 0 {
+				log.Printf("[TUNNEL ROUTING] Agent reconnection successful after %d retries | TunnelID: %s | Path: %s", 
+					attempt, tunnelID, r.URL.Path)
+			}
+			break
+		}
+		
+		if attempt < maxRetries-1 {
+			log.Printf("[TUNNEL ROUTING] Agent not found, retrying in %v | TunnelID: %s | Path: %s | Attempt: %d/%d", 
+				retryDelay, tunnelID, r.URL.Path, attempt+1, maxRetries)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+		}
+	}
+	
 	if ac == nil {
-		log.Printf("[TUNNEL ROUTING] FAILED - no agent found | TunnelID: %s | Path: %s | Method: %s | Asset: %v",
-			tunnelID, r.URL.Path, r.Method, isAsset)
+		log.Printf("[TUNNEL ROUTING] FAILED - no agent found after %d retries | TunnelID: %s | Path: %s | Method: %s | Asset: %v",
+			maxRetries, tunnelID, r.URL.Path, r.Method, isAsset)
 		return false
 	}
 

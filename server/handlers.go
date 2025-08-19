@@ -167,6 +167,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		GeographicalRouting map[string]interface{} `json:"geographical_routing"`
 		CustomURLs          map[string]interface{} `json:"custom_urls"`
 		RedirectionSessions map[string]interface{} `json:"redirection_sessions"`
+		CustomURLAffinity   map[string]interface{} `json:"custom_url_affinity"`
 	}{
 		ActiveConnections:   make([]agentInfo, 0, len(agents)),
 		ConnectionCount:     len(agents),
@@ -174,6 +175,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		GeographicalRouting: getGeoRoutingStats(),
 		CustomURLs:          getCustomURLStats(),
 		RedirectionSessions: getRedirectionStats(),
+		CustomURLAffinity:   affinityManager.GetAffinityStats(),
 	}
 
 	for id, conn := range agents {
@@ -374,6 +376,9 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 			clientKey := generateClientKey(r)
 			log.Printf("[REDIRECT ALWAYS] UseRedirect: %t | ForwardPath: %s | ClientKey: %s | RequestURL: %s", useRedirect, forwardPath, clientKey, r.URL.Path)
 
+			// NEW: Set custom URL affinity for persistent routing (even when redirecting)
+			affinityManager.SetAffinity(clientKey, tunnelID, path, "custom_url_redirect")
+
 			// Create or update redirection session for analytics tracking
 			redirectSession := getRedirectSession(clientKey, path)
 			if redirectSession == nil || !redirectSession.Active {
@@ -406,8 +411,13 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 			// Record successful custom URL usage
 			tunnelMetrics.RecordCustomURLRequest(path, "200")
 			
-			// Create immediate tunnel binding for 2-second affinity window
+			// Generate client key for affinity tracking
 			clientKey := generateClientKey(r)
+			
+			// NEW: Set custom URL affinity for persistent routing
+			affinityManager.SetAffinity(clientKey, tunnelID, path, "custom_url_visit")
+			
+			// Create immediate tunnel binding for 2-second affinity window (legacy)
 			clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url")
 			
 			log.Printf("[TUNNEL SUCCESS] Custom URL routing successful | CustomURL: %s | TunnelID: %s | ForwardPath: %s", path, tunnelID, forwardPath)
@@ -442,8 +452,13 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 					// Record successful custom URL prefix usage
 					tunnelMetrics.RecordCustomURLRequest(parentPath, "200")
 					
-					// Create immediate tunnel binding for 2-second affinity window
+					// Generate client key for affinity tracking
 					clientKey := generateClientKey(r)
+					
+					// NEW: Set custom URL affinity for persistent routing
+					affinityManager.SetAffinity(clientKey, tunnelID, parentPath, "custom_url_prefix")
+					
+					// Create immediate tunnel binding for 2-second affinity window (legacy)
 					clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url_prefix")
 					
 					return
