@@ -369,6 +369,10 @@ func (a *Agent) runOnce() error {
 		log.Printf("Reconnecting with existing tunnel (ID: %s, Secret: %s)", a.ID, maskSecret(a.Secret))
 	}
 
+	// Log agent configuration for debugging
+	log.Printf("AGENT CONFIG: LocalURL: %s | Protocol: %s | CustomURL: %s | UseRedirect: %v | Port: %d",
+		a.LocalURL, a.Protocol, a.CustomURL, a.UseRedirect, a.Port)
+
 	// Create a context that will be cancelled when the connection closes
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	defer cancelCtx()
@@ -533,8 +537,11 @@ func (a *Agent) runOnce() error {
 			case "req":
 				var req ReqFrame
 				if err := json.Unmarshal(plaintext, &req); err != nil {
+					log.Printf("AGENT: Failed to parse HTTP request: %v", err)
 					continue
 				}
+				log.Printf("AGENT: Received HTTP request | Method: %s | Path: %s | ReqID: %s | TunnelID: %s",
+					req.Method, req.Path, req.ReqID, a.ID)
 				a.handleHttpRequest(ctx, &req, writeEncrypted, &wg)
 			case "chunked_resp":
 				var chunk ChunkedRespFrame
@@ -673,8 +680,14 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 	if rd.Query != "" {
 		target += "?" + rd.Query
 	}
+
+	log.Printf("FORWARD: Attempting to forward request | Method: %s | Target: %s | ReqID: %s | LocalURL: %s",
+		rd.Method, target, rd.ReqID, a.LocalURL)
+
 	req, err := http.NewRequest(rd.Method, target, bytes.NewReader(rd.Body))
 	if err != nil {
+		log.Printf("FORWARD ERROR: Failed to create HTTP request | Target: %s | ReqID: %s | Error: %v",
+			target, rd.ReqID, err)
 		return 0, nil, nil, err
 	}
 	for k, vs := range rd.Headers {
@@ -686,9 +699,14 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("FORWARD ERROR: HTTP request failed | Target: %s | ReqID: %s | Error: %v",
+			target, rd.ReqID, err)
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
+
+	log.Printf("FORWARD SUCCESS: Received response | Target: %s | ReqID: %s | Status: %d | ContentType: %s",
+		target, rd.ReqID, resp.StatusCode, resp.Header.Get("Content-Type"))
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(contentType, "text/event-stream") ||
@@ -701,6 +719,8 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 	limitedReader := io.LimitReader(resp.Body, 8*1024*1024) // 8MB limit
 	b, err := io.ReadAll(limitedReader)
 	if err != nil {
+		log.Printf("FORWARD ERROR: Failed to read response body | Target: %s | ReqID: %s | Error: %v",
+			target, rd.ReqID, err)
 		return resp.StatusCode, resp.Header, nil, err
 	}
 
@@ -709,10 +729,13 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 		// Try to read one more byte to see if there's more data
 		extra := make([]byte, 1)
 		if n, _ := resp.Body.Read(extra); n > 0 {
+			log.Printf("FORWARD ERROR: Response too large | Target: %s | ReqID: %s", target, rd.ReqID)
 			return resp.StatusCode, resp.Header, nil, fmt.Errorf("response body too large (>8MB)")
 		}
 	}
 
+	log.Printf("FORWARD COMPLETE: Request forwarded successfully | Target: %s | ReqID: %s | Status: %d | BodySize: %d",
+		target, rd.ReqID, resp.StatusCode, len(b))
 	return resp.StatusCode, resp.Header, b, nil
 }
 
@@ -972,9 +995,14 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 			Body:    body,
 		}
 		if ferr != nil {
+			log.Printf("AGENT: Request forwarding failed, returning 502 Bad Gateway | ReqID: %s | TunnelID: %s | Error: %v",
+				req.ReqID, a.ID, ferr)
 			resp.Status = http.StatusBadGateway
 			resp.Headers = map[string][]string{"Content-Type": {"text/plain"}}
 			resp.Body = []byte(ferr.Error())
+		} else {
+			log.Printf("AGENT: Request completed successfully | ReqID: %s | TunnelID: %s | Status: %d | BodySize: %d",
+				req.ReqID, a.ID, status, len(body))
 		}
 
 		// Check if connection is still alive before writing
