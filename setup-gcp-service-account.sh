@@ -34,6 +34,8 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role="roles/cloudbuild.builds.editor" \
     --quiet
 
+
+
 # Cloud Run Admin - needed to deploy and update services  
 echo "  - Cloud Run Admin"
 gcloud projects add-iam-policy-binding $PROJECT_ID \
@@ -41,14 +43,21 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role="roles/run.admin" \
     --quiet
 
-# Storage Object Admin - needed for build artifacts and container images
-echo "  - Storage Object Admin"
+# Storage Admin - needed for build artifacts, container images, and Cloud Build buckets
+echo "  - Storage Admin"
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-    --role="roles/storage.objectAdmin" \
+    --role="roles/storage.admin" \
     --quiet
 
-# Container Registry access - storage.objectAdmin should be sufficient for gcr.io
+# Container Registry access - storage.admin provides full access to gcr.io and Cloud Build buckets
+
+# Service Usage Consumer - needed for Cloud Build and other service usage
+echo "  - Service Usage Consumer"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+    --role="roles/serviceusage.serviceUsageConsumer" \
+    --quiet
 
 # Service Account User - needed to deploy Cloud Run services with service accounts
 echo "  - Service Account User"

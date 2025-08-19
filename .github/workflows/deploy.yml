@@ -87,9 +87,26 @@ jobs:
         # Copy Dockerfile to root for Cloud Build context (mirrors deploy.sh)
         cp server/Dockerfile ./Dockerfile
         
-        # Build using Cloud Build
+        # Build using Cloud Build with async flag to avoid log streaming issues
         echo "Building Docker image using Cloud Build..."
-        gcloud builds submit --tag $IMAGE_NAME .
+        BUILD_ID=$(gcloud builds submit --tag $IMAGE_NAME . --async --format="value(id)")
+        
+        # Wait for build to complete with polling
+        echo "Waiting for build $BUILD_ID to complete..."
+        while true; do
+          BUILD_STATUS=$(gcloud builds describe $BUILD_ID --format="value(status)")
+          if [ "$BUILD_STATUS" = "SUCCESS" ]; then
+            echo "✅ Build completed successfully"
+            break
+          elif [ "$BUILD_STATUS" = "FAILURE" ] || [ "$BUILD_STATUS" = "CANCELLED" ] || [ "$BUILD_STATUS" = "TIMEOUT" ]; then
+            echo "❌ Build failed with status: $BUILD_STATUS"
+            echo "📋 Build logs: https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$GCP_PROJECT_ID"
+            exit 1
+          else
+            echo "⏳ Build status: $BUILD_STATUS (waiting...)"
+            sleep 10
+          fi
+        done
         
         # Clean up
         rm ./Dockerfile
@@ -181,8 +198,25 @@ jobs:
         # Copy Dockerfile to root for Cloud Build context
         cp server/Dockerfile ./Dockerfile
         
-        # Build using Cloud Build
-        gcloud builds submit --tag $STAGING_IMAGE .
+        # Build using Cloud Build with async flag to avoid log streaming issues
+        BUILD_ID=$(gcloud builds submit --tag $STAGING_IMAGE . --async --format="value(id)")
+        
+        # Wait for build to complete with polling
+        echo "Waiting for build $BUILD_ID to complete..."
+        while true; do
+          BUILD_STATUS=$(gcloud builds describe $BUILD_ID --format="value(status)")
+          if [ "$BUILD_STATUS" = "SUCCESS" ]; then
+            echo "✅ Build completed successfully"
+            break
+          elif [ "$BUILD_STATUS" = "FAILURE" ] || [ "$BUILD_STATUS" = "CANCELLED" ] || [ "$BUILD_STATUS" = "TIMEOUT" ]; then
+            echo "❌ Build failed with status: $BUILD_STATUS"
+            echo "📋 Build logs: https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$GCP_PROJECT_ID"
+            exit 1
+          else
+            echo "⏳ Build status: $BUILD_STATUS (waiting...)"
+            sleep 10
+          fi
+        done
         
         # Clean up
         rm ./Dockerfile
