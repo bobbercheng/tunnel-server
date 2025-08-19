@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,125 +19,6 @@ func getCountryFromIP(clientIP string) string {
 		return geoData.Country
 	}
 	return ""
-}
-
-// registerHandler handles agent registration requests
-func registerHandler(w http.ResponseWriter, r *http.Request) {
-	// Parse request body for protocol and port info
-	var req RegisterReq
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			// Default to HTTP if no body or invalid JSON (backward compatibility)
-			req.Protocol = "http"
-			req.Port = 0
-		}
-	}
-
-	// Validate and set defaults
-	if req.Protocol == "" {
-		req.Protocol = "http"
-	}
-	if req.Protocol != "http" && req.Protocol != "tcp" {
-		http.Error(w, "protocol must be 'http' or 'tcp'", http.StatusBadRequest)
-		return
-	}
-	if req.Protocol == "tcp" && req.Port <= 0 {
-		http.Error(w, "port is required for TCP tunnels", http.StatusBadRequest)
-		return
-	}
-
-	// Validate custom URL if provided
-	if err := validateCustomURL(req.CustomURL); err != nil {
-		http.Error(w, fmt.Sprintf("invalid custom URL: %s", err.Error()), http.StatusBadRequest)
-		return
-	}
-
-	// Check if custom URL is available (will do atomic check during registration)
-	if req.CustomURL != "" {
-		// Do atomic availability check and registration later
-	}
-
-	id := uuid.NewString()
-	secret := randHex(32)
-
-	// Normalize custom URL (remove leading/trailing slashes)
-	var normalizedCustomURL string
-	if req.CustomURL != "" {
-		normalizedCustomURL = strings.Trim(req.CustomURL, "/")
-	}
-
-	tunnelInfo := &TunnelInfo{
-		Secret:      secret,
-		Protocol:    req.Protocol,
-		Port:        req.Port,
-		Created:     time.Now(),
-		CustomURL:   normalizedCustomURL,
-		UseRedirect: req.UseRedirect,
-	}
-
-	// Register in memory (Cloud Run stateless)
-	tunnelsMu.Lock()
-	tunnels[id] = tunnelInfo
-	tunnelsMu.Unlock()
-
-	// Register custom URL mapping if provided (atomic check and registration)
-	if normalizedCustomURL != "" {
-		customURLsMu.Lock()
-		// Atomic check: verify custom URL is still available
-		if existingTunnelID, exists := customURLs[normalizedCustomURL]; exists {
-			customURLsMu.Unlock()
-			// Clean up the tunnel that was already registered
-			tunnelsMu.Lock()
-			delete(tunnels, id)
-			tunnelsMu.Unlock()
-			log.Printf("[REGISTRATION CONFLICT] Custom URL: %s already taken by tunnel: %s | Rejected tunnel: %s | Client IP: %s", normalizedCustomURL, existingTunnelID, id, r.RemoteAddr)
-			http.Error(w, "custom URL is already taken", http.StatusConflict)
-			return
-		}
-		customURLs[normalizedCustomURL] = id
-		customURLsMu.Unlock()
-		log.Printf("[REGISTRATION] Tunnel ID: %s | Custom URL: %s | Method: HTTP | Client IP: %s", id, normalizedCustomURL, r.RemoteAddr)
-	} else {
-		log.Printf("Registered tunnel %s (stateless)", id)
-	}
-
-	publicBase := os.Getenv("PUBLIC_BASE_URL")
-	if publicBase == "" {
-		scheme := "https"
-		host := r.Host
-		if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
-			scheme = "http"
-		}
-		publicBase = fmt.Sprintf("%s://%s", scheme, host)
-	}
-
-	var publicURL string
-	var tcpPort int
-	if req.Protocol == "tcp" {
-		// For TCP tunnels, we'll create a different endpoint structure
-		publicURL = fmt.Sprintf("%s/__tcp__/%s", publicBase, id)
-		tcpPort = req.Port
-	} else {
-		// HTTP tunnels use the existing /__pub__/ endpoint
-		publicURL = fmt.Sprintf("%s/__pub__/%s", publicBase, id)
-	}
-
-	// Build custom URL if provided
-	var customURLResponse string
-	if normalizedCustomURL != "" {
-		customURLResponse = fmt.Sprintf("%s/%s", publicBase, normalizedCustomURL)
-	}
-
-	resp := RegisterResp{
-		ID:          id,
-		Secret:      secret,
-		PublicURL:   publicURL,
-		CustomURL:   customURLResponse,
-		Protocol:    req.Protocol,
-		TcpPort:     tcpPort,
-		UseRedirect: req.UseRedirect,
-	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // healthHandler provides server health and connection status
@@ -218,7 +96,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // publicHandler handles public HTTP requests through tunnels
 func publicHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	
+
 	// /__pub__/{id}/<rest>
 	path := strings.TrimPrefix(r.URL.Path, "/__pub__/")
 	parts := strings.SplitN(path, "/", 2)
@@ -282,19 +160,19 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		if statusCode == 0 {
 			statusCode = http.StatusOK
 		}
-		
+
 		tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, responseSize)
-		
+
 		// Record geographic request if we have geolocation data
 		clientIP := extractRealClientIP(r)
 		if country := getCountryFromIP(clientIP); country != "" {
 			tunnelMetrics.RecordGeographicRequest(id, country)
 		}
-		
+
 		// Record successful tunnel access for smart routing learning
 		clientKey := generateClientKey(r)
 		clientTracker.RecordSuccess(clientKey, id)
-		
+
 		// Create immediate tunnel binding for 2-second affinity window
 		clientTracker.CreateImmediateBinding(clientKey, id, "public_url")
 
@@ -322,7 +200,7 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 // customURLHandler handles custom URL routing with case-sensitive matching
 func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[ROUTING REQUEST] URL: %s | Method: %s | Client IP: %s | User-Agent: %s", r.URL.Path, r.Method, r.RemoteAddr, r.Header.Get("User-Agent"))
-	
+
 	// Skip if this is already a system endpoint
 	if strings.HasPrefix(r.URL.Path, "/__pub__/") ||
 		strings.HasPrefix(r.URL.Path, "/__ws__") ||
@@ -410,16 +288,16 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 			// Record successful custom URL usage
 			tunnelMetrics.RecordCustomURLRequest(path, "200")
-			
+
 			// Generate client key for affinity tracking
 			clientKey := generateClientKey(r)
-			
+
 			// NEW: Set custom URL affinity for persistent routing
 			affinityManager.SetAffinity(clientKey, tunnelID, path, "custom_url_visit")
-			
+
 			// Create immediate tunnel binding for 2-second affinity window (legacy)
 			clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url")
-			
+
 			log.Printf("[TUNNEL SUCCESS] Custom URL routing successful | CustomURL: %s | TunnelID: %s | ForwardPath: %s", path, tunnelID, forwardPath)
 			return
 		}
@@ -451,16 +329,16 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 				if tryTunnelRouteWithTimeout(w, newReq, tunnelID, false) {
 					// Record successful custom URL prefix usage
 					tunnelMetrics.RecordCustomURLRequest(parentPath, "200")
-					
+
 					// Generate client key for affinity tracking
 					clientKey := generateClientKey(r)
-					
+
 					// NEW: Set custom URL affinity for persistent routing
 					affinityManager.SetAffinity(clientKey, tunnelID, parentPath, "custom_url_prefix")
-					
+
 					// Create immediate tunnel binding for 2-second affinity window (legacy)
 					clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url_prefix")
-					
+
 					return
 				}
 

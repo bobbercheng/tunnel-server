@@ -40,14 +40,14 @@ func main() {
 	// Initialize affinity manager
 	affinityManager = NewAffinityManager()
 	log.Println("Initialized custom URL affinity manager")
-	
+
 	// Validate and cleanup any stale connections from previous server instance
 	log.Println("Performing connection validation on startup...")
 	validateAndCleanupStaleConnections()
-	
+
 	// Start periodic connection validation routine
 	schedulePeriodicConnectionValidation()
-	
+
 	// Start client tracker cleanup routine
 	go func() {
 		ticker := time.NewTicker(clientTracker.cleanupInterval)
@@ -57,7 +57,7 @@ func main() {
 			clientTracker.CleanupExpiredSessions()
 		}
 	}()
-	
+
 	// Start recent mappings cleanup routine (more frequent for 2-second window)
 	go func() {
 		ticker := time.NewTicker(10 * time.Second) // Clean every 10 seconds
@@ -75,12 +75,11 @@ func main() {
 
 		for range ticker.C {
 			affinityManager.CleanupInactiveAffinities(24 * time.Hour) // Remove affinities unused for 24+ hours
-			affinityManager.CleanupDisconnectedTunnels()             // Remove affinities for disconnected tunnels
+			affinityManager.CleanupDisconnectedTunnels()              // Remove affinities for disconnected tunnels
 		}
 	}()
 
 	mux := http.NewServeMux()
-	// mux.HandleFunc("/__register__", registerHandler) // Disabled: Registration now happens over WebSocket
 	mux.HandleFunc("/__ws__", wsHandler) // agent websocket
 	mux.HandleFunc("/__pub__/", publicHandler)
 	mux.HandleFunc("/__tcp__/", tcpHandler)
