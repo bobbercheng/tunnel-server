@@ -53,7 +53,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		GeographicalRouting: getGeoRoutingStats(),
 		CustomURLs:          getCustomURLStats(),
 		RedirectionSessions: getRedirectionStats(),
-		CustomURLAffinity:   affinityManager.GetAffinityStats(),
+		CustomURLAffinity:   getAffinityStats(),
 	}
 
 	for id, conn := range agents {

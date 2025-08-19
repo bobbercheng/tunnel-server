@@ -89,6 +89,11 @@ func TestAPIDetection(t *testing.T) {
 
 // TestHealthHandler tests the health endpoint
 func TestHealthHandler(t *testing.T) {
+	// Initialize global variables needed by healthHandler
+	if affinityManager == nil {
+		affinityManager = NewAffinityManager()
+	}
+	
 	req := httptest.NewRequest("GET", "/__health__", nil)
 	w := httptest.NewRecorder()
 	

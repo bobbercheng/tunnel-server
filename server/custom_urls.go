@@ -130,6 +130,19 @@ func getCustomURLStats() map[string]interface{} {
 	return stats
 }
 
+// getAffinityStats returns statistics about custom URL affinity usage (nil-safe)
+func getAffinityStats() map[string]interface{} {
+	if affinityManager == nil {
+		return map[string]interface{}{
+			"status": "not_initialized",
+			"active_affinities": 0,
+			"hit_rate": 0.0,
+			"affinities_by_url": map[string]int{},
+		}
+	}
+	return affinityManager.GetAffinityStats()
+}
+
 // getReservedPathsList returns the list of reserved paths
 func getReservedPathsList() []string {
 	paths := make([]string, 0, len(reservedPaths))
