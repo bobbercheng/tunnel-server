@@ -189,33 +189,37 @@ func (a *Agent) Run() {
 
 		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrTunnelMismatch) {
 			if errors.Is(err, ErrUnauthorized) {
-				fmt.Println("Credentials rejected, re-registering for a new tunnel...")
+				log.Println("REREGISTRATION: Credentials rejected by server, re-registering for a new tunnel...")
 			} else {
-				fmt.Println("Tunnel ID mismatch detected (server may have restarted), re-registering for a new tunnel...")
+				log.Println("REREGISTRATION: Tunnel ID mismatch detected (server restarted), re-registering for a new tunnel...")
 			}
+
+			log.Printf("REREGISTRATION: Previous tunnel ID: %s", a.ID)
 			reg, regErr := a.register()
 			if regErr != nil {
-				fmt.Println("Failed to re-register:", regErr)
-				fmt.Println("Retrying in 5 seconds...")
+				log.Printf("REREGISTRATION: Failed to re-register: %v", regErr)
+				log.Println("REREGISTRATION: Retrying in 5 seconds...")
 				time.Sleep(5 * time.Second)
 				continue
 			}
 			// Update only ID and Secret from server response
 			// Keep original configuration (CustomURL, UseRedirect, etc.) to avoid
 			// sending back server-formatted URLs that fail validation
+			previousID := a.ID
 			a.ID = reg.ID
 			a.Secret = reg.Secret
 			// Reset failure counters after successful re-registration
 			a.consecutiveDNSFailures = 0
 			a.consecutiveNetworkFailures = 0
-			fmt.Println("Re-registered successfully!")
-			fmt.Println("  ID:", a.ID)
-			fmt.Println("  Secret:", a.Secret)
-			fmt.Println("  New Public URL:", reg.PublicURL)
+			log.Println("REREGISTRATION: Re-registered successfully!")
+			log.Printf("  Previous ID: %s", previousID)
+			log.Printf("  New ID: %s", a.ID)
+			log.Printf("  New Secret: %s", maskSecret(a.Secret))
+			log.Printf("  New Public URL: %s", reg.PublicURL)
 			if a.CustomURL != "" {
-				fmt.Println("  Custom URL:", a.CustomURL)
+				log.Printf("  Custom URL: %s", a.CustomURL)
 				if a.UseRedirect {
-					fmt.Println("  SPA Redirection: Enabled")
+					log.Println("  SPA Redirection: Enabled")
 				}
 			}
 			continue
@@ -348,19 +352,21 @@ func (a *Agent) runOnce() error {
 		return fmt.Errorf("failed to send handshake ACK: %w", err)
 	}
 
-	fmt.Println("Connection established successfully with encryption.")
+	log.Printf("Connection established successfully with encryption (tunnel_id: %s)", a.ID)
 
 	// If this is a new connection (no ID/Secret), perform registration over encrypted WebSocket
 	if a.ID == "" || a.Secret == "" {
-		fmt.Println("No tunnel id/secret provided, registering new tunnel...")
+		log.Println("No tunnel id/secret provided, registering new tunnel...")
 		err := a.registerOverWebSocket(ctx, ws, cipher)
 		if err != nil {
 			return fmt.Errorf("WebSocket registration failed: %w", err)
 		}
-		fmt.Println("Registered successfully!")
-		fmt.Println("  ID:", a.ID)
-		fmt.Println("  Secret:", a.Secret)
+		log.Println("Registered successfully!")
+		log.Printf("  Tunnel ID: %s", a.ID)
+		log.Printf("  Secret: %s", maskSecret(a.Secret))
 		// Note: Public URL and Custom URL will be logged by registerOverWebSocket
+	} else {
+		log.Printf("Reconnecting with existing tunnel (ID: %s, Secret: %s)", a.ID, maskSecret(a.Secret))
 	}
 
 	// Create a context that will be cancelled when the connection closes
@@ -415,10 +421,13 @@ func (a *Agent) runOnce() error {
 	a.lastPong = time.Now()
 	a.pingMu.Unlock()
 
-	// Start ping monitoring goroutine
+	// Start ping monitoring goroutine with more aggressive timeouts for Cloud Run
 	go func() {
-		ticker := time.NewTicker(30 * time.Second) // Ping every 30 seconds
+		ticker := time.NewTicker(15 * time.Second) // Ping every 15 seconds for faster detection
 		defer ticker.Stop()
+
+		consecutiveMissedPongs := 0
+		maxMissedPongs := 4 // Allow 4 missed pongs (60 seconds total) before considering connection dead
 
 		for {
 			select {
@@ -438,13 +447,51 @@ func (a *Agent) runOnce() error {
 					return
 				}
 
-				// Check if last pong is too old
+				// Check if last pong is too old with more aggressive timeout for Cloud Run
 				a.pingMu.RLock()
 				lastPong := a.lastPong
 				a.pingMu.RUnlock()
 
-				if time.Since(lastPong) > 150*time.Second { // 5 missed pings, more lenient for cloud environments
-					log.Println("Connection appears to be dead (no pong received), closing...")
+				timeSinceLastPong := time.Since(lastPong)
+
+				// More aggressive timeout: 75 seconds (5 pings * 15 seconds)
+				if timeSinceLastPong > 75*time.Second {
+					consecutiveMissedPongs++
+					log.Printf("Missed pong #%d (last pong: %v ago)", consecutiveMissedPongs, timeSinceLastPong)
+
+					if consecutiveMissedPongs >= maxMissedPongs {
+						log.Printf("Connection appears to be dead (no pong received for %v, %d consecutive misses), closing...", timeSinceLastPong, consecutiveMissedPongs)
+						cancelCtx()
+						return
+					}
+				} else {
+					// Reset counter if we received a recent pong
+					if consecutiveMissedPongs > 0 {
+						log.Printf("Connection recovered, resetting missed pong counter (was %d)", consecutiveMissedPongs)
+						consecutiveMissedPongs = 0
+					}
+				}
+			}
+		}
+	}()
+
+	// Start additional connection health monitoring goroutine
+	go func() {
+		healthTicker := time.NewTicker(10 * time.Second) // Check connection health every 10 seconds
+		defer healthTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-healthTicker.C:
+				// Try to ping the WebSocket connection itself (not application-level ping)
+				pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+				err := ws.Ping(pingCtx)
+				pingCancel()
+
+				if err != nil {
+					log.Printf("WebSocket ping failed, connection appears broken: %v", err)
 					cancelCtx()
 					return
 				}
@@ -458,6 +505,8 @@ func (a *Agent) runOnce() error {
 		for {
 			typ, data, err := ws.Read(ctx)
 			if err != nil {
+				// Log specific error details for debugging
+				log.Printf("WebSocket read error: %v", err)
 				// Connection closed, cancel context to stop all handlers
 				cancelCtx()
 				return
@@ -520,7 +569,11 @@ func (a *Agent) runOnce() error {
 
 				// Check if server's expected tunnel ID matches ours
 				if pingFrame.TunnelID != a.ID {
-					log.Printf("ERROR: Received ping with mismatched tunnel ID (expected: %s, got: %s). Server expects different tunnel. Disconnecting to re-register...", a.ID, pingFrame.TunnelID)
+					log.Printf("TUNNEL MISMATCH: Received ping with mismatched tunnel ID")
+					log.Printf("  Agent tunnel ID: %s", a.ID)
+					log.Printf("  Server tunnel ID: %s", pingFrame.TunnelID)
+					log.Printf("  This indicates server restarted or lost tunnel state")
+					log.Printf("  Triggering re-registration...")
 					// Send tunnel mismatch error
 					select {
 					case errChan <- ErrTunnelMismatch:
@@ -550,7 +603,11 @@ func (a *Agent) runOnce() error {
 
 				// Validate tunnel ID matches
 				if pongFrame.TunnelID != a.ID {
-					log.Printf("ERROR: Received pong with mismatched tunnel ID (expected: %s, got: %s). Server may have restarted. Disconnecting to re-register...", a.ID, pongFrame.TunnelID)
+					log.Printf("TUNNEL MISMATCH: Received pong with mismatched tunnel ID")
+					log.Printf("  Agent tunnel ID: %s", a.ID)
+					log.Printf("  Server tunnel ID: %s", pongFrame.TunnelID)
+					log.Printf("  This indicates server restarted or lost tunnel state")
+					log.Printf("  Triggering re-registration...")
 					// Send tunnel mismatch error
 					select {
 					case errChan <- ErrTunnelMismatch:
@@ -563,8 +620,15 @@ func (a *Agent) runOnce() error {
 
 				// Update last pong time for connection health monitoring
 				a.pingMu.Lock()
+				previousPongTime := a.lastPong
 				a.lastPong = time.Now()
 				a.pingMu.Unlock()
+
+				// Log pong received for debugging (only log occasionally to avoid spam)
+				if time.Since(previousPongTime) > 30*time.Second {
+					log.Printf("Received pong from server (tunnel_id: %s, latency: %v)",
+						pongFrame.TunnelID, time.Since(pongFrame.Timestamp))
+				}
 			default:
 				continue
 			}
@@ -1053,6 +1117,14 @@ func (a *Agent) handleTcpDisconnect(frame *TcpDisconnectFrame) {
 // Helper function for SHA256 hash
 func sha256Sum(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// maskSecret returns a masked version of the secret for logging
+func maskSecret(secret string) string {
+	if len(secret) <= 8 {
+		return "****"
+	}
+	return secret[:4] + "****" + secret[len(secret)-4:]
 }
 
 // calculateBackoff returns exponential backoff delay with max cap
