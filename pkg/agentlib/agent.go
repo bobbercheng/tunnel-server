@@ -540,8 +540,7 @@ func (a *Agent) runOnce() error {
 					log.Printf("AGENT: Failed to parse HTTP request: %v", err)
 					continue
 				}
-				log.Printf("AGENT: Received HTTP request | Method: %s | Path: %s | ReqID: %s | TunnelID: %s",
-					req.Method, req.Path, req.ReqID, a.ID)
+				log.Printf("AGENT: %s %s | ReqID: %s", req.Method, req.Path, req.ReqID)
 				a.handleHttpRequest(ctx, &req, writeEncrypted, &wg)
 			case "chunked_resp":
 				var chunk ChunkedRespFrame
@@ -685,8 +684,7 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 	target = strings.Replace(target, "http://localhost:", "http://127.0.0.1:", 1)
 	target = strings.Replace(target, "https://localhost:", "https://127.0.0.1:", 1)
 
-	log.Printf("FORWARD: Attempting to forward request | Method: %s | Target: %s | ReqID: %s | LocalURL: %s",
-		rd.Method, target, rd.ReqID, a.LocalURL)
+	log.Printf("FORWARD: %s %s | ReqID: %s", rd.Method, target, rd.ReqID)
 
 	req, err := http.NewRequest(rd.Method, target, bytes.NewReader(rd.Body))
 	if err != nil {

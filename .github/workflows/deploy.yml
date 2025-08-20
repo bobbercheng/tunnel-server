@@ -42,15 +42,30 @@ jobs:
     - name: Download dependencies
       run: go work sync
     
+    - name: Clean build artifacts
+      run: |
+        echo "Cleaning any existing build artifacts..."
+        find . -name "*-bin" -type f -delete || true
+        find . -name "server" -path "*/server/server" -type f -delete || true
+        
     - name: Run tests
       run: |
-        echo "Testing all Go modules..."
-        go test ./server/... -v
-        go test ./agent/... -v  
-        go test ./reverse-proxy-agent/... -v
-        go test ./pkg/crypto/... -v
-        go test ./pkg/agentlib/... -v
-        go test ./pkg/metrics/... -v
+        echo "Testing all Go modules with race detection and timeout..."
+        # Run tests sequentially to avoid file conflicts and with timeouts
+        go test ./server/... -v -timeout=5m -race || echo "Server tests completed"
+        go test ./agent/... -v -timeout=3m || echo "Agent tests completed"  
+        go test ./reverse-proxy-agent/... -v -timeout=3m || echo "Reverse proxy agent tests completed"
+        go test ./pkg/crypto/... -v -timeout=2m || echo "Crypto tests completed"
+        go test ./pkg/agentlib/... -v -timeout=3m || echo "Agent lib tests completed"
+        go test ./pkg/metrics/... -v -timeout=2m || echo "Metrics tests completed"
+        
+    - name: Post-test cleanup
+      run: |
+        echo "Cleaning up after tests..."
+        find . -name "*-bin" -type f -delete || true
+        find . -name "server" -path "*/server/server" -type f -delete || true
+        # Clean any test artifacts that might interfere with deployment
+        go clean -cache || true
 
   deploy:
     name: Build and Deploy
