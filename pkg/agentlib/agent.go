@@ -681,6 +681,10 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 		target += "?" + rd.Query
 	}
 
+	// Fix IPv6 localhost issue - force IPv4 localhost for better compatibility
+	target = strings.Replace(target, "http://localhost:", "http://127.0.0.1:", 1)
+	target = strings.Replace(target, "https://localhost:", "https://127.0.0.1:", 1)
+
 	log.Printf("FORWARD: Attempting to forward request | Method: %s | Target: %s | ReqID: %s | LocalURL: %s",
 		rd.Method, target, rd.ReqID, a.LocalURL)
 
@@ -696,7 +700,19 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 		}
 	}
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	// Create HTTP client that forces IPv4 for localhost connections
+	client := &http.Client{
+		Timeout: 120 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Force IPv4 for localhost connections to avoid IPv6 issues
+				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
+					return net.DialTimeout("tcp4", addr, 10*time.Second)
+				}
+				return net.DialTimeout(network, addr, 10*time.Second)
+			},
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("FORWARD ERROR: HTTP request failed | Target: %s | ReqID: %s | Error: %v",

@@ -59,6 +59,13 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role="roles/serviceusage.serviceUsageConsumer" \
     --quiet
 
+# Viewer - needed to see build logs and project resources
+echo "  - Viewer"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+    --role="roles/viewer" \
+    --quiet
+
 # Service Account User - needed to deploy Cloud Run services with service accounts
 echo "  - Service Account User"
 gcloud projects add-iam-policy-binding $PROJECT_ID \
