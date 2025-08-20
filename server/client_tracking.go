@@ -821,27 +821,23 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 		duration := time.Since(startTime)
 		bodySize := len(resp.Body)
 
-		// Check if response is successful (2xx status)
-		if resp.Status >= 200 && resp.Status < 300 {
-			log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
-				tunnelID, r.URL.Path, resp.Status, bodySize, duration)
+		// Tunnel routing succeeded - write response regardless of HTTP status
+		// The HTTP status code is the application's concern, not the tunnel's
+		log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
+			tunnelID, r.URL.Path, resp.Status, bodySize, duration)
 
-			// Write response
-			for k, vs := range resp.Headers {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
+		// Write response
+		for k, vs := range resp.Headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
 			}
-			if resp.Status == 0 {
-				resp.Status = http.StatusOK
-			}
-			w.WriteHeader(resp.Status)
-			_, _ = w.Write(resp.Body)
-			return true
 		}
-		log.Printf("[TUNNEL ROUTING] Non-2xx response (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v | Method: %s | Asset: %v",
-			tunnelID, r.URL.Path, resp.Status, bodySize, duration, r.Method, isAsset)
-		return false
+		if resp.Status == 0 {
+			resp.Status = http.StatusOK
+		}
+		w.WriteHeader(resp.Status)
+		_, _ = w.Write(resp.Body)
+		return true
 	case <-ctx.Done():
 		duration := time.Since(startTime)
 		log.Printf("[TUNNEL ROUTING] TIMEOUT (buffered) | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v",
@@ -913,27 +909,23 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 		duration := time.Since(startTime)
 		bodySize := len(resp.Body)
 
-		// Check if response is successful (2xx status)
-		if resp.Status >= 200 && resp.Status < 300 {
-			log.Printf("[TUNNEL ROUTING] SUCCESS | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
-				tunnelID, r.URL.Path, resp.Status, bodySize, duration)
+		// Tunnel routing succeeded - write response regardless of HTTP status
+		// The HTTP status code is the application's concern, not the tunnel's
+		log.Printf("[TUNNEL ROUTING] SUCCESS | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
+			tunnelID, r.URL.Path, resp.Status, bodySize, duration)
 
-			// Write response
-			for k, vs := range resp.Headers {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
+		// Write response
+		for k, vs := range resp.Headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
 			}
-			if resp.Status == 0 {
-				resp.Status = http.StatusOK
-			}
-			w.WriteHeader(resp.Status)
-			_, _ = w.Write(resp.Body)
-			return true
 		}
-		log.Printf("[TUNNEL ROUTING] Non-2xx response | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v | Method: %s | Asset: %v",
-			tunnelID, r.URL.Path, resp.Status, bodySize, duration, r.Method, isAsset)
-		return false
+		if resp.Status == 0 {
+			resp.Status = http.StatusOK
+		}
+		w.WriteHeader(resp.Status)
+		_, _ = w.Write(resp.Body)
+		return true
 	case <-ctx.Done():
 		duration := time.Since(startTime)
 		log.Printf("[TUNNEL ROUTING] TIMEOUT | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v",
