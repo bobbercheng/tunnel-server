@@ -29,7 +29,7 @@ func validateCustomURL(customURL string) error {
 
 	// Normalize: remove leading/trailing slashes
 	normalized := strings.Trim(customURL, "/")
-	
+
 	// Check length (after removing slashes)
 	if len(normalized) == 0 {
 		return fmt.Errorf("custom URL cannot be empty after removing slashes")
@@ -46,7 +46,7 @@ func validateCustomURL(customURL string) error {
 	// Check for reserved paths
 	segments := strings.Split(normalized, "/")
 	firstSegment := segments[0]
-	
+
 	if reservedPaths[firstSegment] {
 		return fmt.Errorf("custom URL cannot start with reserved path: %s", firstSegment)
 	}
@@ -77,10 +77,10 @@ func isCustomURLAvailable(customURL string) bool {
 	}
 
 	normalized := strings.Trim(customURL, "/")
-	
+
 	customURLsMu.RLock()
 	defer customURLsMu.RUnlock()
-	
+
 	_, exists := customURLs[normalized]
 	return !exists
 }
@@ -97,11 +97,11 @@ func getCustomURLStats() map[string]interface{} {
 
 	// Analyze custom URL patterns
 	patterns := map[string]int{
-		"single_segment":    0, // e.g., "api"
-		"two_segments":      0, // e.g., "api/v1"
-		"three_or_more":     0, // e.g., "api/v1/users"
-		"with_underscores":  0, // containing underscores
-		"with_hyphens":      0, // containing hyphens
+		"single_segment":   0, // e.g., "api"
+		"two_segments":     0, // e.g., "api/v1"
+		"three_or_more":    0, // e.g., "api/v1/users"
+		"with_underscores": 0, // containing underscores
+		"with_hyphens":     0, // containing hyphens
 	}
 
 	for customURL := range customURLs {
@@ -134,9 +134,9 @@ func getCustomURLStats() map[string]interface{} {
 func getAffinityStats() map[string]interface{} {
 	if affinityManager == nil {
 		return map[string]interface{}{
-			"status": "not_initialized",
+			"status":            "not_initialized",
 			"active_affinities": 0,
-			"hit_rate": 0.0,
+			"hit_rate":          0.0,
 			"affinities_by_url": map[string]int{},
 		}
 	}
@@ -188,21 +188,6 @@ func unregisterCustomURL(customURL string) {
 	defer customURLsMu.Unlock()
 
 	delete(customURLs, normalized)
-}
-
-// findCustomURLByTunnelID finds custom URL(s) associated with a tunnel ID
-func findCustomURLByTunnelID(tunnelID string) []string {
-	customURLsMu.RLock()
-	defer customURLsMu.RUnlock()
-
-	var urls []string
-	for customURL, tID := range customURLs {
-		if tID == tunnelID {
-			urls = append(urls, customURL)
-		}
-	}
-
-	return urls
 }
 
 // cleanupCustomURLsForTunnel removes all custom URL mappings for a tunnel

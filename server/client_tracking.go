@@ -187,30 +187,20 @@ func hashString(s string) string {
 	return hex.EncodeToString(hash[:])[:16] // First 16 chars for brevity
 }
 
-// generateFingerprintHash creates a unique hash for the fingerprint
+// generateFingerprintHash creates a unique hash for the fingerprint using stable elements
 func generateFingerprintHash(fp *ClientFingerprint) string {
 	h := sha256.New()
 
-	// Add core identifying information
+	// CORE STABLE ELEMENTS - these should be consistent across all requests from same browser
 	h.Write([]byte(fp.ClientIP))
 	h.Write([]byte(fp.UserAgent))
-	h.Write([]byte(fp.SessionCookie))
-	h.Write([]byte(fp.Authorization))
-
-	// Add auth cookies
-	for name, value := range fp.AuthCookies {
-		h.Write([]byte(name + ":" + value))
-	}
-
-	// Add session tokens
-	for name, value := range fp.SessionTokens {
-		h.Write([]byte(name + ":" + value))
-	}
-
-	// Add stable browser characteristics
 	h.Write([]byte(fp.AcceptLanguage))
-	h.Write([]byte(fp.AcceptEncoding))
 	h.Write([]byte(fp.Host))
+
+	// NOTE: Session cookies are intentionally excluded from core fingerprint
+	// because they can appear/disappear/change during a browser session,
+	// breaking redirect session continuity. They're used for confidence
+	// calculation but not fingerprint stability.
 
 	hash := h.Sum(nil)
 	return hex.EncodeToString(hash)[:24] // Use first 24 chars
@@ -744,38 +734,33 @@ func getActiveTunnelIDs() []string {
 	return tunnelIDs
 }
 
-// tryTunnelRoute attempts to route the request through a specific tunnel (legacy version)
-func tryTunnelRoute(w http.ResponseWriter, r *http.Request, tunnelID string) bool {
-	return tryTunnelRouteWithTimeout(w, r, tunnelID, false)
-}
-
 // tryTunnelRouteWithBufferedBody attempts to route the request through a specific tunnel using pre-buffered body
 func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, bodyBytes []byte, tunnelID string, isAsset bool) bool {
 	startTime := time.Now()
-	
+
 	// RACE CONDITION FIX: Retry getting agent during tunnel reconnection window
 	var ac *agentConn
 	maxRetries := 3
 	retryDelay := 50 * time.Millisecond
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		ac = getAgent(tunnelID)
 		if ac != nil {
 			if attempt > 0 {
-				log.Printf("[TUNNEL ROUTING] Agent reconnection successful after %d retries | TunnelID: %s | Path: %s", 
+				log.Printf("[TUNNEL ROUTING] Agent reconnection successful after %d retries | TunnelID: %s | Path: %s",
 					attempt, tunnelID, r.URL.Path)
 			}
 			break
 		}
-		
+
 		if attempt < maxRetries-1 {
-			log.Printf("[TUNNEL ROUTING] Agent not found, retrying in %v | TunnelID: %s | Path: %s | Attempt: %d/%d", 
+			log.Printf("[TUNNEL ROUTING] Agent not found, retrying in %v | TunnelID: %s | Path: %s | Attempt: %d/%d",
 				retryDelay, tunnelID, r.URL.Path, attempt+1, maxRetries)
 			time.Sleep(retryDelay)
 			retryDelay *= 2 // Exponential backoff
 		}
 	}
-	
+
 	if ac == nil {
 		log.Printf("[TUNNEL ROUTING] FAILED - no agent found after %d retries | TunnelID: %s | Path: %s | Method: %s | Asset: %v",
 			maxRetries, tunnelID, r.URL.Path, r.Method, isAsset)
@@ -953,100 +938,6 @@ func tryTunnelRouteWithTimeout(w http.ResponseWriter, r *http.Request, tunnelID 
 	}
 }
 
-// tryTunnelRouteForRedirectSession attempts to route the request through a specific tunnel for redirect sessions
-// Returns true for ANY valid HTTP response (preserves tunnel stickiness), only fails on connection issues
-func tryTunnelRouteForRedirectSession(w http.ResponseWriter, r *http.Request, bodyBytes []byte, tunnelID string, isAsset bool) bool {
-	startTime := time.Now()
-	ac := getAgent(tunnelID)
-	if ac == nil {
-		log.Printf("[REDIRECT ROUTING] FAILED - no agent found | TunnelID: %s | Path: %s | Method: %s | Asset: %v",
-			tunnelID, r.URL.Path, r.Method, isAsset)
-		return false
-	}
-
-	log.Printf("[REDIRECT ROUTING] Starting tunnel attempt for redirect session | TunnelID: %s | Path: %s | Method: %s | Asset: %v | BodySize: %d",
-		tunnelID, r.URL.Path, r.Method, isAsset, len(bodyBytes))
-
-	// Prepare the request path (remove leading slash if present)
-	requestPath := strings.TrimPrefix(r.URL.Path, "/")
-	if requestPath == "" {
-		requestPath = "/"
-	} else {
-		requestPath = "/" + requestPath
-	}
-
-	reqID := uuid.NewString()
-	req := &ReqFrame{
-		Type:    "req",
-		ReqID:   reqID,
-		Method:  r.Method,
-		Path:    requestPath,
-		Query:   r.URL.RawQuery,
-		Headers: r.Header,
-		Body:    bodyBytes, // Use pre-buffered body
-	}
-
-	respCh := make(chan *RespFrame, 1)
-	ac.registerWaiter(reqID, respCh)
-
-	// Use different timeouts for assets vs regular requests
-	timeout := 5 * time.Second
-	if isAsset {
-		timeout = 15 * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	// Send encrypted request
-	if err := ac.writeEncrypted(ctx, req); err != nil {
-		duration := time.Since(startTime)
-		log.Printf("[REDIRECT ROUTING] FAILED to write encrypted request | TunnelID: %s | Path: %s | Error: %v | Duration: %v",
-			tunnelID, r.URL.Path, err, duration)
-		return false
-	}
-
-	log.Printf("[REDIRECT ROUTING] Request sent, waiting for response | TunnelID: %s | Path: %s | Timeout: %v",
-		tunnelID, r.URL.Path, timeout)
-
-	select {
-	case resp := <-respCh:
-		duration := time.Since(startTime)
-		bodySize := len(resp.Body)
-
-		// For redirect sessions, accept ANY valid HTTP response (2xx, 3xx, 4xx, 5xx)
-		// This preserves tunnel stickiness regardless of application response
-		if resp.Status >= 200 && resp.Status < 600 {
-			log.Printf("[REDIRECT ROUTING] SUCCESS - returning response | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
-				tunnelID, r.URL.Path, resp.Status, bodySize, duration)
-
-			// Write response
-			for k, vs := range resp.Headers {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
-			}
-			if resp.Status == 0 {
-				resp.Status = http.StatusOK
-			}
-			w.WriteHeader(resp.Status)
-			_, _ = w.Write(resp.Body)
-			return true
-		}
-
-		// Invalid status code - treat as connection issue
-		log.Printf("[REDIRECT ROUTING] FAILED - invalid status code | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
-			tunnelID, r.URL.Path, resp.Status, bodySize, duration)
-		return false
-
-	case <-ctx.Done():
-		duration := time.Since(startTime)
-		log.Printf("[REDIRECT ROUTING] TIMEOUT | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v",
-			tunnelID, r.URL.Path, duration, timeout)
-		return false
-	}
-}
-
 // Redirection session management for SPA routing
 
 // getSessionKeys returns the keys of a RedirectSessions map for logging
@@ -1146,29 +1037,6 @@ func updateRedirectSession(redirectSession *RedirectSession) {
 
 	log.Printf("Updated redirection session: customURL=%s, tunnel=%s, requests=%d",
 		redirectSession.CustomURL, redirectSession.TunnelID, redirectSession.RequestCount)
-}
-
-// getActiveRedirectSessionForCustomURL retrieves active redirection session for a specific custom URL
-func getActiveRedirectSessionForCustomURL(clientKey, customURL string) *RedirectSession {
-	clientTracker.mu.RLock()
-	defer clientTracker.mu.RUnlock()
-
-	session, exists := clientTracker.clientSessions[clientKey]
-	if !exists || session.RedirectSessions == nil {
-		return nil
-	}
-
-	redirectSession, exists := session.RedirectSessions[customURL]
-	if !exists || !redirectSession.Active {
-		return nil
-	}
-
-	// Check TTL
-	if time.Since(redirectSession.RedirectTime) > redirectSession.TTL {
-		return nil
-	}
-
-	return redirectSession
 }
 
 // getActiveRedirectSession retrieves any active redirection session for a client (regardless of custom URL)

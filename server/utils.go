@@ -442,14 +442,7 @@ func getTunnelCustomURL(tunnelID string) string {
 
 // smartFallbackHandler handles requests that don't match existing routes
 func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
-	// Skip if this is already a system endpoint (avoid infinite loops)
-	if strings.HasPrefix(r.URL.Path, "/__pub__/") ||
-		strings.HasPrefix(r.URL.Path, "/__ws__") ||
-		strings.HasPrefix(r.URL.Path, "/__tcp__/") ||
-		strings.HasPrefix(r.URL.Path, "/__health__") {
-		http.NotFound(w, r)
-		return
-	}
+	// System endpoints are already filtered by customURLHandler before calling this function
 
 	// Generate client key for enhanced tracking
 	clientKey := generateClientKey(r)
@@ -523,8 +516,8 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if redirectSession := getActiveRedirectSession(clientKey); redirectSession != nil {
 		log.Printf("[SMART ROUTING] Found active redirect session | ClientKey: %s | URL: %s | TunnelID: %s | CustomURL: %s", clientKey, r.URL.Path, redirectSession.TunnelID, redirectSession.CustomURL)
 
-		// Try the redirect session tunnel using specialized function that preserves tunnel stickiness
-		if tryTunnelRouteForRedirectSession(w, r, bodyBytes, redirectSession.TunnelID, isAsset) {
+		// Try the redirect session tunnel
+		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, redirectSession.TunnelID, isAsset) {
 			updateRedirectSession(redirectSession)
 			log.Printf("[SMART ROUTING] Redirect session routing successful | ClientKey: %s | URL: %s | TunnelID: %s", clientKey, r.URL.Path, redirectSession.TunnelID)
 			return
@@ -572,22 +565,9 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		// Asset retry logic has been removed - let parallel attempts handle asset routing consistently
 	}
 
-	// Strategy 1: Enhanced Client Tracking (EXISTING) - but skip if we have redirect sessions for this client
-	// Check if client has any active redirect sessions first
-	hasActiveRedirectSession := false
-	clientTracker.mu.RLock()
-	if session, exists := clientTracker.clientSessions[clientKey]; exists && session.RedirectSessions != nil {
-		for _, redirectSession := range session.RedirectSessions {
-			if redirectSession.Active && time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
-				hasActiveRedirectSession = true
-				break
-			}
-		}
-	}
-	clientTracker.mu.RUnlock()
-
-	// Only use client tracker if no redirect sessions are active (prevents contamination)
-	if !hasActiveRedirectSession {
+	// Strategy 1: Enhanced Client Tracking - only reached if no active redirect sessions
+	// (redirect sessions are handled earlier in the function)
+	{
 		if tunnelID := clientTracker.GetBestTunnel(clientKey); tunnelID != "" {
 			confidence := clientTracker.GetConfidence(clientKey, tunnelID)
 			// Lower confidence threshold for API endpoints since they're critical
@@ -619,46 +599,10 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 				clientTracker.RecordFailure(clientKey, tunnelID)
 			}
 		}
-	} else {
-		log.Printf("[SMART ROUTING] Skipping client tracker due to active redirect sessions | ClientKey: %s | URL: %s", clientKey, r.URL.Path)
 	}
 
-	// Strategy 1.4: Custom URL fallback - try all custom URLs with use_redirect that might match this client
-	if r.URL.Path == "/" || r.URL.Path == "" {
-		// This is a root request, possibly from a redirect - try to find matching custom URLs
-		customURLsMu.RLock()
-		var redirectCustomURLs []string
-		for customURL, tunnelID := range customURLs {
-			// Check if this custom URL has use_redirect enabled
-			tunnelsMu.RLock()
-			if tunnel, exists := tunnels[tunnelID]; exists && tunnel.UseRedirect {
-				redirectCustomURLs = append(redirectCustomURLs, customURL)
-			}
-			tunnelsMu.RUnlock()
-		}
-		customURLsMu.RUnlock()
-
-		if len(redirectCustomURLs) > 0 {
-			log.Printf("[SMART ROUTING] Custom URL fallback | Found %d redirect-enabled custom URLs | ClientKey: %s | URLs: %v", len(redirectCustomURLs), clientKey, redirectCustomURLs)
-
-			// Try each redirect-enabled custom URL to see if it works for this client
-			for _, customURL := range redirectCustomURLs {
-				if tunnelID := getCustomURLTunnel(customURL); tunnelID != "" {
-					log.Printf("[SMART ROUTING] Trying custom URL fallback | CustomURL: %s | TunnelID: %s | ClientKey: %s", customURL, tunnelID, clientKey)
-
-					if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
-						// Success! Create redirect session for future requests
-						createRedirectSession(clientKey, customURL, tunnelID)
-						clientTracker.RecordSuccess(clientKey, tunnelID)
-						log.Printf("[SMART ROUTING] Custom URL fallback successful | URL: %s | CustomURL: %s | TunnelID: %s", r.URL.Path, customURL, tunnelID)
-						return
-					} else {
-						log.Printf("[SMART ROUTING] Custom URL fallback failed | CustomURL: %s | TunnelID: %s", customURL, tunnelID)
-					}
-				}
-			}
-		}
-	}
+	// NOTE: Custom URL fallback strategy removed - now handled by enhanced redirect session detection
+	// The detectCustomURLFromRedirect() function properly handles all cases that this strategy covered
 
 	// Strategy 1.5: IP-based Geographical Routing (NEW)
 	clientIP := extractRealClientIP(r)
