@@ -366,34 +366,34 @@ func getGeoRoutingStats() map[string]interface{} {
 
 // detectCustomURLFromRedirect attempts to identify the custom URL that likely caused this redirect
 func detectCustomURLFromRedirect(r *http.Request, clientKey string) string {
-	// Check if this is a root path request that could be from a custom URL redirect
-	if r.URL.Path != "/" && r.URL.Path != "" {
-		return ""
+	// PRIORITY 1: Check if client has active redirect sessions for any custom URL
+	// This should work for ALL paths, not just root paths
+	if activeSession := getActiveRedirectSession(clientKey); activeSession != nil {
+		log.Printf("[REDIRECT SESSION DETECTION] Found active session | CustomURL: %s | TunnelID: %s | ClientKey: %s | Path: %s | RedirectTime: %v",
+			activeSession.CustomURL, activeSession.TunnelID, clientKey, r.URL.Path, activeSession.RedirectTime)
+		return activeSession.CustomURL
 	}
 
-	// Look for referer that indicates a custom URL redirect
-	referer := r.Header.Get("Referer")
-	if referer != "" {
-		// Extract the path from referer
-		if refURL, err := url.Parse(referer); err == nil {
-			refPath := strings.Trim(refURL.Path, "/")
-			if refPath != "" {
-				// Check if this referer path matches any custom URL
-				customURLsMu.RLock()
-				if tunnelID, exists := customURLs[refPath]; exists {
+	// PRIORITY 2: For root path requests, also check referer-based detection
+	if r.URL.Path == "/" || r.URL.Path == "" {
+		// Look for referer that indicates a custom URL redirect
+		referer := r.Header.Get("Referer")
+		if referer != "" {
+			// Extract the path from referer
+			if refURL, err := url.Parse(referer); err == nil {
+				refPath := strings.Trim(refURL.Path, "/")
+				if refPath != "" {
+					// Check if this referer path matches any custom URL
+					customURLsMu.RLock()
+					if tunnelID, exists := customURLs[refPath]; exists {
+						customURLsMu.RUnlock()
+						log.Printf("[REFERER DETECTION] Detected redirect from custom URL | Referer: %s | CustomURL: %s | TunnelID: %s | ClientKey: %s", referer, refPath, tunnelID, clientKey)
+						return refPath
+					}
 					customURLsMu.RUnlock()
-					log.Printf("[CUSTOM URL DETECTION] Detected redirect from custom URL | Referer: %s | CustomURL: %s | TunnelID: %s | ClientKey: %s", referer, refPath, tunnelID, clientKey)
-					return refPath
 				}
-				customURLsMu.RUnlock()
 			}
 		}
-	}
-
-	// Check if client has recent redirect sessions for any custom URL
-	if activeSession := getActiveRedirectSession(clientKey); activeSession != nil {
-		log.Printf("[CUSTOM URL DETECTION] Detected from active redirect session | CustomURL: %s | ClientKey: %s | RedirectTime: %v", activeSession.CustomURL, clientKey, activeSession.RedirectTime)
-		return activeSession.CustomURL
 	}
 
 	return ""
@@ -430,7 +430,7 @@ func getTunnelCustomURL(tunnelID string) string {
 	// Fallback: search through custom URL mappings
 	customURLsMu.RLock()
 	defer customURLsMu.RUnlock()
-	
+
 	for customURL, mappedTunnelID := range customURLs {
 		if mappedTunnelID == tunnelID {
 			return customURL
@@ -473,9 +473,9 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// PRIORITY: Check for custom URL affinity - route clients to their established tunnel
 	if affinity := affinityManager.GetValidatedAffinity(clientKey); affinity != nil {
-		log.Printf("[AFFINITY] Using custom URL affinity | ClientKey: %s | TunnelID: %s | CustomURL: %s | Source: %s | AccessCount: %d", 
-				   clientKey, affinity.TunnelID, affinity.CustomURL, affinity.Source, affinity.AccessCount)
-		
+		log.Printf("[AFFINITY] Using custom URL affinity | ClientKey: %s | TunnelID: %s | CustomURL: %s | Source: %s | AccessCount: %d",
+			clientKey, affinity.TunnelID, affinity.CustomURL, affinity.Source, affinity.AccessCount)
+
 		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, affinity.TunnelID, isAsset) {
 			affinityManager.UpdateAccess(clientKey) // Update last access time and count
 			log.Printf("[AFFINITY] Affinity routing successful | URL: %s | TunnelID: %s | CustomURL: %s", r.URL.Path, affinity.TunnelID, affinity.CustomURL)
@@ -490,7 +490,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
-			
+
 			if !tunnelExists {
 				// Tunnel disconnected - clear affinity
 				affinityManager.ClearAffinity(clientKey)
@@ -598,7 +598,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 			if confidence > minConfidence && tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
 				clientTracker.RecordSuccess(clientKey, tunnelID)
-				
+
 				// CRITICAL: Set smart routing affinity for successful requests
 				customURL := getTunnelCustomURL(tunnelID)
 				affinityManager.SetAffinity(clientKey, tunnelID, customURL, "client_tracker_route")
@@ -666,7 +666,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, tunnelID)
 			recordIPTunnelMapping(clientIP, tunnelID)
-			
+
 			// CRITICAL: Set smart routing affinity for successful requests
 			customURL := getTunnelCustomURL(tunnelID)
 			affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ip_mapping_route")
@@ -802,7 +802,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 		if tryTunnelRouteWithBufferedBody(w, finalReq, bodyBytes, successfulTunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, successfulTunnelID)
-			
+
 			// CRITICAL: Set smart routing affinity for successful requests
 			customURL := getTunnelCustomURL(successfulTunnelID)
 			affinityManager.SetAffinity(clientKey, successfulTunnelID, customURL, "parallel_route")
@@ -859,7 +859,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 				select {
 				case resp := <-respCh:
 					clientTracker.RecordSuccess(clientKey, tunnelID)
-					
+
 					// CRITICAL: Set smart routing affinity for successful requests
 					customURL := getTunnelCustomURL(tunnelID)
 					affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ultimate_fallback_route")
