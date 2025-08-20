@@ -11,6 +11,7 @@ env:
   GCP_REGION: us-east1
   SERVICE_NAME: tunnel-server
   IMAGE_NAME: gcr.io/contact-center-insights-poc/tunnel-server
+  GO_VERSION: '1.23'
 
 jobs:
   test:
@@ -29,14 +30,24 @@ jobs:
           **/go.sum
           **/go.mod
     
+    - name: Clean Go cache before restoration
+      run: |
+        echo "Cleaning Go module cache to prevent extraction conflicts..."
+        go clean -modcache || true
+        rm -rf ~/.cache/go-build || true
+        mkdir -p ~/.cache/go-build
+        mkdir -p ~/go/pkg/mod
+    
     - name: Cache Go modules
       uses: actions/cache@v3
       with:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-${{ runner.arch }}-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum', '**/go.mod') }}
         restore-keys: |
+          ${{ runner.os }}-go-${{ runner.arch }}-${{ env.GO_VERSION }}-
+          ${{ runner.os }}-go-${{ runner.arch }}-
           ${{ runner.os }}-go-
     
     - name: Download dependencies
