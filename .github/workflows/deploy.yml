@@ -12,6 +12,7 @@ env:
   SERVICE_NAME: tunnel-server
   IMAGE_NAME: gcr.io/contact-center-insights-poc/tunnel-server
   GO_VERSION: '1.23'
+  GOTOOLCHAIN: local
 
 jobs:
   test:
@@ -26,9 +27,6 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.23'
-        cache-dependency-path: |
-          **/go.sum
-          **/go.mod
     
     - name: Clean Go cache before restoration
       run: |
