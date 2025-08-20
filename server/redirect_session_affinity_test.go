@@ -357,6 +357,138 @@ func TestRealWorldBrowserVariations(t *testing.T) {
 	}
 }
 
+// TestEndToEndRoutingFlow tests the complete routing flow to identify where cross-contamination occurs
+func TestEndToEndRoutingFlow(t *testing.T) {
+	// Setup same as previous test but trace the COMPLETE routing flow
+	tunnelsMu.Lock()
+	agentsMu.Lock()
+	customURLsMu.Lock()
+
+	originalTunnels := tunnels
+	originalAgents := agents
+	originalCustomURLs := customURLs
+	originalClientTracker := clientTracker
+	originalAffinityManager := affinityManager
+
+	defer func() {
+		tunnelsMu.Lock()
+		agentsMu.Lock()
+		customURLsMu.Lock()
+		tunnels = originalTunnels
+		agents = originalAgents
+		customURLs = originalCustomURLs
+		clientTracker = originalClientTracker
+		affinityManager = originalAffinityManager
+		customURLsMu.Unlock()
+		agentsMu.Unlock()
+		tunnelsMu.Unlock()
+	}()
+
+	// Clear and initialize
+	tunnels = make(map[string]*TunnelInfo)
+	agents = make(map[string]*agentConn)
+	customURLs = make(map[string]string)
+	clientTracker = NewClientTracker()
+	affinityManager = NewAffinityManager()
+
+	// Create LibreChat tunnel
+	librechatTunnelID := "librechat-tunnel-123"
+	tunnels[librechatTunnelID] = &TunnelInfo{
+		Secret:      "librechat-secret",
+		Protocol:    "http",
+		CustomURL:   "librechat",
+		UseRedirect: true,
+		Created:     time.Now(),
+	}
+	customURLs["librechat"] = librechatTunnelID
+	agents[librechatTunnelID] = &agentConn{
+		id:               librechatTunnelID,
+		connectedAt:      time.Now(),
+		waiters:          make(map[string]chan *RespFrame),
+		tcpConns:         make(map[string]*TcpConn),
+		chunkedResponses: make(map[string]*ChunkedResponse),
+		lastPong:         time.Now(),
+	}
+
+	// Create AnythingLLM tunnel
+	anythingllmTunnelID := "anythingllm-tunnel-456"
+	tunnels[anythingllmTunnelID] = &TunnelInfo{
+		Secret:      "anythingllm-secret",
+		Protocol:    "http",
+		CustomURL:   "anythingllm",
+		UseRedirect: true,
+		Created:     time.Now(),
+	}
+	customURLs["anythingllm"] = anythingllmTunnelID
+	agents[anythingllmTunnelID] = &agentConn{
+		id:               anythingllmTunnelID,
+		connectedAt:      time.Now(),
+		waiters:          make(map[string]chan *RespFrame),
+		tcpConns:         make(map[string]*TcpConn),
+		chunkedResponses: make(map[string]*ChunkedResponse),
+		lastPong:         time.Now(),
+	}
+
+	customURLsMu.Unlock()
+	agentsMu.Unlock()
+	tunnelsMu.Unlock()
+
+	// Step 1: Visit /librechat to establish session
+	req1 := httptest.NewRequest("GET", "/librechat", nil)
+	req1.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+	req1.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req1.RemoteAddr = "173.34.203.180:12345"
+	req1.Host = "tunnel-server-3w6u4kmniq-ue.a.run.app"
+
+	rr1 := httptest.NewRecorder()
+	customURLHandler(rr1, req1)
+
+	clientKey1 := generateClientKey(req1)
+	t.Logf("Step 1 - Visit /librechat: ClientKey = %s", clientKey1)
+
+	// Verify redirect session was created
+	session := getActiveRedirectSession(clientKey1)
+	if session == nil || session.CustomURL != "librechat" {
+		t.Fatal("Redirect session not created properly")
+	}
+	t.Logf("✅ Redirect session created: %s → %s", session.CustomURL, session.TunnelID)
+
+	// Step 2: Make API request with SAME browser characteristics
+	req2 := httptest.NewRequest("GET", "/api/config", nil)
+	req2.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)") // SAME
+	req2.Header.Set("Accept-Language", "en-US,en;q=0.9")                             // SAME
+	req2.RemoteAddr = "173.34.203.180:23456"                                         // Different port (realistic)
+	req2.Host = "tunnel-server-3w6u4kmniq-ue.a.run.app"                              // SAME
+
+	clientKey2 := generateClientKey(req2)
+	t.Logf("Step 2 - API call /api/config: ClientKey = %s", clientKey2)
+
+	// CRITICAL TEST: Are the client keys the same?
+	if clientKey1 != clientKey2 {
+		t.Errorf("FINGERPRINTING INSTABILITY: Different client keys for same browser")
+		t.Errorf("  Initial key: %s", clientKey1)
+		t.Errorf("  API req key: %s", clientKey2)
+		t.Error("This will cause session lookup failure and cross-contamination!")
+
+		// Check if second request can find the session
+		session2 := getActiveRedirectSession(clientKey2)
+		if session2 == nil {
+			t.Error("As expected, API request cannot find redirect session due to different client key")
+			t.Error("This will trigger parallel routing and cause cross-contamination")
+		}
+	} else {
+		t.Logf("✅ Client keys match - fingerprinting is stable")
+
+		// Verify session detection works
+		detectedURL := detectCustomURLFromRedirect(req2, clientKey2)
+		if detectedURL != "librechat" {
+			t.Errorf("Session detection failed even with matching client key: got '%s'", detectedURL)
+		} else {
+			t.Logf("✅ Session detection works: %s", detectedURL)
+		}
+	}
+}
+
 // TestRedirectSessionAffinityFix verifies that the fix prevents cross-contamination
 func TestRedirectSessionAffinityFix(t *testing.T) {
 	// ✅ FIX IMPLEMENTED: Enhanced detectCustomURLFromRedirect function + Stable fingerprinting

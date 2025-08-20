@@ -495,7 +495,36 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// PRIORITY: Custom URL redirect detection - handle requests that come from custom URL redirects
+	// PRIORITY 1: Check for ANY redirect session associated with this IP (ultra-protective)
+	clientIP := extractRealClientIP(r)
+	clientTracker.mu.RLock()
+	if ipClients, exists := clientTracker.ipMappings[clientIP]; exists {
+		for _, ipClientKey := range ipClients {
+			if session, exists := clientTracker.clientSessions[ipClientKey]; exists && session.RedirectSessions != nil {
+				for _, redirectSession := range session.RedirectSessions {
+					if redirectSession.Active && time.Since(redirectSession.RedirectTime) <= redirectSession.TTL {
+						clientTracker.mu.RUnlock()
+						log.Printf("[IP REDIRECT PROTECTION] Found active redirect session for IP | IP: %s | OriginalClientKey: %s | CurrentClientKey: %s | CustomURL: %s | TunnelID: %s",
+							clientIP, ipClientKey, clientKey, redirectSession.CustomURL, redirectSession.TunnelID)
+
+						if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, redirectSession.TunnelID, isAsset) {
+							// Create redirect session for current client key too
+							createRedirectSession(clientKey, redirectSession.CustomURL, redirectSession.TunnelID)
+							updateRedirectSession(redirectSession)
+							log.Printf("[IP REDIRECT PROTECTION] Routing successful | IP: %s | URL: %s | TunnelID: %s", clientIP, r.URL.Path, redirectSession.TunnelID)
+							return
+						}
+						goto continueRouting
+					}
+				}
+			}
+		}
+	}
+	clientTracker.mu.RUnlock()
+
+continueRouting:
+
+	// PRIORITY 2: Custom URL redirect detection - handle requests that come from custom URL redirects
 	if detectedCustomURL := detectCustomURLFromRedirect(r, clientKey); detectedCustomURL != "" {
 		if tunnelID := getCustomURLTunnel(detectedCustomURL); tunnelID != "" {
 			log.Printf("[SMART ROUTING] Custom URL redirect detected | URL: %s | CustomURL: %s | TunnelID: %s | ClientKey: %s", r.URL.Path, detectedCustomURL, tunnelID, clientKey)
@@ -605,7 +634,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// The detectCustomURLFromRedirect() function properly handles all cases that this strategy covered
 
 	// Strategy 1.5: IP-based Geographical Routing (NEW)
-	clientIP := extractRealClientIP(r)
+	// clientIP already extracted above for IP redirect protection
 	if tunnelID := getIPTunnelMapping(clientIP); tunnelID != "" {
 		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelID, isAsset) {
 			clientTracker.RecordSuccess(clientKey, tunnelID)
@@ -671,11 +700,57 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Strategy 3: Try all active tunnels in parallel (enhanced with learning)
+	// Strategy 3: Conservative parallel routing - only for specific scenarios
 	if len(tunnelIDs) == 0 {
 		http.NotFound(w, r)
 		return
 	}
+
+	// RESTRICTION 1: Never use parallel routing for API requests in multi-tenant environments
+	// API endpoints often overlap between services, causing cross-contamination
+	if isAPI && len(tunnelIDs) > 1 {
+		log.Printf("[PARALLEL ROUTING] BLOCKED - API request with multiple tunnels, preventing cross-contamination | URL: %s | TunnelCount: %d", r.URL.Path, len(tunnelIDs))
+		http.Error(w, "API routing blocked to prevent cross-contamination", http.StatusBadGateway)
+		return
+	}
+
+	// RESTRICTION 2: Never use parallel routing when ANY IP from same network has redirect sessions
+	// This prevents contamination even with fingerprinting variations
+	// (IP redirect protection already checked above - this adds additional logging)
+
+	// RESTRICTION 3: Only use parallel routing for truly unknown scenarios
+	// Check if this is a completely new client with no prior interaction
+	clientTracker.mu.RLock()
+	hasAnyPriorInteraction := false
+	if _, exists := clientTracker.clientSessions[clientKey]; exists {
+		hasAnyPriorInteraction = true
+	}
+	// Also check if this IP has any prior mappings
+	if ipClients, exists := clientTracker.ipMappings[clientIP]; exists && len(ipClients) > 0 {
+		hasAnyPriorInteraction = true
+	}
+	clientTracker.mu.RUnlock()
+
+	if hasAnyPriorInteraction && len(tunnelIDs) > 1 {
+		log.Printf("[PARALLEL ROUTING] BLOCKED - Prior interaction detected with multiple tunnels, using first tunnel only | URL: %s | ClientKey: %s", r.URL.Path, clientKey)
+		// Use first tunnel instead of parallel attempts
+		tunnelIDs = []string{tunnelIDs[0]}
+	}
+
+	// OPTION: Completely disable parallel routing via environment variable
+	if os.Getenv("DISABLE_PARALLEL_ROUTING") == "true" {
+		log.Printf("[PARALLEL ROUTING] DISABLED - Environment variable set, using first tunnel only | URL: %s | TunnelID: %s", r.URL.Path, tunnelIDs[0])
+		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, tunnelIDs[0], isAsset) {
+			log.Printf("Smart routing: %s -> tunnel %s (first-tunnel-only)", r.URL.Path, tunnelIDs[0])
+			return
+		} else {
+			http.Error(w, "tunnel routing failed", http.StatusBadGateway)
+			return
+		}
+	}
+
+	log.Printf("[PARALLEL ROUTING] Proceeding with conservative approach | URL: %s | TunnelCount: %d | IsAPI: %v | PriorInteraction: %v",
+		r.URL.Path, len(tunnelIDs), isAPI, hasAnyPriorInteraction)
 
 	// Body was already read and buffered at the beginning of the function
 

@@ -187,20 +187,24 @@ func hashString(s string) string {
 	return hex.EncodeToString(hash[:])[:16] // First 16 chars for brevity
 }
 
-// generateFingerprintHash creates a unique hash for the fingerprint using stable elements
+// generateFingerprintHash creates a unique hash for the fingerprint using ultra-stable elements
 func generateFingerprintHash(fp *ClientFingerprint) string {
 	h := sha256.New()
 
-	// CORE STABLE ELEMENTS - these should be consistent across all requests from same browser
+	// ULTRA-STABLE CORE ELEMENTS - absolute minimum for maximum stability
+	// These are the ONLY elements that remain consistent across all request types
 	h.Write([]byte(fp.ClientIP))
 	h.Write([]byte(fp.UserAgent))
-	h.Write([]byte(fp.AcceptLanguage))
-	h.Write([]byte(fp.Host))
 
-	// NOTE: Session cookies are intentionally excluded from core fingerprint
-	// because they can appear/disappear/change during a browser session,
-	// breaking redirect session continuity. They're used for confidence
-	// calculation but not fingerprint stability.
+	// NOTE: Removed AcceptLanguage and Host because they can vary in some browsers:
+	// - AcceptLanguage: May change between requests due to browser settings
+	// - Host: May include different ports or protocols
+	// - Session cookies: Excluded for stability (appear/disappear during session)
+	// - All other headers: Too volatile for reliable fingerprinting
+	//
+	// This ultra-minimal approach ensures maximum session continuity
+	// at the cost of some fingerprint granularity, which is acceptable
+	// for preventing cross-contamination.
 
 	hash := h.Sum(nil)
 	return hex.EncodeToString(hash)[:24] // Use first 24 chars
