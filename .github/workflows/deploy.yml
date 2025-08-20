@@ -27,6 +27,7 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.23'
+        cache: false
     
     - name: Clean Go cache before restoration
       run: |
