@@ -171,6 +171,10 @@ type agentConn struct {
 	chunkedMu        sync.Mutex
 	chunkedResponses map[string]*ChunkedResponse // reqID -> ChunkedResponse
 
+	// Streaming response management
+	streamingMu       sync.Mutex
+	streamingSessions map[string]bool // reqID -> whether streaming_start has been processed
+
 	// Connection health monitoring
 	lastPong time.Time
 	pingMu   sync.RWMutex

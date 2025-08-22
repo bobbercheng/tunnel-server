@@ -70,10 +70,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		connectedAt:      time.Now(),
 		clientIP:         clientIP,
 		geoData:          geoData,
-		waiters:          make(map[string]chan *RespFrame),
-		tcpConns:         make(map[string]*TcpConn),
-		chunkedResponses: make(map[string]*ChunkedResponse),
-		lastPong:         time.Now(),
+		waiters:           make(map[string]chan *RespFrame),
+		tcpConns:          make(map[string]*TcpConn),
+		chunkedResponses:  make(map[string]*ChunkedResponse),
+		streamingSessions: make(map[string]bool),
+		lastPong:          time.Now(),
 	}
 
 	// For reconnections, register agent immediately
@@ -211,16 +212,30 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Process message in goroutine but with connection context
-		go func(msgData []byte) {
+		// Check if this is a streaming message that needs ordered processing
+		isStreamingMessage := ac.isStreamingMessage(data)
+		
+		if isStreamingMessage {
+			// Process streaming messages sequentially to maintain order
 			select {
 			case <-connCtx.Done():
 				// Connection was closed, don't process message
-				return
+				continue
 			default:
-				ac.handleMessage(msgData)
+				ac.handleMessage(data)
 			}
-		}(data)
+		} else {
+			// Process other messages in goroutine as before
+			go func(msgData []byte) {
+				select {
+				case <-connCtx.Done():
+					// Connection was closed, don't process message
+					return
+				default:
+					ac.handleMessage(msgData)
+				}
+			}(data)
+		}
 	}
 }
 
@@ -527,6 +542,25 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		log.Printf("Unexpected register message from agent %s", ac.id)
 	default:
 		log.Printf("Unknown message type from agent %s: %s", ac.id, baseMsg.Type)
+	}
+}
+
+// isStreamingMessage checks if a message is a streaming-related message that requires ordered processing
+func (ac *agentConn) isStreamingMessage(data []byte) bool {
+	// Parse message type quickly
+	var baseMsg struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &baseMsg); err != nil {
+		return false // If we can't parse it, process it normally
+	}
+	
+	// Check if it's a streaming message type
+	switch baseMsg.Type {
+	case "streaming_start", "streaming_chunk", "streaming_end", "streaming_heartbeat":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -956,6 +990,11 @@ func (ac *agentConn) handleStreamingStart(data []byte) {
 	select {
 	case ch <- resp:
 		log.Printf("SERVER STREAMING: Sent streaming_start to waiter | ReqID: %s", frame.ReqID)
+		// Mark this streaming session as started
+		ac.streamingMu.Lock()
+		ac.streamingSessions[frame.ReqID] = true
+		ac.streamingMu.Unlock()
+		log.Printf("SERVER STREAMING: Marked streaming session as started | ReqID: %s", frame.ReqID)
 	default:
 		log.Printf("SERVER STREAMING: Failed to send streaming_start (channel full) | ReqID: %s", frame.ReqID)
 	}
@@ -975,6 +1014,18 @@ func (ac *agentConn) handleStreamingChunk(data []byte) {
 
 	log.Printf("SERVER STREAMING: Received chunk %d (%d bytes) | ReqID: %s | AgentID: %s",
 		frame.ChunkIndex, len(frame.Data), frame.ReqID, ac.id)
+
+	// CRITICAL: Validate that streaming_start was processed before this chunk
+	ac.streamingMu.Lock()
+	streamingStarted, exists := ac.streamingSessions[frame.ReqID]
+	ac.streamingMu.Unlock()
+	
+	if !exists || !streamingStarted {
+		log.Printf("SERVER STREAMING: ERROR - Received streaming_chunk before streaming_start | ReqID: %s | AgentID: %s | ChunkIndex: %d",
+			frame.ReqID, ac.id, frame.ChunkIndex)
+		log.Printf("SERVER STREAMING: This indicates a message ordering issue that causes the 'one stream object' problem")
+		return
+	}
 
 	// Get the waiting HTTP response writer
 	ac.respMu.Lock()
@@ -1050,6 +1101,13 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 	default:
 		log.Printf("SERVER STREAMING: Failed to send streaming_end (channel full) | ReqID: %s", frame.ReqID)
 	}
+	
+	// Clean up streaming session tracking
+	ac.streamingMu.Lock()
+	delete(ac.streamingSessions, frame.ReqID)
+	ac.streamingMu.Unlock()
+	log.Printf("SERVER STREAMING: Cleaned up streaming session | ReqID: %s", frame.ReqID)
+	
 	close(ch)
 }
 
