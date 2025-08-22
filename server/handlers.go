@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"nhooyr.io/websocket"
 )
 
 // getCountryFromIP extracts country from IP address using existing geo functionality
@@ -120,6 +122,20 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 
+	// Detect WebSocket upgrade requests
+	isWebSocketUpgrade := strings.ToLower(r.Header.Get("Connection")) == "upgrade" &&
+		strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
+		r.Method == "GET"
+
+	// Detect streaming requests for buffer sizing and timeout logic
+	isStreamingRequest := strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+		strings.Contains(r.Header.Get("Accept"), "text/stream") ||
+		strings.Contains(r.Header.Get("Accept"), "application/stream") ||
+		strings.Contains(r.Header.Get("Content-Type"), "text/event-stream") ||
+		strings.Contains(r.URL.Path, "/api/agents/") || // AI endpoints are likely streaming
+		strings.Contains(r.URL.Path, "/stream") ||
+		strings.Contains(r.URL.Path, "/chat")
+
 	reqID := uuid.NewString()
 	req := &ReqFrame{
 		Type:    "req",
@@ -131,17 +147,37 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		Body:    body,
 	}
 
-	respCh := make(chan *RespFrame, 1)
+	// Handle WebSocket upgrade requests
+	if isWebSocketUpgrade {
+		log.Printf("SERVER WEBSOCKET: Upgrade request detected | Path: %s | ReqID: %s", 
+			r.URL.Path, reqID)
+		handleWebSocketUpgrade(w, r, req, ac, reqID)
+		return
+	}
+
+	// Use larger buffer for streaming responses to prevent channel blocking
+	bufferSize := 1
+	if isStreamingRequest {
+		bufferSize = 100 // Much larger buffer for streaming chunks
+	}
+	respCh := make(chan *RespFrame, bufferSize)
 	ac.registerWaiter(reqID, respCh)
 
-	// Use longer timeout for potentially streaming responses
-	timeout := 60 * time.Second
-	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
-		strings.Contains(r.Header.Get("Accept"), "text/stream") {
-		timeout = 120 * time.Second
+	// Use timeout only for non-streaming requests
+	var ctx context.Context
+	var cancel context.CancelFunc
+	
+	if isStreamingRequest {
+		// No artificial timeout for streaming - let client control connection lifecycle
+		ctx = r.Context()
+		log.Printf("SERVER: Using client-controlled timeout for streaming request | Path: %s | Method: %s", 
+			r.URL.Path, r.Method)
+	} else {
+		// Regular requests get 60-second timeout
+		timeout := 60 * time.Second
+		ctx, cancel = context.WithTimeout(r.Context(), timeout)
+		defer cancel()
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
 
 	// Send encrypted request
 	if err := ac.writeEncrypted(ctx, req); err != nil {
@@ -152,45 +188,112 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-respCh:
-		// Record metrics
-		duration := time.Since(startTime).Seconds()
-		requestSize := int64(len(body))
-		responseSize := int64(len(resp.Body))
 		statusCode := resp.Status
 		if statusCode == 0 {
 			statusCode = http.StatusOK
 		}
 
-		tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, responseSize)
-
-		// Record geographic request if we have geolocation data
-		clientIP := extractRealClientIP(r)
-		if country := getCountryFromIP(clientIP); country != "" {
-			tunnelMetrics.RecordGeographicRequest(id, country)
-		}
-
-		// Record successful tunnel access for smart routing learning
-		clientKey := generateClientKey(r)
-		clientTracker.RecordSuccess(clientKey, id)
-
-		// Create immediate tunnel binding for 2-second affinity window
-		clientTracker.CreateImmediateBinding(clientKey, id, "public_url")
-
-		// Record IP-based geographical routing
-		recordIPTunnelMapping(clientIP, id)
-
-		// For non-asset requests (main pages), record asset mapping
-		if !isAssetRequest(restPath) {
-			recordClientAssetMapping(clientKey, id)
-		}
-
-		for k, vs := range resp.Headers {
-			for _, v := range vs {
-				w.Header().Add(k, v)
+		// Check if this is a streaming response
+		if resp.Type == "streaming_start" {
+			log.Printf("SERVER: Starting streaming response | ReqID: %s | Status: %d", reqID, statusCode)
+			
+			// Set headers for streaming
+			for k, vs := range resp.Headers {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
 			}
+			w.WriteHeader(statusCode)
+			
+			// Flush headers to start streaming
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+
+			// Record initial metrics  
+			clientIP := extractRealClientIP(r)
+			clientKey := generateClientKey(r)
+			clientTracker.RecordSuccess(clientKey, id)
+			clientTracker.CreateImmediateBinding(clientKey, id, "public_url")
+			recordIPTunnelMapping(clientIP, id)
+			if !isAssetRequest(restPath) {
+				recordClientAssetMapping(clientKey, id)
+			}
+
+			// Stream chunks in real-time
+			totalSize := int64(0)
+			for {
+				select {
+				case chunk := <-respCh:
+					if chunk.Type == "streaming_chunk" {
+						log.Printf("SERVER: Writing streaming chunk (%d bytes) | ReqID: %s", len(chunk.Body), reqID)
+						n, err := w.Write(chunk.Body)
+						if err != nil {
+							log.Printf("SERVER: Error writing streaming chunk | ReqID: %s | Error: %v", reqID, err)
+							return
+						}
+						totalSize += int64(n)
+						
+						// Flush immediately for real-time streaming
+						if flusher, ok := w.(http.Flusher); ok {
+							flusher.Flush()
+						}
+					} else if chunk.Type == "streaming_end" {
+						log.Printf("SERVER: Streaming response completed | ReqID: %s | TotalSize: %d bytes", reqID, totalSize)
+						
+						// Record final metrics
+						duration := time.Since(startTime).Seconds()
+						requestSize := int64(len(body))
+						tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, totalSize)
+						
+						// Record geographic request if we have geolocation data
+						if country := getCountryFromIP(clientIP); country != "" {
+							tunnelMetrics.RecordGeographicRequest(id, country)
+						}
+						return
+					}
+				case <-ctx.Done():
+					log.Printf("SERVER: Streaming timeout | ReqID: %s", reqID)
+					return
+				}
+			}
+		} else {
+			// Handle regular (non-streaming) response
+			duration := time.Since(startTime).Seconds()
+			requestSize := int64(len(body))
+			responseSize := int64(len(resp.Body))
+
+			tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, responseSize)
+
+			// Record geographic request if we have geolocation data
+			clientIP := extractRealClientIP(r)
+			if country := getCountryFromIP(clientIP); country != "" {
+				tunnelMetrics.RecordGeographicRequest(id, country)
+			}
+
+			// Record successful tunnel access for smart routing learning
+			clientKey := generateClientKey(r)
+			clientTracker.RecordSuccess(clientKey, id)
+
+			// Create immediate tunnel binding for 2-second affinity window
+			clientTracker.CreateImmediateBinding(clientKey, id, "public_url")
+
+			// Record IP-based geographical routing
+			recordIPTunnelMapping(clientIP, id)
+
+			// For non-asset requests (main pages), record asset mapping
+			if !isAssetRequest(restPath) {
+				recordClientAssetMapping(clientKey, id)
+			}
+
+			for k, vs := range resp.Headers {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(statusCode)
+			_, _ = w.Write(resp.Body)
 		}
-		w.WriteHeader(statusCode)
-		_, _ = w.Write(resp.Body)
 	case <-ctx.Done():
 		tunnelMetrics.RecordError(id, "timeout")
 		http.Error(w, "timeout waiting agent", http.StatusGatewayTimeout)
@@ -351,4 +454,145 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 	// No custom URL match found, fall back to smart routing
 	log.Printf("[ROUTING FALLBACK] No custom URL match found | Path: %s | Falling back to smart routing", r.URL.Path)
 	smartFallbackHandler(w, r)
+}
+
+// handleWebSocketUpgrade handles WebSocket upgrade requests from clients
+func handleWebSocketUpgrade(w http.ResponseWriter, r *http.Request, req *ReqFrame, ac *agentConn, reqID string) {
+	// Step 1: Send WebSocket upgrade request to agent
+	respCh := make(chan *RespFrame, 1)
+	ac.registerWaiter(reqID, respCh)
+
+	// Use no timeout for WebSocket connections (persistent)
+	ctx := r.Context()
+
+	// Send encrypted request to agent
+	if err := ac.writeEncrypted(ctx, req); err != nil {
+		tunnelMetrics.RecordError(ac.id, "websocket_write_failed")
+		http.Error(w, "failed to write WebSocket upgrade to agent: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	log.Printf("SERVER WEBSOCKET: Sent upgrade request to agent | ReqID: %s | AgentID: %s", 
+		reqID, ac.id)
+
+	// Step 2: Wait for agent response
+	select {
+	case resp := <-respCh:
+		if resp.Type != "websocket_upgrade_success" {
+			log.Printf("SERVER WEBSOCKET: Agent upgrade failed | ReqID: %s | Status: %d", 
+				reqID, resp.Status)
+			http.Error(w, "WebSocket upgrade failed at agent", http.StatusBadGateway)
+			return
+		}
+
+		log.Printf("SERVER WEBSOCKET: Agent confirmed upgrade success | ReqID: %s", reqID)
+
+		// Step 3: Upgrade client connection to WebSocket
+		clientConn, err := upgradeClientToWebSocket(w, r)
+		if err != nil {
+			log.Printf("SERVER WEBSOCKET: Failed to upgrade client connection | ReqID: %s | Error: %v", 
+				reqID, err)
+			return
+		}
+
+		log.Printf("SERVER WEBSOCKET: Client connection upgraded successfully | ReqID: %s", reqID)
+
+		// Step 4: Create WebSocket session and start bidirectional forwarding
+		session := &WebSocketSession{
+			ReqID:      reqID,
+			TunnelID:   ac.id,
+			ClientConn: clientConn,
+			ServerConn: ac,
+			CreatedAt:  time.Now(),
+			Active:     true,
+		}
+
+		// Register session
+		webSocketMutex.Lock()
+		webSocketSessions[reqID] = session
+		webSocketMutex.Unlock()
+
+		log.Printf("SERVER WEBSOCKET: Session created, starting bidirectional forwarding | ReqID: %s", reqID)
+
+		// Step 5: Start bidirectional frame forwarding
+		startWebSocketForwarding(session)
+
+	case <-ctx.Done():
+		log.Printf("SERVER WEBSOCKET: Client disconnected during upgrade | ReqID: %s", reqID)
+		return
+	}
+}
+
+// upgradeClientToWebSocket upgrades the HTTP connection to WebSocket
+func upgradeClientToWebSocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
+	// Accept WebSocket connection from client
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true, // For development - should be configurable
+		OriginPatterns:     []string{"*"}, // Allow all origins for now
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to accept WebSocket connection: %w", err)
+	}
+
+	return conn, nil
+}
+
+// startWebSocketForwarding handles bidirectional WebSocket frame forwarding
+func startWebSocketForwarding(session *WebSocketSession) {
+	// Start goroutine to forward frames from client to agent
+	go func() {
+		defer func() {
+			// Cleanup session when client forwarding stops
+			webSocketMutex.Lock()
+			if session.Active {
+				session.Active = false
+				delete(webSocketSessions, session.ReqID)
+			}
+			webSocketMutex.Unlock()
+
+			// Send close notification to agent
+			closeFrame := WebSocketFrame{
+				Type:      "websocket_close",
+				ReqID:     session.ReqID,
+				Direction: "to_agent",
+			}
+			session.ServerConn.writeEncrypted(context.Background(), closeFrame)
+
+			log.Printf("SERVER WEBSOCKET: Client-to-agent forwarding stopped | ReqID: %s", session.ReqID)
+		}()
+
+		for session.Active {
+			// Read frame from client
+			msgType, data, err := session.ClientConn.Read(context.Background())
+			if err != nil {
+				closeStatus := websocket.CloseStatus(err)
+				if closeStatus != websocket.StatusNormalClosure && closeStatus != websocket.StatusGoingAway {
+					log.Printf("SERVER WEBSOCKET: Error reading from client | ReqID: %s | Error: %v", 
+						session.ReqID, err)
+				}
+				return
+			}
+
+			// Forward frame to agent
+			frame := WebSocketFrame{
+				Type:        "websocket_frame",
+				ReqID:       session.ReqID,
+				MessageType: int(msgType),
+				Data:        data,
+				Direction:   "to_agent",
+			}
+
+			if err := session.ServerConn.writeEncrypted(context.Background(), frame); err != nil {
+				log.Printf("SERVER WEBSOCKET: Error forwarding frame to agent | ReqID: %s | Error: %v", 
+					session.ReqID, err)
+				return
+			}
+
+			log.Printf("SERVER WEBSOCKET: Forwarded frame from client to agent | ReqID: %s | Type: %d | Size: %d bytes", 
+				session.ReqID, msgType, len(data))
+		}
+	}()
+
+	log.Printf("SERVER WEBSOCKET: Bidirectional forwarding started | ReqID: %s | TunnelID: %s", 
+		session.ReqID, session.TunnelID)
 }

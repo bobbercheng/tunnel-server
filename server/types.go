@@ -125,6 +125,15 @@ type TunnelInfoFrame struct {
 	Port     int    `json:"port"`     // for TCP tunnels
 }
 
+// WebSocketFrame is used for WebSocket frame forwarding
+type WebSocketFrame struct {
+	Type        string `json:"type"`         // "websocket_frame" or "websocket_close"
+	ReqID       string `json:"req_id"`       // request identifier
+	MessageType int    `json:"message_type"` // WebSocket message type (text, binary, etc.)
+	Data        []byte `json:"data"`         // frame data
+	Direction   string `json:"direction"`    // "to_server" or "to_client"
+}
+
 // Agent connection tracking
 type agentConn struct {
 	id          string

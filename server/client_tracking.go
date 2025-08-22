@@ -783,6 +783,20 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 	}
 
 	reqID := uuid.NewString()
+	// Detect WebSocket upgrade requests
+	isWebSocketUpgrade := strings.ToLower(r.Header.Get("Connection")) == "upgrade" &&
+		strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
+		r.Method == "GET"
+
+	// Detect streaming requests for buffer sizing and timeout logic
+	isStreamingRequest := strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+		strings.Contains(r.Header.Get("Accept"), "text/stream") ||
+		strings.Contains(r.Header.Get("Accept"), "application/stream") ||
+		strings.Contains(r.Header.Get("Content-Type"), "text/event-stream") ||
+		strings.Contains(r.URL.Path, "/api/agents/") || // AI endpoints are likely streaming
+		strings.Contains(r.URL.Path, "/stream") ||
+		strings.Contains(r.URL.Path, "/chat")
+
 	req := &ReqFrame{
 		Type:    "req",
 		ReqID:   reqID,
@@ -793,17 +807,41 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 		Body:    bodyBytes, // Use buffered body instead of consuming r.Body
 	}
 
-	respCh := make(chan *RespFrame, 1)
-	ac.registerWaiter(reqID, respCh)
-
-	// Use different timeouts for assets vs regular requests
-	timeout := 5 * time.Second
-	if isAsset {
-		timeout = 15 * time.Second // Longer timeout for asset requests
+	// Handle WebSocket upgrade requests
+	if isWebSocketUpgrade {
+		log.Printf("[TUNNEL ROUTING] WebSocket upgrade detected | TunnelID: %s | Path: %s | ReqID: %s", 
+			tunnelID, r.URL.Path, reqID)
+		// Use the same WebSocket upgrade handler from handlers.go
+		handleWebSocketUpgrade(w, r, req, ac, reqID)
+		return true // Successfully handled
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
+	// Use larger buffer for streaming responses to prevent channel blocking
+	bufferSize := 1
+	if isStreamingRequest {
+		bufferSize = 100 // Much larger buffer for streaming chunks
+	}
+	respCh := make(chan *RespFrame, bufferSize)
+	ac.registerWaiter(reqID, respCh)
+
+	// Use timeout only for non-streaming requests
+	var ctx context.Context
+	var cancel context.CancelFunc
+	
+	if isStreamingRequest {
+		// No artificial timeout for streaming - let client control connection lifecycle
+		ctx = r.Context()
+		log.Printf("[TUNNEL ROUTING] Using client-controlled timeout for streaming request | TunnelID: %s | Path: %s | Method: %s", 
+			tunnelID, r.URL.Path, r.Method)
+	} else {
+		// Regular requests get timeouts based on type
+		timeout := 5 * time.Second
+		if isAsset {
+			timeout = 15 * time.Second // Longer timeout for asset requests
+		}
+		ctx, cancel = context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+	}
 
 	// Send encrypted request
 	if err := ac.writeEncrypted(ctx, req); err != nil {
@@ -813,35 +851,107 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 		return false
 	}
 
-	log.Printf("[TUNNEL ROUTING] Request sent (buffered), waiting for response | TunnelID: %s | Path: %s | Timeout: %v",
-		tunnelID, r.URL.Path, timeout)
+	if isStreamingRequest {
+		log.Printf("[TUNNEL ROUTING] Request sent (buffered), waiting for response | TunnelID: %s | Path: %s | Timeout: client-controlled",
+			tunnelID, r.URL.Path)
+	} else {
+		timeout := 5 * time.Second
+		if isAsset {
+			timeout = 15 * time.Second
+		}
+		log.Printf("[TUNNEL ROUTING] Request sent (buffered), waiting for response | TunnelID: %s | Path: %s | Timeout: %v",
+			tunnelID, r.URL.Path, timeout)
+	}
 
 	select {
 	case resp := <-respCh:
-		duration := time.Since(startTime)
-		bodySize := len(resp.Body)
+		statusCode := resp.Status
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
 
-		// Tunnel routing succeeded - write response regardless of HTTP status
-		// The HTTP status code is the application's concern, not the tunnel's
-		log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
-			tunnelID, r.URL.Path, resp.Status, bodySize, duration)
-
-		// Write response
-		for k, vs := range resp.Headers {
-			for _, v := range vs {
-				w.Header().Add(k, v)
+		// Check if this is a streaming response
+		if resp.Type == "streaming_start" {
+			log.Printf("[TUNNEL ROUTING] Starting streaming response | TunnelID: %s | Path: %s | Status: %d", 
+				tunnelID, r.URL.Path, statusCode)
+			
+			// Set headers for streaming
+			for k, vs := range resp.Headers {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
 			}
+			w.WriteHeader(statusCode)
+			
+			// Flush headers to start streaming
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+
+			// Stream chunks in real-time
+			totalSize := int64(0)
+			for {
+				select {
+				case chunk := <-respCh:
+					if chunk.Type == "streaming_chunk" {
+						log.Printf("[TUNNEL ROUTING] Writing streaming chunk (%d bytes) | TunnelID: %s | Path: %s", 
+							len(chunk.Body), tunnelID, r.URL.Path)
+						n, err := w.Write(chunk.Body)
+						if err != nil {
+							log.Printf("[TUNNEL ROUTING] Error writing streaming chunk | TunnelID: %s | Path: %s | Error: %v", 
+								tunnelID, r.URL.Path, err)
+							return false
+						}
+						totalSize += int64(n)
+						
+						// Flush immediately for real-time streaming
+						if flusher, ok := w.(http.Flusher); ok {
+							flusher.Flush()
+						}
+					} else if chunk.Type == "streaming_end" {
+						duration := time.Since(startTime)
+						log.Printf("[TUNNEL ROUTING] STREAMING SUCCESS | TunnelID: %s | Path: %s | Status: %d | TotalSize: %d | Duration: %v",
+							tunnelID, r.URL.Path, statusCode, totalSize, duration)
+						return true
+					}
+				case <-ctx.Done():
+					log.Printf("[TUNNEL ROUTING] STREAMING TIMEOUT | TunnelID: %s | Path: %s", tunnelID, r.URL.Path)
+					return false
+				}
+			}
+		} else {
+			// Handle regular (non-streaming) response
+			duration := time.Since(startTime)
+			bodySize := len(resp.Body)
+
+			// Tunnel routing succeeded - write response regardless of HTTP status
+			// The HTTP status code is the application's concern, not the tunnel's
+			log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
+				tunnelID, r.URL.Path, statusCode, bodySize, duration)
+
+			// Write response
+			for k, vs := range resp.Headers {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(statusCode)
+			_, _ = w.Write(resp.Body)
+			return true
 		}
-		if resp.Status == 0 {
-			resp.Status = http.StatusOK
-		}
-		w.WriteHeader(resp.Status)
-		_, _ = w.Write(resp.Body)
-		return true
 	case <-ctx.Done():
 		duration := time.Since(startTime)
-		log.Printf("[TUNNEL ROUTING] TIMEOUT (buffered) | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v",
-			tunnelID, r.URL.Path, duration, timeout, r.Method, isAsset)
+		if isStreamingRequest {
+			log.Printf("[TUNNEL ROUTING] CLIENT DISCONNECT (buffered) | TunnelID: %s | Path: %s | Duration: %v | Method: %s | Asset: %v",
+				tunnelID, r.URL.Path, duration, r.Method, isAsset)
+		} else {
+			timeout := 5 * time.Second
+			if isAsset {
+				timeout = 15 * time.Second
+			}
+			log.Printf("[TUNNEL ROUTING] TIMEOUT (buffered) | TunnelID: %s | Path: %s | Duration: %v | Timeout: %v | Method: %s | Asset: %v",
+				tunnelID, r.URL.Path, duration, timeout, r.Method, isAsset)
+		}
 		return false
 	}
 }

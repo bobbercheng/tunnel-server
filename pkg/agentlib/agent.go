@@ -23,6 +23,15 @@ import (
 	"nhooyr.io/websocket/wsjson"
 )
 
+// WebSocketFrame is used for WebSocket frame forwarding
+type WebSocketFrame struct {
+	Type        string `json:"type"`         // "websocket_frame" or "websocket_close"
+	ReqID       string `json:"req_id"`       // request identifier
+	MessageType int    `json:"message_type"` // WebSocket message type (text, binary, etc.)
+	Data        []byte `json:"data"`         // frame data
+	Direction   string `json:"direction"`    // "to_server" or "to_client"
+}
+
 type RegisterResp struct {
 	ID          string `json:"id"`
 	Secret      string `json:"secret"`
@@ -566,6 +575,20 @@ func (a *Agent) runOnce() error {
 					continue
 				}
 				go a.handleTcpDisconnect(&frame)
+			case "websocket_frame":
+				var frame WebSocketFrame
+				if err := json.Unmarshal(plaintext, &frame); err != nil {
+					log.Printf("AGENT: Failed to parse WebSocket frame: %v", err)
+					continue
+				}
+				go a.handleWebSocketFrame(&frame)
+			case "websocket_close":
+				var frame WebSocketFrame
+				if err := json.Unmarshal(plaintext, &frame); err != nil {
+					log.Printf("AGENT: Failed to parse WebSocket close: %v", err)
+					continue
+				}
+				go a.handleWebSocketClose(&frame)
 			case "ping":
 				// Respond to server ping with pong
 				var pingFrame PingFrame
@@ -754,49 +777,141 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 }
 
 func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []byte, error) {
-	var buffer bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
+	// For streaming responses, return an indicator that streaming is in progress
+	// The actual streaming will be handled by the caller
+	return resp.StatusCode, resp.Header, []byte("STREAMING_RESPONSE"), nil
+}
 
-	go func() {
-		defer close(done)
-		buf := make([]byte, 4096)
-		totalRead := 0
-		maxSize := 8 * 1024 * 1024 // 8MB limit
+// handleStreamingRequest handles real-time streaming responses (SSE, etc.)
+func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, status int, headers map[string][]string, writeEncrypted func(v any) error) {
+	// Make a new HTTP request to get the actual response stream
+	target := a.LocalURL + req.Path
+	if req.Query != "" {
+		target += "?" + req.Query
+	}
 
-		for {
-			select {
-			case <-ctx.Done():
-				done <- ctx.Err()
-				return
-			default:
-				n, err := resp.Body.Read(buf)
-				if n > 0 {
-					if totalRead+n > maxSize {
-						done <- fmt.Errorf("streaming response too large (>8MB)")
-						return
-					}
-					buffer.Write(buf[:n])
-					totalRead += n
+	// Fix IPv6 localhost issue - force IPv4 localhost for better compatibility
+	target = strings.Replace(target, "http://localhost:", "http://127.0.0.1:", 1)
+	target = strings.Replace(target, "https://localhost:", "https://127.0.0.1:", 1)
+
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, bytes.NewReader(req.Body))
+	if err != nil {
+		log.Printf("AGENT STREAMING: Failed to create HTTP request | Target: %s | ReqID: %s | Error: %v",
+			target, req.ReqID, err)
+		return
+	}
+
+	// Copy headers
+	for k, vs := range req.Headers {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
+
+	// Create HTTP client
+	client := &http.Client{
+		Timeout: 0, // No timeout for streaming responses
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Force IPv4 for localhost connections to avoid IPv6 issues
+				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
+					return net.DialTimeout("tcp4", addr, 10*time.Second)
 				}
-				if err != nil {
-					if err == io.EOF {
-						done <- nil
-						return
+				return net.DialTimeout(network, addr, 10*time.Second)
+			},
+		},
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("AGENT STREAMING: HTTP request failed | Target: %s | ReqID: %s | Error: %v",
+			target, req.ReqID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("AGENT STREAMING: Stream established | ReqID: %s | Status: %d | ContentType: %s",
+		req.ReqID, resp.StatusCode, resp.Header.Get("Content-Type"))
+
+	// Send streaming start message with headers and status
+	startFrame := ChunkedRespFrame{
+		Type:        "streaming_start",
+		ReqID:       req.ReqID,
+		Status:      resp.StatusCode,
+		Headers:     resp.Header,
+		ChunkIndex:  0,
+		TotalChunks: -1, // Unknown for streaming
+		Data:        []byte{},
+		IsLast:      false,
+	}
+
+	if err := writeEncrypted(startFrame); err != nil {
+		log.Printf("AGENT STREAMING: Failed to send streaming_start | ReqID: %s | Error: %v", req.ReqID, err)
+		return
+	}
+
+	// Stream data in real-time
+	buf := make([]byte, 4096)
+	chunkIndex := 1
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("AGENT STREAMING: Context cancelled | ReqID: %s", req.ReqID)
+			return
+		default:
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				// Send chunk immediately
+				chunkFrame := ChunkedRespFrame{
+					Type:        "streaming_chunk",
+					ReqID:       req.ReqID,
+					Status:      resp.StatusCode,
+					Headers:     nil, // Headers only sent in start frame
+					ChunkIndex:  chunkIndex,
+					TotalChunks: -1, // Unknown for streaming
+					Data:        make([]byte, n),
+					IsLast:      false,
+				}
+				copy(chunkFrame.Data, buf[:n])
+
+				if err := writeEncrypted(chunkFrame); err != nil {
+					log.Printf("AGENT STREAMING: Failed to send chunk %d | ReqID: %s | Error: %v", chunkIndex, req.ReqID, err)
+					return
+				}
+
+				log.Printf("AGENT STREAMING: Sent chunk %d (%d bytes) | ReqID: %s", chunkIndex, n, req.ReqID)
+				chunkIndex++
+			}
+
+			if err != nil {
+				if err == io.EOF {
+					// Stream ended normally
+					endFrame := ChunkedRespFrame{
+						Type:        "streaming_end",
+						ReqID:       req.ReqID,
+						Status:      resp.StatusCode,
+						Headers:     nil,
+						ChunkIndex:  chunkIndex,
+						TotalChunks: chunkIndex,
+						Data:        []byte{},
+						IsLast:      true,
 					}
-					done <- err
+
+					if err := writeEncrypted(endFrame); err != nil {
+						log.Printf("AGENT STREAMING: Failed to send streaming_end | ReqID: %s | Error: %v", req.ReqID, err)
+					} else {
+						log.Printf("AGENT STREAMING: Stream completed successfully | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
+					}
+					return
+				} else {
+					// Stream error
+					log.Printf("AGENT STREAMING: Stream read error | ReqID: %s | Error: %v", req.ReqID, err)
 					return
 				}
 			}
 		}
-	}()
-
-	err := <-done
-	if err != nil && err != context.DeadlineExceeded {
-		return resp.StatusCode, resp.Header, buffer.Bytes(), nil
 	}
-	return resp.StatusCode, resp.Header, buffer.Bytes(), nil
 }
 
 // registerOverWebSocket performs registration over encrypted WebSocket connection
@@ -986,6 +1101,252 @@ func mustJSON(v any) []byte {
 	return b
 }
 
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade request
+func (a *Agent) isWebSocketUpgrade(req *ReqFrame) bool {
+	// Check for WebSocket upgrade headers
+	var connection, upgrade string
+	if conn, exists := req.Headers["Connection"]; exists && len(conn) > 0 {
+		connection = conn[0]
+	}
+	if up, exists := req.Headers["Upgrade"]; exists && len(up) > 0 {
+		upgrade = up[0]
+	}
+	
+	// WebSocket upgrade requires:
+	// 1. Connection: upgrade (case-insensitive)
+	// 2. Upgrade: websocket (case-insensitive)
+	// 3. Usually GET method
+	return strings.ToLower(connection) == "upgrade" &&
+		strings.ToLower(upgrade) == "websocket" &&
+		req.Method == "GET"
+}
+
+// handleWebSocketUpgrade handles WebSocket upgrade and establishes bidirectional forwarding
+func (a *Agent) handleWebSocketUpgrade(ctx context.Context, req *ReqFrame, writeEncrypted func(v any) error) {
+	// Step 1: Establish WebSocket connection to local service
+	localConn, err := a.establishLocalWebSocket(req)
+	if err != nil {
+		log.Printf("AGENT WEBSOCKET: Failed to establish local WebSocket connection | ReqID: %s | Error: %v",
+			req.ReqID, err)
+		// Send error response
+		resp := RespFrame{
+			Type:    "resp",
+			ReqID:   req.ReqID,
+			Status:  http.StatusBadGateway,
+			Headers: map[string][]string{"Content-Type": {"text/plain"}},
+			Body:    []byte("WebSocket upgrade failed"),
+		}
+		writeEncrypted(resp)
+		return
+	}
+	defer localConn.Close(websocket.StatusNormalClosure, "Agent connection closed")
+
+	// Step 2: Send successful upgrade response to server
+	resp := RespFrame{
+		Type:    "websocket_upgrade_success",
+		ReqID:   req.ReqID,
+		Status:  http.StatusSwitchingProtocols,
+		Headers: map[string][]string{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body: []byte{},
+	}
+	
+	if err := writeEncrypted(resp); err != nil {
+		log.Printf("AGENT WEBSOCKET: Failed to send upgrade response | ReqID: %s | Error: %v", 
+			req.ReqID, err)
+		return
+	}
+
+	log.Printf("AGENT WEBSOCKET: Upgrade successful, starting bidirectional forwarding | ReqID: %s", 
+		req.ReqID)
+
+	// Step 3: Start bidirectional WebSocket frame forwarding
+	a.forwardWebSocketFrames(ctx, req.ReqID, localConn, writeEncrypted)
+}
+
+// establishLocalWebSocket establishes WebSocket connection to local service
+func (a *Agent) establishLocalWebSocket(req *ReqFrame) (*websocket.Conn, error) {
+	// Build WebSocket URL
+	target := strings.Replace(a.LocalURL, "http://", "ws://", 1)
+	target = strings.Replace(target, "https://", "wss://", 1)
+	target += req.Path
+	if req.Query != "" {
+		target += "?" + req.Query
+	}
+
+	// Fix IPv6 localhost issue
+	target = strings.Replace(target, "ws://localhost:", "ws://127.0.0.1:", 1)
+	target = strings.Replace(target, "wss://localhost:", "wss://127.0.0.1:", 1)
+
+	log.Printf("AGENT WEBSOCKET: Connecting to local service | Target: %s | ReqID: %s", 
+		target, req.ReqID)
+
+	// Prepare headers for WebSocket connection
+	headers := http.Header{}
+	for k, vs := range req.Headers {
+		// Skip upgrade-related headers - they'll be set by websocket client
+		if strings.ToLower(k) == "connection" || 
+		   strings.ToLower(k) == "upgrade" ||
+		   strings.ToLower(k) == "sec-websocket-key" ||
+		   strings.ToLower(k) == "sec-websocket-version" {
+			continue
+		}
+		for _, v := range vs {
+			headers.Add(k, v)
+		}
+	}
+
+	// Establish WebSocket connection
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, target, &websocket.DialOptions{
+		HTTPHeader: headers,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial local WebSocket: %w", err)
+	}
+
+	// Register connection for bidirectional forwarding
+	webSocketMutex.Lock()
+	webSocketConnections[req.ReqID] = conn
+	webSocketMutex.Unlock()
+
+	return conn, nil
+}
+
+// forwardWebSocketFrames handles bidirectional WebSocket frame forwarding
+func (a *Agent) forwardWebSocketFrames(ctx context.Context, reqID string, localConn *websocket.Conn, writeEncrypted func(v any) error) {
+	// Create context for WebSocket forwarding
+	wsCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Channel to signal completion
+	done := make(chan struct{})
+	errorChan := make(chan error, 2)
+
+	// Forward frames from local WebSocket to tunnel server
+	go func() {
+		defer func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}()
+
+		for {
+			select {
+			case <-wsCtx.Done():
+				return
+			default:
+			}
+
+			// Read frame from local WebSocket
+			msgType, data, err := localConn.Read(wsCtx)
+			if err != nil {
+				closeStatus := websocket.CloseStatus(err)
+				if closeStatus != websocket.StatusNormalClosure && closeStatus != websocket.StatusGoingAway {
+					log.Printf("AGENT WEBSOCKET: Error reading from local WebSocket | ReqID: %s | Error: %v", 
+						reqID, err)
+					errorChan <- err
+				}
+				return
+			}
+
+			// Forward frame to tunnel server
+			frame := WebSocketFrame{
+				Type:        "websocket_frame",
+				ReqID:       reqID,
+				MessageType: int(msgType),
+				Data:        data,
+				Direction:   "to_server", // local -> server
+			}
+
+			if err := writeEncrypted(frame); err != nil {
+				log.Printf("AGENT WEBSOCKET: Error forwarding frame to server | ReqID: %s | Error: %v", 
+					reqID, err)
+				errorChan <- err
+				return
+			}
+
+			log.Printf("AGENT WEBSOCKET: Forwarded frame to server | ReqID: %s | Type: %d | Size: %d bytes", 
+				reqID, msgType, len(data))
+		}
+	}()
+
+	// Wait for completion or error
+	select {
+	case <-done:
+		log.Printf("AGENT WEBSOCKET: Frame forwarding completed | ReqID: %s", reqID)
+	case err := <-errorChan:
+		log.Printf("AGENT WEBSOCKET: Frame forwarding failed | ReqID: %s | Error: %v", reqID, err)
+	case <-wsCtx.Done():
+		log.Printf("AGENT WEBSOCKET: Frame forwarding cancelled | ReqID: %s", reqID)
+	}
+
+	// Send close frame to server
+	closeFrame := WebSocketFrame{
+		Type:      "websocket_close",
+		ReqID:     reqID,
+		Direction: "to_server",
+	}
+	writeEncrypted(closeFrame)
+}
+
+// WebSocket connection tracking
+var (
+	webSocketConnections = make(map[string]*websocket.Conn)
+	webSocketMutex       sync.RWMutex
+)
+
+// handleWebSocketFrame forwards frames from server to local WebSocket
+func (a *Agent) handleWebSocketFrame(frame *WebSocketFrame) {
+	webSocketMutex.RLock()
+	conn, exists := webSocketConnections[frame.ReqID]
+	webSocketMutex.RUnlock()
+
+	if !exists {
+		log.Printf("AGENT WEBSOCKET: No local connection found for ReqID: %s", frame.ReqID)
+		return
+	}
+
+	// Forward frame to local WebSocket
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := conn.Write(ctx, websocket.MessageType(frame.MessageType), frame.Data)
+	if err != nil {
+		log.Printf("AGENT WEBSOCKET: Error writing frame to local WebSocket | ReqID: %s | Error: %v", 
+			frame.ReqID, err)
+		// Remove failed connection
+		webSocketMutex.Lock()
+		delete(webSocketConnections, frame.ReqID)
+		webSocketMutex.Unlock()
+		conn.Close(websocket.StatusInternalError, "Write failed")
+		return
+	}
+
+	log.Printf("AGENT WEBSOCKET: Forwarded frame from server to local | ReqID: %s | Type: %d | Size: %d bytes", 
+		frame.ReqID, frame.MessageType, len(frame.Data))
+}
+
+// handleWebSocketClose handles WebSocket close from server
+func (a *Agent) handleWebSocketClose(frame *WebSocketFrame) {
+	webSocketMutex.Lock()
+	conn, exists := webSocketConnections[frame.ReqID]
+	if exists {
+		delete(webSocketConnections, frame.ReqID)
+	}
+	webSocketMutex.Unlock()
+
+	if exists {
+		log.Printf("AGENT WEBSOCKET: Closing local WebSocket connection | ReqID: %s", frame.ReqID)
+		conn.Close(websocket.StatusNormalClosure, "Server closed connection")
+	}
+}
+
 // handleHttpRequest processes HTTP requests (existing logic)
 func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncrypted func(v any) error, wg *sync.WaitGroup) {
 	wg.Add(1)
@@ -999,7 +1360,23 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 		default:
 		}
 
+		// Check for WebSocket upgrade request
+		if a.isWebSocketUpgrade(req) {
+			log.Printf("AGENT: WebSocket upgrade detected | ReqID: %s | TunnelID: %s | Path: %s",
+				req.ReqID, a.ID, req.Path)
+			a.handleWebSocketUpgrade(ctx, req, writeEncrypted)
+			return
+		}
+
 		status, hdr, body, ferr := a.forward(req)
+
+		// Check if this is a streaming response
+		if ferr == nil && string(body) == "STREAMING_RESPONSE" {
+			log.Printf("AGENT: Starting streaming response | ReqID: %s | TunnelID: %s | Status: %d",
+				req.ReqID, a.ID, status)
+			a.handleStreamingRequest(ctx, req, status, hdr, writeEncrypted)
+			return
+		}
 
 		resp := RespFrame{
 			Type:    "resp",

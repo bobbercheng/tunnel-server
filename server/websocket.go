@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -466,6 +467,18 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		ac.handleResponse(data)
 	case "chunked_resp":
 		ac.handleChunkedResponse(data)
+	case "streaming_start":
+		ac.handleStreamingStart(data)
+	case "streaming_chunk":
+		ac.handleStreamingChunk(data)
+	case "streaming_end":
+		ac.handleStreamingEnd(data)
+	case "websocket_upgrade_success":
+		ac.handleWebSocketUpgradeSuccess(data)
+	case "websocket_frame":
+		ac.handleWebSocketFrame(data)
+	case "websocket_close":
+		ac.handleWebSocketClose(data)
 	case "tcp_data":
 		ac.handleTCPData(data)
 	case "tcp_disconnect":
@@ -867,9 +880,237 @@ func schedulePeriodicConnectionValidation() {
 	}()
 }
 
+// handleStreamingStart processes the start of a streaming response
+func (ac *agentConn) handleStreamingStart(data []byte) {
+	var frame ChunkedRespFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		log.Printf("Failed to parse streaming_start from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("SERVER STREAMING: Starting stream | ReqID: %s | AgentID: %s | Status: %d", 
+		frame.ReqID, ac.id, frame.Status)
+
+	// Get the waiting HTTP response writer
+	ac.respMu.Lock()
+	ch, exists := ac.waiters[frame.ReqID]
+	if !exists {
+		ac.respMu.Unlock()
+		log.Printf("SERVER STREAMING: No waiter found for streaming start | ReqID: %s | AgentID: %s", 
+			frame.ReqID, ac.id)
+		return
+	}
+	
+	// Send initial response to start streaming
+	resp := &RespFrame{
+		Type:    "streaming_start",
+		ReqID:   frame.ReqID,
+		Status:  frame.Status,
+		Headers: frame.Headers,
+		Body:    []byte{}, // Empty body for start frame
+	}
+	
+	// Send to waiter without removing it (streaming continues)
+	select {
+	case ch <- resp:
+		log.Printf("SERVER STREAMING: Sent streaming_start to waiter | ReqID: %s", frame.ReqID)
+	default:
+		log.Printf("SERVER STREAMING: Failed to send streaming_start (channel full) | ReqID: %s", frame.ReqID)
+	}
+	ac.respMu.Unlock()
+}
+
+// handleStreamingChunk processes streaming data chunks
+func (ac *agentConn) handleStreamingChunk(data []byte) {
+	var frame ChunkedRespFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		log.Printf("Failed to parse streaming_chunk from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("SERVER STREAMING: Received chunk %d (%d bytes) | ReqID: %s | AgentID: %s", 
+		frame.ChunkIndex, len(frame.Data), frame.ReqID, ac.id)
+
+	// Get the waiting HTTP response writer
+	ac.respMu.Lock()
+	ch, exists := ac.waiters[frame.ReqID]
+	if !exists {
+		ac.respMu.Unlock()
+		log.Printf("SERVER STREAMING: No waiter found for streaming chunk | ReqID: %s | AgentID: %s", 
+			frame.ReqID, ac.id)
+		return
+	}
+	
+	// Send chunk data immediately 
+	resp := &RespFrame{
+		Type:    "streaming_chunk",
+		ReqID:   frame.ReqID,
+		Status:  frame.Status,
+		Headers: nil, // Headers only in start frame
+		Body:    frame.Data,
+	}
+	
+	// Send to waiter without removing it (streaming continues)
+	select {
+	case ch <- resp:
+		log.Printf("SERVER STREAMING: Sent chunk %d to waiter | ReqID: %s", frame.ChunkIndex, frame.ReqID)
+	default:
+		log.Printf("SERVER STREAMING: Failed to send chunk (channel full) | ReqID: %s", frame.ReqID)
+	}
+	ac.respMu.Unlock()
+}
+
+// handleStreamingEnd processes the end of a streaming response
+func (ac *agentConn) handleStreamingEnd(data []byte) {
+	var frame ChunkedRespFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		log.Printf("Failed to parse streaming_end from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("SERVER STREAMING: Stream ended | ReqID: %s | AgentID: %s | TotalChunks: %d", 
+		frame.ReqID, ac.id, frame.TotalChunks)
+
+	// Get the waiting HTTP response writer and remove it
+	ac.respMu.Lock()
+	ch, exists := ac.waiters[frame.ReqID]
+	if exists {
+		delete(ac.waiters, frame.ReqID)
+	}
+	ac.respMu.Unlock()
+
+	if !exists {
+		log.Printf("SERVER STREAMING: No waiter found for streaming end | ReqID: %s | AgentID: %s", 
+			frame.ReqID, ac.id)
+		return
+	}
+	
+	// Send end signal
+	resp := &RespFrame{
+		Type:    "streaming_end",
+		ReqID:   frame.ReqID,
+		Status:  frame.Status,
+		Headers: nil,
+		Body:    []byte{}, // Empty body for end frame
+	}
+	
+	// Send final response and close channel
+	select {
+	case ch <- resp:
+		log.Printf("SERVER STREAMING: Sent streaming_end to waiter | ReqID: %s", frame.ReqID)
+	default:
+		log.Printf("SERVER STREAMING: Failed to send streaming_end (channel full) | ReqID: %s", frame.ReqID)
+	}
+	close(ch)
+}
+
 // getAgent retrieves an agent connection by ID
 func getAgent(id string) *agentConn {
 	agentsMu.RLock()
 	defer agentsMu.RUnlock()
 	return agents[id]
+}
+
+// WebSocket connection tracking
+var (
+	webSocketSessions = make(map[string]*WebSocketSession) // reqID -> session
+	webSocketMutex    sync.RWMutex
+)
+
+type WebSocketSession struct {
+	ReqID      string
+	TunnelID   string
+	ClientConn *websocket.Conn // Connection to client
+	ServerConn *agentConn      // Connection to agent
+	CreatedAt  time.Time
+	Active     bool
+}
+
+// handleWebSocketUpgradeSuccess handles successful WebSocket upgrade from agent
+func (ac *agentConn) handleWebSocketUpgradeSuccess(data []byte) {
+	var resp RespFrame
+	if err := json.Unmarshal(data, &resp); err != nil {
+		log.Printf("Failed to parse WebSocket upgrade response from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("SERVER WEBSOCKET: Upgrade successful from agent | AgentID: %s | ReqID: %s", 
+		ac.id, resp.ReqID)
+
+	// Find the waiting client connection and upgrade it
+	ac.respMu.Lock()
+	ch, exists := ac.waiters[resp.ReqID]
+	if exists {
+		delete(ac.waiters, resp.ReqID)
+	}
+	ac.respMu.Unlock()
+
+	if exists {
+		select {
+		case ch <- &resp:
+			log.Printf("SERVER WEBSOCKET: Sent upgrade success to waiter | ReqID: %s", resp.ReqID)
+		case <-time.After(1 * time.Second):
+			log.Printf("SERVER WEBSOCKET: Timeout sending upgrade response | ReqID: %s", resp.ReqID)
+		}
+	} else {
+		log.Printf("SERVER WEBSOCKET: No waiter found for upgrade response | ReqID: %s", resp.ReqID)
+	}
+}
+
+// handleWebSocketFrame handles WebSocket frames from agent to client
+func (ac *agentConn) handleWebSocketFrame(data []byte) {
+	var frame WebSocketFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		log.Printf("Failed to parse WebSocket frame from agent %s: %v", ac.id, err)
+		return
+	}
+
+	webSocketMutex.RLock()
+	session, exists := webSocketSessions[frame.ReqID]
+	webSocketMutex.RUnlock()
+
+	if !exists || !session.Active {
+		log.Printf("SERVER WEBSOCKET: No active session found for frame | ReqID: %s", frame.ReqID)
+		return
+	}
+
+	// Forward frame to client
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := session.ClientConn.Write(ctx, websocket.MessageType(frame.MessageType), frame.Data)
+	if err != nil {
+		log.Printf("SERVER WEBSOCKET: Error writing frame to client | ReqID: %s | Error: %v", 
+			frame.ReqID, err)
+		// Mark session as inactive
+		webSocketMutex.Lock()
+		session.Active = false
+		webSocketMutex.Unlock()
+		return
+	}
+
+	log.Printf("SERVER WEBSOCKET: Forwarded frame from agent to client | ReqID: %s | Type: %d | Size: %d bytes", 
+		frame.ReqID, frame.MessageType, len(frame.Data))
+}
+
+// handleWebSocketClose handles WebSocket close from agent
+func (ac *agentConn) handleWebSocketClose(data []byte) {
+	var frame WebSocketFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		log.Printf("Failed to parse WebSocket close from agent %s: %v", ac.id, err)
+		return
+	}
+
+	webSocketMutex.Lock()
+	session, exists := webSocketSessions[frame.ReqID]
+	if exists {
+		session.Active = false
+		delete(webSocketSessions, frame.ReqID)
+	}
+	webSocketMutex.Unlock()
+
+	if exists && session.ClientConn != nil {
+		log.Printf("SERVER WEBSOCKET: Closing client connection | ReqID: %s", frame.ReqID)
+		session.ClientConn.Close(websocket.StatusNormalClosure, "Agent closed connection")
+	}
 }
