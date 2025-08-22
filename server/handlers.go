@@ -137,6 +137,11 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		strings.Contains(r.URL.Path, "/chat")
 
 	reqID := uuid.NewString()
+
+	// DIAGNOSTIC: Log routing path entry
+	log.Printf("[ROUTING PATH] DIRECT HANDLER entered for %s -> tunnel %s | ContentType: %s | UserAgent: %s | ReqID: %s", 
+		r.URL.Path, id, r.Header.Get("Content-Type"), r.Header.Get("User-Agent"), reqID)
+
 	req := &ReqFrame{
 		Type:    "req",
 		ReqID:   reqID,

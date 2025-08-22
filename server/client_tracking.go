@@ -783,6 +783,11 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 	}
 
 	reqID := uuid.NewString()
+	
+	// DIAGNOSTIC: Log routing path entry
+	log.Printf("[ROUTING PATH] SMART ROUTING entered for %s -> tunnel %s | ContentType: %s | UserAgent: %s | ReqID: %s", 
+		r.URL.Path, tunnelID, r.Header.Get("Content-Type"), r.Header.Get("User-Agent"), reqID)
+
 	// Detect WebSocket upgrade requests
 	isWebSocketUpgrade := strings.ToLower(r.Header.Get("Connection")) == "upgrade" &&
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&

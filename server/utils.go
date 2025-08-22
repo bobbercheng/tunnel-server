@@ -842,7 +842,7 @@ continueRouting:
 	// ULTIMATE FALLBACK: Try each tunnel with extended timeout for any missed requests
 	if len(tunnelIDs) > 0 {
 		tunnelID := tunnelIDs[0]
-		log.Printf("Smart routing: ULTIMATE FALLBACK - trying tunnel %s for %s", tunnelID, r.URL.Path)
+		log.Printf("[ROUTING PATH] ULTIMATE FALLBACK entered for %s -> tunnel %s | ContentType: %s | UserAgent: %s", r.URL.Path, tunnelID, r.Header.Get("Content-Type"), r.Header.Get("User-Agent"))
 
 		// Create final request with original body
 		finalReq := r.Clone(r.Context())
@@ -893,16 +893,45 @@ continueRouting:
 						recordClientAssetMapping(clientKey, tunnelID)
 					}
 
+					// DIAGNOSTIC: Log headers received from agent in ultimate fallback
+					log.Printf("[ULTIMATE FALLBACK] Headers from agent | TunnelID: %s | Path: %s | Headers: %+v", tunnelID, r.URL.Path, resp.Headers)
+
+					// DIAGNOSTIC: Check content-type specifically in ultimate fallback
+					if contentType, exists := resp.Headers["Content-Type"]; exists {
+						log.Printf("[ULTIMATE FALLBACK] Content-Type from agent | TunnelID: %s | Path: %s | ContentType: %v", tunnelID, r.URL.Path, contentType)
+					}
+
 					// Write response
 					for k, vs := range resp.Headers {
 						for _, v := range vs {
 							w.Header().Add(k, v)
 						}
 					}
+
+					// CRITICAL FIX: Ensure Content-Type is explicitly set to prevent Go's auto-detection
+					// This is the MISSING Content-Type protection that was causing the issue!
+					if contentTypeHeaders := w.Header().Values("Content-Type"); len(contentTypeHeaders) == 0 {
+						// No Content-Type header found, set default for streaming
+						w.Header().Set("Content-Type", "text/event-stream")
+						log.Printf("[ULTIMATE FALLBACK] CONTENT-TYPE FIX - No Content-Type found, setting default | TunnelID: %s | Path: %s", tunnelID, r.URL.Path)
+					} else {
+						// Content-Type exists, ensure it's properly set (not just added)
+						existingContentType := contentTypeHeaders[0]
+						w.Header().Set("Content-Type", existingContentType)
+						log.Printf("[ULTIMATE FALLBACK] CONTENT-TYPE FIX - Reinforcing existing Content-Type | TunnelID: %s | Path: %s | ContentType: %s", tunnelID, r.URL.Path, existingContentType)
+					}
+
+					// DIAGNOSTIC: Log headers after Content-Type protection
+					log.Printf("[ULTIMATE FALLBACK] Headers set on response writer (after Content-Type fix) | TunnelID: %s | Path: %s | Headers: %+v", tunnelID, r.URL.Path, w.Header())
+
 					if resp.Status == 0 {
 						resp.Status = http.StatusOK
 					}
 					w.WriteHeader(resp.Status)
+
+					// DIAGNOSTIC: Log final response headers after WriteHeader  
+					log.Printf("[ULTIMATE FALLBACK] Final response headers sent to client | TunnelID: %s | Path: %s | Status: %d | Headers: %+v", tunnelID, r.URL.Path, resp.Status, w.Header())
+
 					_, _ = w.Write(resp.Body)
 
 					log.Printf("Smart routing: %s -> tunnel %s (ultimate-fallback-EXTENDED-SUCCESS)", r.URL.Path, tunnelID)
