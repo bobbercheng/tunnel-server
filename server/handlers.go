@@ -149,7 +149,7 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Handle WebSocket upgrade requests
 	if isWebSocketUpgrade {
-		log.Printf("SERVER WEBSOCKET: Upgrade request detected | Path: %s | ReqID: %s", 
+		log.Printf("SERVER WEBSOCKET: Upgrade request detected | Path: %s | ReqID: %s",
 			r.URL.Path, reqID)
 		handleWebSocketUpgrade(w, r, req, ac, reqID)
 		return
@@ -166,11 +166,11 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 	// Use timeout only for non-streaming requests
 	var ctx context.Context
 	var cancel context.CancelFunc
-	
+
 	if isStreamingRequest {
 		// No artificial timeout for streaming - let client control connection lifecycle
 		ctx = r.Context()
-		log.Printf("SERVER: Using client-controlled timeout for streaming request | Path: %s | Method: %s", 
+		log.Printf("SERVER: Using client-controlled timeout for streaming request | Path: %s | Method: %s",
 			r.URL.Path, r.Method)
 	} else {
 		// Regular requests get 60-second timeout
@@ -196,21 +196,37 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a streaming response
 		if resp.Type == "streaming_start" {
 			log.Printf("SERVER: Starting streaming response | ReqID: %s | Status: %d", reqID, statusCode)
-			
+
+			// DIAGNOSTIC: Log headers received from agent
+			log.Printf("SERVER: Streaming headers from agent | ReqID: %s | Headers: %+v", reqID, resp.Headers)
+
+			// DIAGNOSTIC: Check content-type specifically
+			if contentType, exists := resp.Headers["Content-Type"]; exists {
+				log.Printf("SERVER: Streaming Content-Type from agent | ReqID: %s | ContentType: %v", reqID, contentType)
+			}
+
 			// Set headers for streaming
 			for k, vs := range resp.Headers {
 				for _, v := range vs {
 					w.Header().Add(k, v)
 				}
 			}
+
+			// DIAGNOSTIC: Log headers after setting them
+			log.Printf("SERVER: Streaming headers set on writer | ReqID: %s | Headers: %+v", reqID, w.Header())
+
 			w.WriteHeader(statusCode)
-			
+
+			// DIAGNOSTIC: Log final response headers after WriteHeader
+			log.Printf("SERVER: Final streaming response headers sent to client | ReqID: %s | Status: %d | Headers: %+v",
+				reqID, statusCode, w.Header())
+
 			// Flush headers to start streaming
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
 
-			// Record initial metrics  
+			// Record initial metrics
 			clientIP := extractRealClientIP(r)
 			clientKey := generateClientKey(r)
 			clientTracker.RecordSuccess(clientKey, id)
@@ -233,19 +249,19 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 						totalSize += int64(n)
-						
+
 						// Flush immediately for real-time streaming
 						if flusher, ok := w.(http.Flusher); ok {
 							flusher.Flush()
 						}
 					} else if chunk.Type == "streaming_end" {
 						log.Printf("SERVER: Streaming response completed | ReqID: %s | TotalSize: %d bytes", reqID, totalSize)
-						
+
 						// Record final metrics
 						duration := time.Since(startTime).Seconds()
 						requestSize := int64(len(body))
 						tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, totalSize)
-						
+
 						// Record geographic request if we have geolocation data
 						if country := getCountryFromIP(clientIP); country != "" {
 							tunnelMetrics.RecordGeographicRequest(id, country)
@@ -472,14 +488,14 @@ func handleWebSocketUpgrade(w http.ResponseWriter, r *http.Request, req *ReqFram
 		return
 	}
 
-	log.Printf("SERVER WEBSOCKET: Sent upgrade request to agent | ReqID: %s | AgentID: %s", 
+	log.Printf("SERVER WEBSOCKET: Sent upgrade request to agent | ReqID: %s | AgentID: %s",
 		reqID, ac.id)
 
 	// Step 2: Wait for agent response
 	select {
 	case resp := <-respCh:
 		if resp.Type != "websocket_upgrade_success" {
-			log.Printf("SERVER WEBSOCKET: Agent upgrade failed | ReqID: %s | Status: %d", 
+			log.Printf("SERVER WEBSOCKET: Agent upgrade failed | ReqID: %s | Status: %d",
 				reqID, resp.Status)
 			http.Error(w, "WebSocket upgrade failed at agent", http.StatusBadGateway)
 			return
@@ -490,7 +506,7 @@ func handleWebSocketUpgrade(w http.ResponseWriter, r *http.Request, req *ReqFram
 		// Step 3: Upgrade client connection to WebSocket
 		clientConn, err := upgradeClientToWebSocket(w, r)
 		if err != nil {
-			log.Printf("SERVER WEBSOCKET: Failed to upgrade client connection | ReqID: %s | Error: %v", 
+			log.Printf("SERVER WEBSOCKET: Failed to upgrade client connection | ReqID: %s | Error: %v",
 				reqID, err)
 			return
 		}
@@ -527,7 +543,7 @@ func handleWebSocketUpgrade(w http.ResponseWriter, r *http.Request, req *ReqFram
 func upgradeClientToWebSocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
 	// Accept WebSocket connection from client
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // For development - should be configurable
+		InsecureSkipVerify: true,          // For development - should be configurable
 		OriginPatterns:     []string{"*"}, // Allow all origins for now
 	})
 	if err != nil {
@@ -567,7 +583,7 @@ func startWebSocketForwarding(session *WebSocketSession) {
 			if err != nil {
 				closeStatus := websocket.CloseStatus(err)
 				if closeStatus != websocket.StatusNormalClosure && closeStatus != websocket.StatusGoingAway {
-					log.Printf("SERVER WEBSOCKET: Error reading from client | ReqID: %s | Error: %v", 
+					log.Printf("SERVER WEBSOCKET: Error reading from client | ReqID: %s | Error: %v",
 						session.ReqID, err)
 				}
 				return
@@ -583,16 +599,16 @@ func startWebSocketForwarding(session *WebSocketSession) {
 			}
 
 			if err := session.ServerConn.writeEncrypted(context.Background(), frame); err != nil {
-				log.Printf("SERVER WEBSOCKET: Error forwarding frame to agent | ReqID: %s | Error: %v", 
+				log.Printf("SERVER WEBSOCKET: Error forwarding frame to agent | ReqID: %s | Error: %v",
 					session.ReqID, err)
 				return
 			}
 
-			log.Printf("SERVER WEBSOCKET: Forwarded frame from client to agent | ReqID: %s | Type: %d | Size: %d bytes", 
+			log.Printf("SERVER WEBSOCKET: Forwarded frame from client to agent | ReqID: %s | Type: %d | Size: %d bytes",
 				session.ReqID, msgType, len(data))
 		}
 	}()
 
-	log.Printf("SERVER WEBSOCKET: Bidirectional forwarding started | ReqID: %s | TunnelID: %s", 
+	log.Printf("SERVER WEBSOCKET: Bidirectional forwarding started | ReqID: %s | TunnelID: %s",
 		session.ReqID, session.TunnelID)
 }

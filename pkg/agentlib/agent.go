@@ -745,10 +745,23 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 	log.Printf("FORWARD SUCCESS: Received response | Target: %s | ReqID: %s | Status: %d | ContentType: %s",
 		target, rd.ReqID, resp.StatusCode, resp.Header.Get("Content-Type"))
 
+	// DIAGNOSTIC: Log all headers for analysis
+	log.Printf("FORWARD: All response headers | Target: %s | ReqID: %s | Headers: %+v",
+		target, rd.ReqID, resp.Header)
+
 	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "text/event-stream") ||
-		strings.Contains(contentType, "text/stream") ||
-		strings.Contains(contentType, "application/stream") {
+
+	// DIAGNOSTIC: Log streaming detection analysis
+	isEventStream := strings.Contains(contentType, "text/event-stream")
+	isTextStream := strings.Contains(contentType, "text/stream")
+	isAppStream := strings.Contains(contentType, "application/stream")
+
+	log.Printf("FORWARD: Streaming detection analysis | Target: %s | ReqID: %s | ContentType: '%s' | IsEventStream: %v | IsTextStream: %v | IsAppStream: %v",
+		target, rd.ReqID, contentType, isEventStream, isTextStream, isAppStream)
+
+	if isEventStream || isTextStream || isAppStream {
+		log.Printf("FORWARD: Detected streaming response, calling handleStreamingResponse | Target: %s | ReqID: %s",
+			target, rd.ReqID)
 		return handleStreamingResponse(resp)
 	}
 
@@ -777,6 +790,10 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 }
 
 func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []byte, error) {
+	// DIAGNOSTIC: Log what we're returning for streaming responses
+	log.Printf("handleStreamingResponse: Called for streaming response | Status: %d | ContentType: %s | Headers: %+v",
+		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header)
+
 	// For streaming responses, return an indicator that streaming is in progress
 	// The actual streaming will be handled by the caller
 	return resp.StatusCode, resp.Header, []byte("STREAMING_RESPONSE"), nil
@@ -833,6 +850,16 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 	log.Printf("AGENT STREAMING: Stream established | ReqID: %s | Status: %d | ContentType: %s",
 		req.ReqID, resp.StatusCode, resp.Header.Get("Content-Type"))
 
+	// DIAGNOSTIC: Log all headers received from local service
+	log.Printf("AGENT STREAMING: All headers from local service | ReqID: %s | Headers: %+v", req.ReqID, resp.Header)
+
+	// DIAGNOSTIC: Check if content-type is what we expect for streaming
+	contentType := resp.Header.Get("Content-Type")
+	log.Printf("AGENT STREAMING: Content-Type analysis | ReqID: %s | ContentType: '%s' | IsEventStream: %v | IsStream: %v",
+		req.ReqID, contentType,
+		strings.Contains(contentType, "text/event-stream"),
+		strings.Contains(contentType, "text/stream") || strings.Contains(contentType, "application/stream"))
+
 	// Send streaming start message with headers and status
 	startFrame := ChunkedRespFrame{
 		Type:        "streaming_start",
@@ -844,6 +871,9 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 		Data:        []byte{},
 		IsLast:      false,
 	}
+
+	// DIAGNOSTIC: Log what we're sending in the streaming_start frame
+	log.Printf("AGENT STREAMING: Sending streaming_start frame | ReqID: %s | Headers: %+v", req.ReqID, startFrame.Headers)
 
 	if err := writeEncrypted(startFrame); err != nil {
 		log.Printf("AGENT STREAMING: Failed to send streaming_start | ReqID: %s | Error: %v", req.ReqID, err)
@@ -1111,7 +1141,7 @@ func (a *Agent) isWebSocketUpgrade(req *ReqFrame) bool {
 	if up, exists := req.Headers["Upgrade"]; exists && len(up) > 0 {
 		upgrade = up[0]
 	}
-	
+
 	// WebSocket upgrade requires:
 	// 1. Connection: upgrade (case-insensitive)
 	// 2. Upgrade: websocket (case-insensitive)
@@ -1143,23 +1173,23 @@ func (a *Agent) handleWebSocketUpgrade(ctx context.Context, req *ReqFrame, write
 
 	// Step 2: Send successful upgrade response to server
 	resp := RespFrame{
-		Type:    "websocket_upgrade_success",
-		ReqID:   req.ReqID,
-		Status:  http.StatusSwitchingProtocols,
+		Type:   "websocket_upgrade_success",
+		ReqID:  req.ReqID,
+		Status: http.StatusSwitchingProtocols,
 		Headers: map[string][]string{
 			"Upgrade":    {"websocket"},
 			"Connection": {"Upgrade"},
 		},
 		Body: []byte{},
 	}
-	
+
 	if err := writeEncrypted(resp); err != nil {
-		log.Printf("AGENT WEBSOCKET: Failed to send upgrade response | ReqID: %s | Error: %v", 
+		log.Printf("AGENT WEBSOCKET: Failed to send upgrade response | ReqID: %s | Error: %v",
 			req.ReqID, err)
 		return
 	}
 
-	log.Printf("AGENT WEBSOCKET: Upgrade successful, starting bidirectional forwarding | ReqID: %s", 
+	log.Printf("AGENT WEBSOCKET: Upgrade successful, starting bidirectional forwarding | ReqID: %s",
 		req.ReqID)
 
 	// Step 3: Start bidirectional WebSocket frame forwarding
@@ -1180,17 +1210,17 @@ func (a *Agent) establishLocalWebSocket(req *ReqFrame) (*websocket.Conn, error) 
 	target = strings.Replace(target, "ws://localhost:", "ws://127.0.0.1:", 1)
 	target = strings.Replace(target, "wss://localhost:", "wss://127.0.0.1:", 1)
 
-	log.Printf("AGENT WEBSOCKET: Connecting to local service | Target: %s | ReqID: %s", 
+	log.Printf("AGENT WEBSOCKET: Connecting to local service | Target: %s | ReqID: %s",
 		target, req.ReqID)
 
 	// Prepare headers for WebSocket connection
 	headers := http.Header{}
 	for k, vs := range req.Headers {
 		// Skip upgrade-related headers - they'll be set by websocket client
-		if strings.ToLower(k) == "connection" || 
-		   strings.ToLower(k) == "upgrade" ||
-		   strings.ToLower(k) == "sec-websocket-key" ||
-		   strings.ToLower(k) == "sec-websocket-version" {
+		if strings.ToLower(k) == "connection" ||
+			strings.ToLower(k) == "upgrade" ||
+			strings.ToLower(k) == "sec-websocket-key" ||
+			strings.ToLower(k) == "sec-websocket-version" {
 			continue
 		}
 		for _, v := range vs {
@@ -1248,7 +1278,7 @@ func (a *Agent) forwardWebSocketFrames(ctx context.Context, reqID string, localC
 			if err != nil {
 				closeStatus := websocket.CloseStatus(err)
 				if closeStatus != websocket.StatusNormalClosure && closeStatus != websocket.StatusGoingAway {
-					log.Printf("AGENT WEBSOCKET: Error reading from local WebSocket | ReqID: %s | Error: %v", 
+					log.Printf("AGENT WEBSOCKET: Error reading from local WebSocket | ReqID: %s | Error: %v",
 						reqID, err)
 					errorChan <- err
 				}
@@ -1265,13 +1295,13 @@ func (a *Agent) forwardWebSocketFrames(ctx context.Context, reqID string, localC
 			}
 
 			if err := writeEncrypted(frame); err != nil {
-				log.Printf("AGENT WEBSOCKET: Error forwarding frame to server | ReqID: %s | Error: %v", 
+				log.Printf("AGENT WEBSOCKET: Error forwarding frame to server | ReqID: %s | Error: %v",
 					reqID, err)
 				errorChan <- err
 				return
 			}
 
-			log.Printf("AGENT WEBSOCKET: Forwarded frame to server | ReqID: %s | Type: %d | Size: %d bytes", 
+			log.Printf("AGENT WEBSOCKET: Forwarded frame to server | ReqID: %s | Type: %d | Size: %d bytes",
 				reqID, msgType, len(data))
 		}
 	}()
@@ -1318,7 +1348,7 @@ func (a *Agent) handleWebSocketFrame(frame *WebSocketFrame) {
 
 	err := conn.Write(ctx, websocket.MessageType(frame.MessageType), frame.Data)
 	if err != nil {
-		log.Printf("AGENT WEBSOCKET: Error writing frame to local WebSocket | ReqID: %s | Error: %v", 
+		log.Printf("AGENT WEBSOCKET: Error writing frame to local WebSocket | ReqID: %s | Error: %v",
 			frame.ReqID, err)
 		// Remove failed connection
 		webSocketMutex.Lock()
@@ -1328,7 +1358,7 @@ func (a *Agent) handleWebSocketFrame(frame *WebSocketFrame) {
 		return
 	}
 
-	log.Printf("AGENT WEBSOCKET: Forwarded frame from server to local | ReqID: %s | Type: %d | Size: %d bytes", 
+	log.Printf("AGENT WEBSOCKET: Forwarded frame from server to local | ReqID: %s | Type: %d | Size: %d bytes",
 		frame.ReqID, frame.MessageType, len(frame.Data))
 }
 
@@ -1374,6 +1404,11 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 		if ferr == nil && string(body) == "STREAMING_RESPONSE" {
 			log.Printf("AGENT: Starting streaming response | ReqID: %s | TunnelID: %s | Status: %d",
 				req.ReqID, a.ID, status)
+
+			// DIAGNOSTIC: Log the decision to handle streaming
+			log.Printf("AGENT: Detected STREAMING_RESPONSE indicator, calling handleStreamingRequest | ReqID: %s | TunnelID: %s | Status: %d | Headers: %+v",
+				req.ReqID, a.ID, status, hdr)
+
 			a.handleStreamingRequest(ctx, req, status, hdr, writeEncrypted)
 			return
 		}

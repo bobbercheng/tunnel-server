@@ -809,7 +809,7 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 
 	// Handle WebSocket upgrade requests
 	if isWebSocketUpgrade {
-		log.Printf("[TUNNEL ROUTING] WebSocket upgrade detected | TunnelID: %s | Path: %s | ReqID: %s", 
+		log.Printf("[TUNNEL ROUTING] WebSocket upgrade detected | TunnelID: %s | Path: %s | ReqID: %s",
 			tunnelID, r.URL.Path, reqID)
 		// Use the same WebSocket upgrade handler from handlers.go
 		handleWebSocketUpgrade(w, r, req, ac, reqID)
@@ -827,11 +827,11 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 	// Use timeout only for non-streaming requests
 	var ctx context.Context
 	var cancel context.CancelFunc
-	
+
 	if isStreamingRequest {
 		// No artificial timeout for streaming - let client control connection lifecycle
 		ctx = r.Context()
-		log.Printf("[TUNNEL ROUTING] Using client-controlled timeout for streaming request | TunnelID: %s | Path: %s | Method: %s", 
+		log.Printf("[TUNNEL ROUTING] Using client-controlled timeout for streaming request | TunnelID: %s | Path: %s | Method: %s",
 			tunnelID, r.URL.Path, r.Method)
 	} else {
 		// Regular requests get timeouts based on type
@@ -872,17 +872,39 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 
 		// Check if this is a streaming response
 		if resp.Type == "streaming_start" {
-			log.Printf("[TUNNEL ROUTING] Starting streaming response | TunnelID: %s | Path: %s | Status: %d", 
+			log.Printf("[TUNNEL ROUTING] Starting streaming response | TunnelID: %s | Path: %s | Status: %d",
 				tunnelID, r.URL.Path, statusCode)
-			
+
+			// DIAGNOSTIC: Log headers received from agent before setting them
+			log.Printf("[TUNNEL ROUTING] Headers received from agent | TunnelID: %s | Path: %s | Headers: %+v",
+				tunnelID, r.URL.Path, resp.Headers)
+
+			// DIAGNOSTIC: Check content-type specifically
+			if contentType, exists := resp.Headers["Content-Type"]; exists {
+				log.Printf("[TUNNEL ROUTING] Content-Type from agent | TunnelID: %s | Path: %s | ContentType: %v",
+					tunnelID, r.URL.Path, contentType)
+			} else {
+				log.Printf("[TUNNEL ROUTING] No Content-Type header from agent | TunnelID: %s | Path: %s",
+					tunnelID, r.URL.Path)
+			}
+
 			// Set headers for streaming
 			for k, vs := range resp.Headers {
 				for _, v := range vs {
 					w.Header().Add(k, v)
 				}
 			}
+
+			// DIAGNOSTIC: Log headers after setting them on response writer
+			log.Printf("[TUNNEL ROUTING] Headers set on response writer | TunnelID: %s | Path: %s | Headers: %+v",
+				tunnelID, r.URL.Path, w.Header())
+
 			w.WriteHeader(statusCode)
-			
+
+			// DIAGNOSTIC: Log final response headers after WriteHeader
+			log.Printf("[TUNNEL ROUTING] Final response headers sent to client | TunnelID: %s | Path: %s | Status: %d | Headers: %+v",
+				tunnelID, r.URL.Path, statusCode, w.Header())
+
 			// Flush headers to start streaming
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -894,16 +916,16 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 				select {
 				case chunk := <-respCh:
 					if chunk.Type == "streaming_chunk" {
-						log.Printf("[TUNNEL ROUTING] Writing streaming chunk (%d bytes) | TunnelID: %s | Path: %s", 
+						log.Printf("[TUNNEL ROUTING] Writing streaming chunk (%d bytes) | TunnelID: %s | Path: %s",
 							len(chunk.Body), tunnelID, r.URL.Path)
 						n, err := w.Write(chunk.Body)
 						if err != nil {
-							log.Printf("[TUNNEL ROUTING] Error writing streaming chunk | TunnelID: %s | Path: %s | Error: %v", 
+							log.Printf("[TUNNEL ROUTING] Error writing streaming chunk | TunnelID: %s | Path: %s | Error: %v",
 								tunnelID, r.URL.Path, err)
 							return false
 						}
 						totalSize += int64(n)
-						
+
 						// Flush immediately for real-time streaming
 						if flusher, ok := w.(http.Flusher); ok {
 							flusher.Flush()
@@ -924,6 +946,16 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 			duration := time.Since(startTime)
 			bodySize := len(resp.Body)
 
+			// DIAGNOSTIC: Log headers for regular responses too
+			log.Printf("[TUNNEL ROUTING] Regular response headers from agent | TunnelID: %s | Path: %s | Headers: %+v",
+				tunnelID, r.URL.Path, resp.Headers)
+
+			// DIAGNOSTIC: Check content-type for regular responses
+			if contentType, exists := resp.Headers["Content-Type"]; exists {
+				log.Printf("[TUNNEL ROUTING] Regular response Content-Type from agent | TunnelID: %s | Path: %s | ContentType: %v",
+					tunnelID, r.URL.Path, contentType)
+			}
+
 			// Tunnel routing succeeded - write response regardless of HTTP status
 			// The HTTP status code is the application's concern, not the tunnel's
 			log.Printf("[TUNNEL ROUTING] SUCCESS (buffered) | TunnelID: %s | Path: %s | Status: %d | BodySize: %d | Duration: %v",
@@ -935,6 +967,11 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 					w.Header().Add(k, v)
 				}
 			}
+
+			// DIAGNOSTIC: Log headers after setting them for regular responses
+			log.Printf("[TUNNEL ROUTING] Regular response headers set on writer | TunnelID: %s | Path: %s | Headers: %+v",
+				tunnelID, r.URL.Path, w.Header())
+
 			w.WriteHeader(statusCode)
 			_, _ = w.Write(resp.Body)
 			return true
