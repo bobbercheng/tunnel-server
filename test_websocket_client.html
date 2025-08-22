@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Tunnel Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .connecting { background-color: #ffeaa7; color: #856404; }
+        .messages {
+            border: 1px solid #ddd;
+            height: 300px;
+            overflow-y: auto;
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #f9f9f9;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        input, button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        input {
+            flex: 1;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .test-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .test-buttons button {
+            background-color: #28a745;
+        }
+        .test-buttons button:hover {
+            background-color: #1e7e34;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚇 WebSocket Tunnel Test Client</h1>
+        <p>Test WebSocket connections through the tunnel system</p>
+        
+        <div class="input-group">
+            <input type="text" id="urlInput" placeholder="WebSocket URL (e.g., ws://localhost:9998/testws)" 
+                   value="ws://localhost:9999/testws">
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+        
+        <div id="status" class="status disconnected">❌ Disconnected</div>
+        
+        <div class="messages" id="messages"></div>
+        
+        <div class="input-group">
+            <input type="text" id="messageInput" placeholder="Type a message..." disabled>
+            <button id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+        </div>
+        
+        <div class="test-buttons">
+            <button onclick="sendJsonTest()" id="jsonBtn" disabled>Send JSON Test</button>
+            <button onclick="sendTextTest()" id="textBtn" disabled>Send Text Test</button>
+            <button onclick="sendBinaryTest()" id="binaryBtn" disabled>Send Binary Test</button>
+            <button onclick="stressTest()" id="stressBtn" disabled>Stress Test (10 msgs)</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let messageCount = 0;
+
+        function addMessage(message, type = 'info') {
+            const messages = document.getElementById('messages');
+            const timestamp = new Date().toISOString();
+            const div = document.createElement('div');
+            div.style.marginBottom = '5px';
+            div.style.color = type === 'error' ? 'red' : type === 'sent' ? 'blue' : 'green';
+            div.textContent = `[${timestamp}] ${type.toUpperCase()}: ${message}`;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function updateStatus(status, className) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = status;
+            statusDiv.className = `status ${className}`;
+        }
+
+        function updateButtons(connected) {
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+            document.getElementById('messageInput').disabled = !connected;
+            document.getElementById('sendBtn').disabled = !connected;
+            document.getElementById('jsonBtn').disabled = !connected;
+            document.getElementById('textBtn').disabled = !connected;
+            document.getElementById('binaryBtn').disabled = !connected;
+            document.getElementById('stressBtn').disabled = !connected;
+        }
+
+        function connect() {
+            const url = document.getElementById('urlInput').value;
+            if (!url) {
+                addMessage('Please enter a WebSocket URL', 'error');
+                return;
+            }
+
+            updateStatus('🔄 Connecting...', 'connecting');
+            addMessage(`Attempting to connect to: ${url}`, 'info');
+
+            try {
+                ws = new WebSocket(url);
+
+                ws.onopen = function(event) {
+                    updateStatus('✅ Connected', 'connected');
+                    addMessage('WebSocket connection established!', 'info');
+                    updateButtons(true);
+                };
+
+                ws.onmessage = function(event) {
+                    messageCount++;
+                    addMessage(`Received (#${messageCount}): ${event.data}`, 'received');
+                };
+
+                ws.onclose = function(event) {
+                    updateStatus('❌ Disconnected', 'disconnected');
+                    addMessage(`Connection closed (Code: ${event.code}, Reason: ${event.reason})`, 'error');
+                    updateButtons(false);
+                    ws = null;
+                };
+
+                ws.onerror = function(event) {
+                    addMessage('WebSocket error occurred', 'error');
+                    updateStatus('❌ Error', 'disconnected');
+                };
+
+            } catch (error) {
+                addMessage(`Connection error: ${error.message}`, 'error');
+                updateStatus('❌ Error', 'disconnected');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+                updateStatus('❌ Disconnected', 'disconnected');
+                updateButtons(false);
+                addMessage('Disconnected by user', 'info');
+            }
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if (!message || !ws) return;
+
+            ws.send(message);
+            addMessage(`Sent: ${message}`, 'sent');
+            input.value = '';
+        }
+
+        function sendJsonTest() {
+            if (!ws) return;
+            const testData = {
+                type: 'test',
+                message: 'Hello from WebSocket tunnel test!',
+                timestamp: new Date().toISOString(),
+                data: { number: 42, array: [1, 2, 3], nested: { key: 'value' } }
+            };
+            const jsonStr = JSON.stringify(testData);
+            ws.send(jsonStr);
+            addMessage(`Sent JSON: ${jsonStr}`, 'sent');
+        }
+
+        function sendTextTest() {
+            if (!ws) return;
+            const message = `Text test message #${Date.now()}`;
+            ws.send(message);
+            addMessage(`Sent text: ${message}`, 'sent');
+        }
+
+        function sendBinaryTest() {
+            if (!ws) return;
+            const buffer = new ArrayBuffer(16);
+            const view = new Uint8Array(buffer);
+            for (let i = 0; i < 16; i++) {
+                view[i] = i;
+            }
+            ws.send(buffer);
+            addMessage(`Sent binary data (16 bytes)`, 'sent');
+        }
+
+        function stressTest() {
+            if (!ws) return;
+            for (let i = 0; i < 10; i++) {
+                setTimeout(() => {
+                    const message = `Stress test message ${i + 1}/10 - ${Date.now()}`;
+                    ws.send(message);
+                    addMessage(`Stress ${i + 1}/10: ${message}`, 'sent');
+                }, i * 100);
+            }
+        }
+
+        // Enable Enter key in message input
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Auto-focus on URL input
+        document.getElementById('urlInput').focus();
+    </script>
+</body>
+</html>

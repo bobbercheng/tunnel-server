@@ -865,6 +865,10 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 
 	select {
 	case resp := <-respCh:
+		// DIAGNOSTIC: Log the exact response received
+		log.Printf("[TUNNEL ROUTING] Response received from agent | TunnelID: %s | Path: %s | Type: '%s' | Status: %d | Headers: %+v",
+			tunnelID, r.URL.Path, resp.Type, resp.Status, resp.Headers)
+
 		statusCode := resp.Status
 		if statusCode == 0 {
 			statusCode = http.StatusOK
@@ -943,6 +947,10 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 			}
 		} else {
 			// Handle regular (non-streaming) response
+			// DIAGNOSTIC: Log why this is being treated as a regular response
+			log.Printf("[TUNNEL ROUTING] Treating as regular response (not streaming) | TunnelID: %s | Path: %s | Type: '%s' | Expected: 'streaming_start'",
+				tunnelID, r.URL.Path, resp.Type)
+
 			duration := time.Since(startTime)
 			bodySize := len(resp.Body)
 

@@ -1,0 +1,3 @@
+OPENAI_API_KEY=sk-RUxdW97rAsCK_8aCghp16w
+OPENAI_BASE_URL=http://localhost:4000
+OPENAI_MODEL=qwen3-coder-plus

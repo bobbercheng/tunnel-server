@@ -888,7 +888,7 @@ func (ac *agentConn) handleStreamingStart(data []byte) {
 		return
 	}
 
-	log.Printf("SERVER STREAMING: Starting stream | ReqID: %s | AgentID: %s | Status: %d", 
+	log.Printf("SERVER STREAMING: Starting stream | ReqID: %s | AgentID: %s | Status: %d",
 		frame.ReqID, ac.id, frame.Status)
 
 	// Get the waiting HTTP response writer
@@ -896,11 +896,11 @@ func (ac *agentConn) handleStreamingStart(data []byte) {
 	ch, exists := ac.waiters[frame.ReqID]
 	if !exists {
 		ac.respMu.Unlock()
-		log.Printf("SERVER STREAMING: No waiter found for streaming start | ReqID: %s | AgentID: %s", 
+		log.Printf("SERVER STREAMING: No waiter found for streaming start | ReqID: %s | AgentID: %s",
 			frame.ReqID, ac.id)
 		return
 	}
-	
+
 	// Send initial response to start streaming
 	resp := &RespFrame{
 		Type:    "streaming_start",
@@ -909,7 +909,11 @@ func (ac *agentConn) handleStreamingStart(data []byte) {
 		Headers: frame.Headers,
 		Body:    []byte{}, // Empty body for start frame
 	}
-	
+
+	// DIAGNOSTIC: Log exactly what we're sending to the waiter
+	log.Printf("SERVER STREAMING: Sending streaming_start to waiter | ReqID: %s | Type: '%s' | Status: %d | Headers: %+v",
+		frame.ReqID, resp.Type, resp.Status, resp.Headers)
+
 	// Send to waiter without removing it (streaming continues)
 	select {
 	case ch <- resp:
@@ -928,7 +932,7 @@ func (ac *agentConn) handleStreamingChunk(data []byte) {
 		return
 	}
 
-	log.Printf("SERVER STREAMING: Received chunk %d (%d bytes) | ReqID: %s | AgentID: %s", 
+	log.Printf("SERVER STREAMING: Received chunk %d (%d bytes) | ReqID: %s | AgentID: %s",
 		frame.ChunkIndex, len(frame.Data), frame.ReqID, ac.id)
 
 	// Get the waiting HTTP response writer
@@ -936,12 +940,12 @@ func (ac *agentConn) handleStreamingChunk(data []byte) {
 	ch, exists := ac.waiters[frame.ReqID]
 	if !exists {
 		ac.respMu.Unlock()
-		log.Printf("SERVER STREAMING: No waiter found for streaming chunk | ReqID: %s | AgentID: %s", 
+		log.Printf("SERVER STREAMING: No waiter found for streaming chunk | ReqID: %s | AgentID: %s",
 			frame.ReqID, ac.id)
 		return
 	}
-	
-	// Send chunk data immediately 
+
+	// Send chunk data immediately
 	resp := &RespFrame{
 		Type:    "streaming_chunk",
 		ReqID:   frame.ReqID,
@@ -949,7 +953,7 @@ func (ac *agentConn) handleStreamingChunk(data []byte) {
 		Headers: nil, // Headers only in start frame
 		Body:    frame.Data,
 	}
-	
+
 	// Send to waiter without removing it (streaming continues)
 	select {
 	case ch <- resp:
@@ -968,7 +972,7 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 		return
 	}
 
-	log.Printf("SERVER STREAMING: Stream ended | ReqID: %s | AgentID: %s | TotalChunks: %d", 
+	log.Printf("SERVER STREAMING: Stream ended | ReqID: %s | AgentID: %s | TotalChunks: %d",
 		frame.ReqID, ac.id, frame.TotalChunks)
 
 	// Get the waiting HTTP response writer and remove it
@@ -980,11 +984,11 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 	ac.respMu.Unlock()
 
 	if !exists {
-		log.Printf("SERVER STREAMING: No waiter found for streaming end | ReqID: %s | AgentID: %s", 
+		log.Printf("SERVER STREAMING: No waiter found for streaming end | ReqID: %s | AgentID: %s",
 			frame.ReqID, ac.id)
 		return
 	}
-	
+
 	// Send end signal
 	resp := &RespFrame{
 		Type:    "streaming_end",
@@ -993,7 +997,7 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 		Headers: nil,
 		Body:    []byte{}, // Empty body for end frame
 	}
-	
+
 	// Send final response and close channel
 	select {
 	case ch <- resp:
@@ -1034,7 +1038,7 @@ func (ac *agentConn) handleWebSocketUpgradeSuccess(data []byte) {
 		return
 	}
 
-	log.Printf("SERVER WEBSOCKET: Upgrade successful from agent | AgentID: %s | ReqID: %s", 
+	log.Printf("SERVER WEBSOCKET: Upgrade successful from agent | AgentID: %s | ReqID: %s",
 		ac.id, resp.ReqID)
 
 	// Find the waiting client connection and upgrade it
@@ -1080,7 +1084,7 @@ func (ac *agentConn) handleWebSocketFrame(data []byte) {
 
 	err := session.ClientConn.Write(ctx, websocket.MessageType(frame.MessageType), frame.Data)
 	if err != nil {
-		log.Printf("SERVER WEBSOCKET: Error writing frame to client | ReqID: %s | Error: %v", 
+		log.Printf("SERVER WEBSOCKET: Error writing frame to client | ReqID: %s | Error: %v",
 			frame.ReqID, err)
 		// Mark session as inactive
 		webSocketMutex.Lock()
@@ -1089,7 +1093,7 @@ func (ac *agentConn) handleWebSocketFrame(data []byte) {
 		return
 	}
 
-	log.Printf("SERVER WEBSOCKET: Forwarded frame from agent to client | ReqID: %s | Type: %d | Size: %d bytes", 
+	log.Printf("SERVER WEBSOCKET: Forwarded frame from agent to client | ReqID: %s | Type: %d | Size: %d bytes",
 		frame.ReqID, frame.MessageType, len(frame.Data))
 }
 
