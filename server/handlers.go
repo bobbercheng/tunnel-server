@@ -212,8 +212,21 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// DIAGNOSTIC: Log headers after setting them
-			log.Printf("SERVER: Streaming headers set on writer | ReqID: %s | Headers: %+v", reqID, w.Header())
+			// CRITICAL FIX: Ensure Content-Type is explicitly set to prevent Go's auto-detection
+			// Go's net/http automatically sets Content-Type if none exists when WriteHeader() is called
+			if contentTypeHeaders := w.Header().Values("Content-Type"); len(contentTypeHeaders) == 0 {
+				// No Content-Type header found, set default for streaming
+				w.Header().Set("Content-Type", "text/event-stream")
+				log.Printf("SERVER: CONTENT-TYPE FIX - No Content-Type found, setting default | ReqID: %s", reqID)
+			} else {
+				// Content-Type exists, ensure it's properly set (not just added)
+				existingContentType := contentTypeHeaders[0]
+				w.Header().Set("Content-Type", existingContentType)
+				log.Printf("SERVER: CONTENT-TYPE FIX - Reinforcing existing Content-Type | ReqID: %s | ContentType: %s", reqID, existingContentType)
+			}
+
+			// DIAGNOSTIC: Log headers after Content-Type protection
+			log.Printf("SERVER: Streaming headers set on writer (after Content-Type fix) | ReqID: %s | Headers: %+v", reqID, w.Header())
 
 			w.WriteHeader(statusCode)
 

@@ -899,8 +899,21 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 				}
 			}
 
-			// DIAGNOSTIC: Log headers after setting them on response writer
-			log.Printf("[TUNNEL ROUTING] Headers set on response writer | TunnelID: %s | Path: %s | Headers: %+v",
+			// CRITICAL FIX: Ensure Content-Type is explicitly set to prevent Go's auto-detection
+			// Go's net/http automatically sets Content-Type if none exists when WriteHeader() is called
+			if contentTypeHeaders := w.Header().Values("Content-Type"); len(contentTypeHeaders) == 0 {
+				// No Content-Type header found, set default for streaming
+				w.Header().Set("Content-Type", "text/event-stream")
+				log.Printf("[TUNNEL ROUTING] CONTENT-TYPE FIX - No Content-Type found, setting default | TunnelID: %s | Path: %s", tunnelID, r.URL.Path)
+			} else {
+				// Content-Type exists, ensure it's properly set (not just added)
+				existingContentType := contentTypeHeaders[0]
+				w.Header().Set("Content-Type", existingContentType)
+				log.Printf("[TUNNEL ROUTING] CONTENT-TYPE FIX - Reinforcing existing Content-Type | TunnelID: %s | Path: %s | ContentType: %s", tunnelID, r.URL.Path, existingContentType)
+			}
+
+			// DIAGNOSTIC: Log headers after Content-Type protection
+			log.Printf("[TUNNEL ROUTING] Headers set on response writer (after Content-Type fix) | TunnelID: %s | Path: %s | Headers: %+v",
 				tunnelID, r.URL.Path, w.Header())
 
 			w.WriteHeader(statusCode)

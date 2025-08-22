@@ -181,6 +181,10 @@ type Agent struct {
 	chunkedRespMu sync.Mutex
 	chunkedResps  map[string]*ChunkedResponse // reqID -> partial response
 
+	// Streaming response management
+	streamingRespMu sync.Mutex
+	streamingResps  map[string]*http.Response // reqID -> streaming response
+
 	// Connection health monitoring
 	lastPong time.Time
 	pingMu   sync.RWMutex
@@ -717,6 +721,14 @@ func (a *Agent) runOnce() error {
 }
 
 func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) {
+	return a.forwardInternal(rd, nil, nil)
+}
+
+func (a *Agent) forwardWithStreamingHandler(rd *ReqFrame, ctx context.Context, writeEncrypted func(v any) error) (int, map[string][]string, []byte, error) {
+	return a.forwardInternal(rd, ctx, writeEncrypted)
+}
+
+func (a *Agent) forwardInternal(rd *ReqFrame, ctx context.Context, writeEncrypted func(v any) error) (int, map[string][]string, []byte, error) {
 	target := a.LocalURL + rd.Path
 	if rd.Query != "" {
 		target += "?" + rd.Query
@@ -779,9 +791,19 @@ func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) 
 		target, rd.ReqID, contentType, isEventStream, isTextStream, isAppStream)
 
 	if isEventStream || isTextStream || isAppStream {
-		log.Printf("FORWARD: Detected streaming response, calling handleStreamingResponse | Target: %s | ReqID: %s",
+		log.Printf("FORWARD: Detected streaming response | Target: %s | ReqID: %s",
 			target, rd.ReqID)
-		return handleStreamingResponse(resp)
+		
+		// If we have streaming handler context, handle streaming directly here
+		if ctx != nil && writeEncrypted != nil {
+			log.Printf("FORWARD: Handling streaming response directly | Target: %s | ReqID: %s",
+				target, rd.ReqID)
+			a.handleStreamingResponseDirect(ctx, rd, resp, writeEncrypted)
+			return resp.StatusCode, resp.Header, []byte("STREAMING_HANDLED"), nil
+		}
+		
+		// Otherwise return indicator for legacy path
+		return resp.StatusCode, resp.Header, []byte("STREAMING_RESPONSE"), nil
 	}
 
 	// Read response with size limit
@@ -813,12 +835,199 @@ func handleStreamingResponse(resp *http.Response) (int, map[string][]string, []b
 	log.Printf("handleStreamingResponse: Called for streaming response | Status: %d | ContentType: %s | Headers: %+v",
 		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header)
 
-	// For streaming responses, return an indicator that streaming is in progress
-	// The actual streaming will be handled by the caller
+	// For streaming responses, return the response object for reuse
+	// We'll store it in a way that can be retrieved by the streaming handler
 	return resp.StatusCode, resp.Header, []byte("STREAMING_RESPONSE"), nil
 }
 
-// handleStreamingRequest handles real-time streaming responses (SSE, etc.)
+// handleStreamingResponseDirect handles streaming directly with the original response
+func (a *Agent) handleStreamingResponseDirect(ctx context.Context, req *ReqFrame, resp *http.Response, writeEncrypted func(v any) error) {
+	defer resp.Body.Close()
+
+	log.Printf("AGENT STREAMING: Stream established directly | ReqID: %s | Status: %d | ContentType: %s",
+		req.ReqID, resp.StatusCode, resp.Header.Get("Content-Type"))
+
+	// DIAGNOSTIC: Log all headers received from local service
+	log.Printf("AGENT STREAMING: All headers from local service | ReqID: %s | Headers: %+v", req.ReqID, resp.Header)
+
+	// DIAGNOSTIC: Check if content-type is what we expect for streaming
+	contentType := resp.Header.Get("Content-Type")
+	log.Printf("AGENT STREAMING: Content-Type analysis | ReqID: %s | ContentType: '%s' | IsEventStream: %v | IsStream: %v",
+		req.ReqID, contentType,
+		strings.Contains(contentType, "text/event-stream"),
+		strings.Contains(contentType, "text/stream") || strings.Contains(contentType, "application/stream"))
+
+	// Send streaming start message with headers and status
+	startFrame := ChunkedRespFrame{
+		Type:        "streaming_start",
+		ReqID:       req.ReqID,
+		Status:      resp.StatusCode,
+		Headers:     resp.Header,
+		ChunkIndex:  0,
+		TotalChunks: -1, // Unknown for streaming
+		Data:        []byte{},
+		IsLast:      false,
+	}
+
+	// DIAGNOSTIC: Log what we're sending in the streaming_start frame
+	log.Printf("AGENT STREAMING: Sending streaming_start frame | ReqID: %s | Headers: %+v", req.ReqID, startFrame.Headers)
+
+	if err := writeEncrypted(startFrame); err != nil {
+		log.Printf("AGENT STREAMING: Failed to send streaming_start | ReqID: %s | Error: %v", req.ReqID, err)
+		return
+	}
+
+	// Stream data in real-time with connection health monitoring
+	buf := make([]byte, 32768) // Increased from 4KB to 32KB for better streaming
+	chunkIndex := 1
+
+	log.Printf("AGENT STREAMING: Starting stream loop | ReqID: %s | BufferSize: %d", req.ReqID, len(buf))
+
+	// Add connection health monitoring
+	lastWriteTime := time.Now()
+	healthTicker := time.NewTicker(5 * time.Second)
+	defer healthTicker.Stop()
+
+	// Start health monitoring in a separate goroutine
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-healthTicker.C:
+				log.Printf("AGENT STREAMING: Health check timer triggered | ReqID: %s", req.ReqID)
+				// Check if we're still able to write to the WebSocket
+				if time.Since(lastWriteTime) > 30*time.Second {
+					log.Printf("AGENT STREAMING: No writes in 30s, checking connection health | ReqID: %s", req.ReqID)
+					// Try to send a heartbeat to check connection
+					heartbeat := HeartbeatFrame{
+						Type:        "streaming_heartbeat",
+						ReqID:       req.ReqID,
+						Status:      resp.StatusCode,
+						Headers:     nil,
+						ChunkIndex:  -1, // Special index for heartbeat
+						TotalChunks: -1,
+						Data:        []byte("heartbeat"),
+						IsLast:      false,
+						Timestamp:   time.Now().Unix(),
+					}
+					if err := writeEncrypted(heartbeat); err != nil {
+						log.Printf("AGENT STREAMING: Connection health check failed | ReqID: %s | Error: %v", req.ReqID, err)
+						return
+					}
+					log.Printf("AGENT STREAMING: Connection health check passed | ReqID: %s", req.ReqID)
+				}
+			}
+		}
+	}()
+
+	// Main streaming loop with non-blocking reads using goroutine and channels
+	for {
+		log.Printf("AGENT STREAMING: Starting loop iteration | ReqID: %s | ChunkIndex: %d", req.ReqID, chunkIndex)
+
+		// Use a channel to make the read interruptible
+		type readResult struct {
+			n   int
+			err error
+		}
+		readChan := make(chan readResult, 1)
+
+		// Start the read in a goroutine
+		go func() {
+			log.Printf("AGENT STREAMING: About to read from response body (BLOCKING) | ReqID: %s | Attempt: %d", req.ReqID, chunkIndex)
+			n, err := resp.Body.Read(buf)
+			log.Printf("AGENT STREAMING: Read operation completed | ReqID: %s | BytesRead: %d | Error: %v", req.ReqID, n, err)
+			readChan <- readResult{n: n, err: err}
+		}()
+
+		// Wait for either context cancellation, timeout, or read completion
+		var n int
+		var err error
+		
+		// Add a timeout for debugging slow reads
+		readTimeout := time.NewTimer(10 * time.Second)
+		defer readTimeout.Stop()
+		
+		select {
+		case <-ctx.Done():
+			log.Printf("AGENT STREAMING: Context cancelled | ReqID: %s", req.ReqID)
+			return
+		case <-readTimeout.C:
+			log.Printf("AGENT STREAMING: Read timeout after 10s, continuing to wait | ReqID: %s | ChunkIndex: %d", req.ReqID, chunkIndex)
+			// Don't return, continue waiting for the read
+			select {
+			case <-ctx.Done():
+				log.Printf("AGENT STREAMING: Context cancelled during timeout wait | ReqID: %s", req.ReqID)
+				return
+			case result := <-readChan:
+				n = result.n
+				err = result.err
+				log.Printf("AGENT STREAMING: Read completed after timeout | ReqID: %s | BytesRead: %d | Error: %v", req.ReqID, n, err)
+			}
+		case result := <-readChan:
+			n = result.n
+			err = result.err
+			log.Printf("AGENT STREAMING: Read from response body | ReqID: %s | BytesRead: %d | Error: %v | BufferSize: %d", req.ReqID, n, err, len(buf))
+		}
+
+		if n > 0 {
+			log.Printf("AGENT STREAMING: Processing chunk with %d bytes | ReqID: %s", n, req.ReqID)
+			// Send chunk immediately
+			chunkFrame := ChunkedRespFrame{
+				Type:        "streaming_chunk",
+				ReqID:       req.ReqID,
+				Status:      resp.StatusCode,
+				Headers:     nil, // Headers only sent in start frame
+				ChunkIndex:  chunkIndex,
+				TotalChunks: -1, // Unknown for streaming
+				Data:        make([]byte, n),
+				IsLast:      false,
+			}
+			copy(chunkFrame.Data, buf[:n])
+
+			log.Printf("AGENT STREAMING: About to send chunk %d | ReqID: %s | Size: %d bytes", chunkIndex, req.ReqID, n)
+
+			if err := writeEncrypted(chunkFrame); err != nil {
+				log.Printf("AGENT STREAMING: Failed to send chunk %d | ReqID: %s | Error: %v", chunkIndex, req.ReqID, err)
+				return
+			}
+
+			log.Printf("AGENT STREAMING: Sent chunk %d (%d bytes) | ReqID: %s", chunkIndex, n, req.ReqID)
+			chunkIndex++
+			lastWriteTime = time.Now() // Update last write time
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				// Stream ended normally
+				log.Printf("AGENT STREAMING: Stream ended with EOF | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
+				endFrame := ChunkedRespFrame{
+					Type:        "streaming_end",
+					ReqID:       req.ReqID,
+					Status:      resp.StatusCode,
+					Headers:     nil,
+					ChunkIndex:  chunkIndex,
+					TotalChunks: chunkIndex,
+					Data:        []byte{},
+					IsLast:      true,
+				}
+
+				if err := writeEncrypted(endFrame); err != nil {
+					log.Printf("AGENT STREAMING: Failed to send streaming_end | ReqID: %s | Error: %v", req.ReqID, err)
+				} else {
+					log.Printf("AGENT STREAMING: Stream completed successfully | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
+				}
+				return
+			} else {
+				// Stream error
+				log.Printf("AGENT STREAMING: Stream read error | ReqID: %s | Error: %v", req.ReqID, err)
+				return
+			}
+		}
+	}
+}
+
+// handleStreamingRequest handles real-time streaming responses (SSE, etc.) - LEGACY PATH
 func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, status int, headers map[string][]string, writeEncrypted func(v any) error) {
 	// Make a new HTTP request to get the actual response stream
 	target := a.LocalURL + req.Path
@@ -915,89 +1124,140 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 	healthTicker := time.NewTicker(5 * time.Second)
 	defer healthTicker.Stop()
 
+	// Start health monitoring in a separate goroutine
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-healthTicker.C:
+				log.Printf("AGENT STREAMING: Health check timer triggered | ReqID: %s", req.ReqID)
+				// Check if we're still able to write to the WebSocket
+				if time.Since(lastWriteTime) > 30*time.Second {
+					log.Printf("AGENT STREAMING: No writes in 30s, checking connection health | ReqID: %s", req.ReqID)
+					// Try to send a heartbeat to check connection
+					heartbeat := HeartbeatFrame{
+						Type:        "streaming_heartbeat",
+						ReqID:       req.ReqID,
+						Status:      resp.StatusCode,
+						Headers:     nil,
+						ChunkIndex:  -1, // Special index for heartbeat
+						TotalChunks: -1,
+						Data:        []byte("heartbeat"),
+						IsLast:      false,
+						Timestamp:   time.Now().Unix(),
+					}
+					if err := writeEncrypted(heartbeat); err != nil {
+						log.Printf("AGENT STREAMING: Connection health check failed | ReqID: %s | Error: %v", req.ReqID, err)
+						return
+					}
+					log.Printf("AGENT STREAMING: Connection health check passed | ReqID: %s", req.ReqID)
+				}
+			}
+		}
+	}()
+
+	// Main streaming loop with non-blocking reads using goroutine and channels
 	for {
+		log.Printf("AGENT STREAMING: Starting loop iteration | ReqID: %s | ChunkIndex: %d", req.ReqID, chunkIndex)
+
+		// Use a channel to make the read interruptible
+		type readResult struct {
+			n   int
+			err error
+		}
+		readChan := make(chan readResult, 1)
+
+		// Start the read in a goroutine
+		go func() {
+			log.Printf("AGENT STREAMING: About to read from response body (BLOCKING) | ReqID: %s | Attempt: %d", req.ReqID, chunkIndex)
+			n, err := resp.Body.Read(buf)
+			log.Printf("AGENT STREAMING: Read operation completed | ReqID: %s | BytesRead: %d | Error: %v", req.ReqID, n, err)
+			readChan <- readResult{n: n, err: err}
+		}()
+
+		// Wait for either context cancellation, timeout, or read completion
+		var n int
+		var err error
+		
+		// Add a timeout for debugging slow reads
+		readTimeout := time.NewTimer(10 * time.Second)
+		defer readTimeout.Stop()
+		
 		select {
 		case <-ctx.Done():
 			log.Printf("AGENT STREAMING: Context cancelled | ReqID: %s", req.ReqID)
 			return
-		case <-healthTicker.C:
-			// Check if we're still able to write to the WebSocket
-			if time.Since(lastWriteTime) > 30*time.Second {
-				log.Printf("AGENT STREAMING: No writes in 30s, checking connection health | ReqID: %s", req.ReqID)
-				// Try to send a heartbeat to check connection
-				heartbeat := HeartbeatFrame{
-					Type:        "streaming_heartbeat",
+		case <-readTimeout.C:
+			log.Printf("AGENT STREAMING: Read timeout after 10s, continuing to wait | ReqID: %s | ChunkIndex: %d", req.ReqID, chunkIndex)
+			// Don't return, continue waiting for the read
+			select {
+			case <-ctx.Done():
+				log.Printf("AGENT STREAMING: Context cancelled during timeout wait | ReqID: %s", req.ReqID)
+				return
+			case result := <-readChan:
+				n = result.n
+				err = result.err
+				log.Printf("AGENT STREAMING: Read completed after timeout | ReqID: %s | BytesRead: %d | Error: %v", req.ReqID, n, err)
+			}
+		case result := <-readChan:
+			n = result.n
+			err = result.err
+			log.Printf("AGENT STREAMING: Read from response body | ReqID: %s | BytesRead: %d | Error: %v | BufferSize: %d", req.ReqID, n, err, len(buf))
+		}
+
+		if n > 0 {
+			log.Printf("AGENT STREAMING: Processing chunk with %d bytes | ReqID: %s", n, req.ReqID)
+			// Send chunk immediately
+			chunkFrame := ChunkedRespFrame{
+				Type:        "streaming_chunk",
+				ReqID:       req.ReqID,
+				Status:      resp.StatusCode,
+				Headers:     nil, // Headers only sent in start frame
+				ChunkIndex:  chunkIndex,
+				TotalChunks: -1, // Unknown for streaming
+				Data:        make([]byte, n),
+				IsLast:      false,
+			}
+			copy(chunkFrame.Data, buf[:n])
+
+			log.Printf("AGENT STREAMING: About to send chunk %d | ReqID: %s | Size: %d bytes", chunkIndex, req.ReqID, n)
+
+			if err := writeEncrypted(chunkFrame); err != nil {
+				log.Printf("AGENT STREAMING: Failed to send chunk %d | ReqID: %s | Error: %v", chunkIndex, req.ReqID, err)
+				return
+			}
+
+			log.Printf("AGENT STREAMING: Sent chunk %d (%d bytes) | ReqID: %s", chunkIndex, n, req.ReqID)
+			chunkIndex++
+			lastWriteTime = time.Now() // Update last write time
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				// Stream ended normally
+				log.Printf("AGENT STREAMING: Stream ended with EOF | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
+				endFrame := ChunkedRespFrame{
+					Type:        "streaming_end",
 					ReqID:       req.ReqID,
 					Status:      resp.StatusCode,
 					Headers:     nil,
-					ChunkIndex:  -1, // Special index for heartbeat
-					TotalChunks: -1,
-					Data:        []byte("heartbeat"),
-					IsLast:      false,
-					Timestamp:   time.Now().Unix(),
-				}
-				if err := writeEncrypted(heartbeat); err != nil {
-					log.Printf("AGENT STREAMING: Connection health check failed | ReqID: %s | Error: %v", req.ReqID, err)
-					return
-				}
-				log.Printf("AGENT STREAMING: Connection health check passed | ReqID: %s", req.ReqID)
-			}
-		default:
-			n, err := resp.Body.Read(buf)
-			log.Printf("AGENT STREAMING: Read from response body | ReqID: %s | BytesRead: %d | Error: %v | BufferSize: %d", req.ReqID, n, err, len(buf))
-
-			if n > 0 {
-				// Send chunk immediately
-				chunkFrame := ChunkedRespFrame{
-					Type:        "streaming_chunk",
-					ReqID:       req.ReqID,
-					Status:      resp.StatusCode,
-					Headers:     nil, // Headers only sent in start frame
 					ChunkIndex:  chunkIndex,
-					TotalChunks: -1, // Unknown for streaming
-					Data:        make([]byte, n),
-					IsLast:      false,
-				}
-				copy(chunkFrame.Data, buf[:n])
-
-				log.Printf("AGENT STREAMING: About to send chunk %d | ReqID: %s | Size: %d bytes", chunkIndex, req.ReqID, n)
-
-				if err := writeEncrypted(chunkFrame); err != nil {
-					log.Printf("AGENT STREAMING: Failed to send chunk %d | ReqID: %s | Error: %v", chunkIndex, req.ReqID, err)
-					return
+					TotalChunks: chunkIndex,
+					Data:        []byte{},
+					IsLast:      true,
 				}
 
-				log.Printf("AGENT STREAMING: Sent chunk %d (%d bytes) | ReqID: %s", chunkIndex, n, req.ReqID)
-				chunkIndex++
-				lastWriteTime = time.Now() // Update last write time
-			}
-
-			if err != nil {
-				if err == io.EOF {
-					// Stream ended normally
-					log.Printf("AGENT STREAMING: Stream ended with EOF | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
-					endFrame := ChunkedRespFrame{
-						Type:        "streaming_end",
-						ReqID:       req.ReqID,
-						Status:      resp.StatusCode,
-						Headers:     nil,
-						ChunkIndex:  chunkIndex,
-						TotalChunks: chunkIndex,
-						Data:        []byte{},
-						IsLast:      true,
-					}
-
-					if err := writeEncrypted(endFrame); err != nil {
-						log.Printf("AGENT STREAMING: Failed to send streaming_end | ReqID: %s | Error: %v", req.ReqID, err)
-					} else {
-						log.Printf("AGENT STREAMING: Stream completed successfully | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
-					}
-					return
+				if err := writeEncrypted(endFrame); err != nil {
+					log.Printf("AGENT STREAMING: Failed to send streaming_end | ReqID: %s | Error: %v", req.ReqID, err)
 				} else {
-					// Stream error
-					log.Printf("AGENT STREAMING: Stream read error | ReqID: %s | Error: %v", req.ReqID, err)
-					return
+					log.Printf("AGENT STREAMING: Stream completed successfully | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
 				}
+				return
+			} else {
+				// Stream error
+				log.Printf("AGENT STREAMING: Stream read error | ReqID: %s | Error: %v", req.ReqID, err)
+				return
 			}
 		}
 	}
@@ -1457,15 +1717,20 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 			return
 		}
 
-		status, hdr, body, ferr := a.forward(req)
+		status, hdr, body, ferr := a.forwardWithStreamingHandler(req, ctx, writeEncrypted)
 
 		// Check if this is a streaming response
-		if ferr == nil && string(body) == "STREAMING_RESPONSE" {
-			log.Printf("AGENT: Starting streaming response | ReqID: %s | TunnelID: %s | Status: %d",
-				req.ReqID, a.ID, status)
+		if ferr == nil && (string(body) == "STREAMING_RESPONSE" || string(body) == "STREAMING_HANDLED") {
+			log.Printf("AGENT: Streaming response handled | ReqID: %s | TunnelID: %s | Status: %d | Result: %s",
+				req.ReqID, a.ID, status, string(body))
+			
+			// If streaming was handled directly, we're done
+			if string(body) == "STREAMING_HANDLED" {
+				return
+			}
 
-			// DIAGNOSTIC: Log the decision to handle streaming
-			log.Printf("AGENT: Detected STREAMING_RESPONSE indicator, calling handleStreamingRequest | ReqID: %s | TunnelID: %s | Status: %d | Headers: %+v",
+			// Otherwise use the legacy path
+			log.Printf("AGENT: Using legacy streaming path | ReqID: %s | TunnelID: %s | Status: %d | Headers: %+v",
 				req.ReqID, a.ID, status, hdr)
 
 			a.handleStreamingRequest(ctx, req, status, hdr, writeEncrypted)
