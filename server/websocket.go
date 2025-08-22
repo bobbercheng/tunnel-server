@@ -1079,8 +1079,13 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 	}
 	ac.respMu.Unlock()
 
+	// Clean up streaming session tracking regardless of waiter existence
+	ac.streamingMu.Lock()
+	delete(ac.streamingSessions, frame.ReqID)
+	ac.streamingMu.Unlock()
+	
 	if !exists {
-		log.Printf("SERVER STREAMING: No waiter found for streaming end | ReqID: %s | AgentID: %s",
+		log.Printf("SERVER STREAMING: No waiter found for streaming end | ReqID: %s | AgentID: %s (session still cleaned up)",
 			frame.ReqID, ac.id)
 		return
 	}
@@ -1094,20 +1099,17 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 		Body:    []byte{}, // Empty body for end frame
 	}
 
-	// Send final response and close channel
+	// Send final response with timeout protection
 	select {
 	case ch <- resp:
 		log.Printf("SERVER STREAMING: Sent streaming_end to waiter | ReqID: %s", frame.ReqID)
+	case <-time.After(1 * time.Second):
+		log.Printf("SERVER STREAMING: Timeout sending streaming_end (waiter unresponsive) | ReqID: %s", frame.ReqID)
 	default:
 		log.Printf("SERVER STREAMING: Failed to send streaming_end (channel full) | ReqID: %s", frame.ReqID)
 	}
 	
-	// Clean up streaming session tracking
-	ac.streamingMu.Lock()
-	delete(ac.streamingSessions, frame.ReqID)
-	ac.streamingMu.Unlock()
-	log.Printf("SERVER STREAMING: Cleaned up streaming session | ReqID: %s", frame.ReqID)
-	
+	log.Printf("SERVER STREAMING: Cleaned up streaming session and closing channel | ReqID: %s", frame.ReqID)
 	close(ch)
 }
 

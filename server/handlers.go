@@ -258,7 +258,23 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 			totalSize := int64(0)
 			for {
 				select {
-				case chunk := <-respCh:
+				case chunk, ok := <-respCh:
+					if !ok {
+						// Channel was closed, streaming session ended
+						log.Printf("SERVER: Streaming channel closed | ReqID: %s | TotalSize: %d bytes", reqID, totalSize)
+						
+						// Record final metrics for channel closure
+						duration := time.Since(startTime).Seconds()
+						requestSize := int64(len(body))
+						tunnelMetrics.RecordRequest(id, r.Method, strconv.Itoa(statusCode), duration, requestSize, totalSize)
+
+						// Record geographic request if we have geolocation data
+						if country := getCountryFromIP(clientIP); country != "" {
+							tunnelMetrics.RecordGeographicRequest(id, country)
+						}
+						return
+					}
+					
 					if chunk.Type == "streaming_chunk" {
 						log.Printf("SERVER: Writing streaming chunk (%d bytes) | ReqID: %s", len(chunk.Body), reqID)
 						n, err := w.Write(chunk.Body)
@@ -273,7 +289,7 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 							flusher.Flush()
 						}
 					} else if chunk.Type == "streaming_end" {
-						log.Printf("SERVER: Streaming response completed | ReqID: %s | TotalSize: %d bytes", reqID, totalSize)
+						log.Printf("SERVER: Streaming response completed with streaming_end | ReqID: %s | TotalSize: %d bytes", reqID, totalSize)
 
 						// Record final metrics
 						duration := time.Since(startTime).Seconds()
@@ -285,9 +301,11 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 							tunnelMetrics.RecordGeographicRequest(id, country)
 						}
 						return
+					} else {
+						log.Printf("SERVER: Unexpected streaming frame type | ReqID: %s | Type: %s", reqID, chunk.Type)
 					}
 				case <-ctx.Done():
-					log.Printf("SERVER: Streaming timeout | ReqID: %s", reqID)
+					log.Printf("SERVER: Streaming timeout/cancellation | ReqID: %s", reqID)
 					return
 				}
 			}

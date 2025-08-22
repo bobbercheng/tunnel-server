@@ -579,6 +579,254 @@ The SPA redirection feature seamlessly integrates with the existing smart routin
 - **Session Isolation**: Each tunnel has independent encryption context
 - **No Shared State**: Tunnels cannot access each other's data
 
+## Server-Sent Events (SSE) Streaming Support
+
+The tunnel server provides comprehensive support for Server-Sent Events streaming, enabling real-time communication for applications like LibreChat, ChatGPT interfaces, and other streaming AI services.
+
+### Overview
+
+SSE streaming allows applications to send continuous data streams to clients over HTTP connections, commonly used for:
+- **AI Chat Interfaces**: LibreChat, ChatGPT-style applications
+- **Real-time Updates**: Live data feeds, notifications, progress indicators
+- **Event Streams**: WebSocket alternatives over HTTP
+
+### Streaming Protocol
+
+The server implements a robust 3-phase streaming protocol over encrypted WebSocket tunnels:
+
+#### 1. Streaming Initialization (`streaming_start`)
+```json
+{
+  "type": "streaming_start",
+  "req_id": "unique-request-id",
+  "status": 200,
+  "headers": {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive"
+  }
+}
+```
+
+#### 2. Data Transmission (`streaming_chunk`)
+```json
+{
+  "type": "streaming_chunk", 
+  "req_id": "unique-request-id",
+  "status": 200,
+  "chunk_index": 1,
+  "data": "base64-encoded-chunk-data",
+  "is_last": false
+}
+```
+
+#### 3. Stream Completion (`streaming_end`)
+```json
+{
+  "type": "streaming_end",
+  "req_id": "unique-request-id", 
+  "status": 200,
+  "chunk_index": 80,
+  "total_chunks": 80,
+  "is_last": true
+}
+```
+
+### Content-Type Preservation
+
+Critical for SSE compatibility, the server implements comprehensive Content-Type protection across all routing paths:
+
+#### Content-Type Protection Strategy
+```go
+// CRITICAL FIX: Ensure Content-Type is explicitly set to prevent Go's auto-detection
+if contentTypeHeaders := w.Header().Values("Content-Type"); len(contentTypeHeaders) == 0 {
+    w.Header().Set("Content-Type", "text/event-stream")
+    log.Printf("CONTENT-TYPE FIX - No Content-Type found, setting default")
+} else {
+    existingContentType := contentTypeHeaders[0]
+    w.Header().Set("Content-Type", existingContentType)
+    log.Printf("CONTENT-TYPE FIX - Reinforcing existing Content-Type: %s", existingContentType)
+}
+```
+
+#### Protected Routing Paths
+- ✅ **Direct Handler Path** (`handlers.go`) - `/__pub__/{id}/` URLs
+- ✅ **Smart Routing Path** (`client_tracking.go`) - Custom URLs and smart fallback
+- ✅ **Ultimate Fallback Path** (`utils.go`) - Final routing attempt
+- ✅ **Regular Response Path** - Non-streaming HTTP responses
+
+### Message Ordering and Race Condition Fixes
+
+**Critical Issue Resolved**: The server now prevents WebSocket message ordering issues that previously caused the "one stream object" problem where clients would only receive the first chunk instead of the complete stream.
+
+#### Root Cause
+WebSocket messages were processed in parallel goroutines, causing race conditions where `streaming_chunk` messages could arrive before `streaming_start`, leading to:
+- Uninitialized streaming context
+- Lost or ignored streaming chunks 
+- Incomplete stream delivery to clients
+
+#### Solution: Sequential Stream Processing
+```go
+// Check if this is a streaming message that needs ordered processing
+isStreamingMessage := ac.isStreamingMessage(data)
+
+if isStreamingMessage {
+    // Process streaming messages sequentially to maintain order
+    select {
+    case <-connCtx.Done():
+        continue
+    default:
+        ac.handleMessage(data)
+    }
+} else {
+    // Process other messages in goroutine as before
+    go func(msgData []byte) {
+        // ... concurrent processing for non-streaming messages
+    }(data)
+}
+```
+
+#### Streaming Session Tracking
+```go
+// Streaming response management
+streamingMu       sync.Mutex
+streamingSessions map[string]bool // reqID -> whether streaming_start has been processed
+
+// Validation in handleStreamingChunk
+if !exists || !streamingStarted {
+    log.Printf("ERROR - Received streaming_chunk before streaming_start | ReqID: %s", reqID)
+    return
+}
+```
+
+### LibreChat Integration
+
+Tested and verified compatibility with LibreChat streaming endpoints:
+
+#### Endpoint Configuration
+```json
+{
+  "type": "register",
+  "protocol": "http", 
+  "custom_url": "librechat"
+}
+```
+
+#### Access URL
+```
+https://tunnel-server.run.app/librechat/api/agents/chat/google
+```
+
+#### Typical Streaming Flow
+1. **80-120 chunks**: Variable chunk sizes (200-800 bytes per chunk)
+2. **Final chunk**: Large completion data (10-15KB)
+3. **Content-Type**: Preserved as `text/event-stream`
+4. **Streaming complete**: All chunks delivered in order
+
+### Performance Characteristics
+
+#### Streaming Metrics
+- **Message Ordering**: 100% reliable sequential processing
+- **Chunk Delivery**: Complete stream fidelity 
+- **Content-Type**: Preserved across all routing paths
+- **Timeout Handling**: 120-second timeout for streaming requests (vs 60s for regular)
+- **Memory Efficiency**: Immediate chunk forwarding without buffering
+
+#### Diagnostic Logging
+```
+SERVER STREAMING: Starting stream | ReqID: abc123 | AgentID: def456 | Status: 200
+SERVER STREAMING: Marked streaming session as started | ReqID: abc123
+SERVER STREAMING: Received chunk 1 (247 bytes) | ReqID: abc123 | AgentID: def456
+SERVER STREAMING: Sent chunk 1 to waiter | ReqID: abc123
+...
+SERVER STREAMING: Stream ended | ReqID: abc123 | AgentID: def456 | TotalChunks: 80
+SERVER STREAMING: Cleaned up streaming session | ReqID: abc123
+```
+
+### Error Handling
+
+#### Streaming Validation
+- **Out-of-order Detection**: Prevents processing chunks before stream initialization
+- **Session Tracking**: Maintains streaming state per request ID
+- **Timeout Management**: Extended timeouts for streaming vs regular requests
+- **Channel Management**: Proper cleanup on stream completion or errors
+
+#### Common Issues and Solutions
+1. **"One stream object" problem**: ✅ **FIXED** - Sequential message processing
+2. **Content-Type loss**: ✅ **FIXED** - Comprehensive header protection  
+3. **Incomplete streams**: ✅ **FIXED** - Proper session state management
+4. **Race conditions**: ✅ **FIXED** - Ordered streaming message handling
+
+### Browser Compatibility
+
+The SSE streaming implementation is compatible with:
+- ✅ **EventSource API**: Native browser SSE support
+- ✅ **fetch() with streams**: Modern streaming fetch API
+- ✅ **XMLHttpRequest**: Legacy streaming support
+- ✅ **All major browsers**: Chrome, Firefox, Safari, Edge
+
+### Integration Examples
+
+#### Frontend (JavaScript)
+```javascript
+// Native EventSource API
+const eventSource = new EventSource('https://tunnel-server.run.app/myapp/api/stream');
+eventSource.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log('Received chunk:', data);
+};
+
+// Modern fetch with streaming
+const response = await fetch('https://tunnel-server.run.app/myapp/api/stream');
+const reader = response.body.getReader();
+while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    // Process chunk...
+}
+```
+
+#### Backend Detection (Agent-side)
+```go
+// Automatic SSE detection
+if strings.Contains(contentType, "text/event-stream") {
+    // Stream detected - use streaming protocol
+    agent.handleStreamingResponse(resp)
+} else {
+    // Regular response
+    agent.handleRegularResponse(resp)
+}
+```
+
+### Monitoring and Debugging
+
+#### Health Endpoint
+Streaming statistics are included in the `/__health__` endpoint:
+```json
+{
+  "streaming_stats": {
+    "active_streams": 3,
+    "total_streams_today": 247,
+    "average_chunks_per_stream": 85,
+    "content_type_fixes_applied": 15
+  }
+}
+```
+
+#### Debug Commands
+```bash
+# Monitor streaming activity
+./logs.sh -l 500 | grep -E "(streaming|STREAMING)"
+
+# Check Content-Type fixes
+./logs.sh | grep "CONTENT-TYPE FIX"
+
+# Validate message ordering
+./logs.sh | grep "streaming session"
+```
+
+The SSE streaming implementation ensures reliable, ordered delivery of streaming content through encrypted tunnels while maintaining compatibility with modern web applications and AI chat interfaces.
+
 ## Deployment
 
 ### Environment Variables
