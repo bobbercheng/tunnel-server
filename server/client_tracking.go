@@ -919,6 +919,10 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 			for {
 				select {
 				case chunk := <-respCh:
+					// DIAGNOSTIC: Log every chunk received
+					log.Printf("[TUNNEL ROUTING] Received chunk from channel | TunnelID: %s | Path: %s | Type: '%s' | Size: %d bytes",
+						tunnelID, r.URL.Path, chunk.Type, len(chunk.Body))
+
 					if chunk.Type == "streaming_chunk" {
 						log.Printf("[TUNNEL ROUTING] Writing streaming chunk (%d bytes) | TunnelID: %s | Path: %s",
 							len(chunk.Body), tunnelID, r.URL.Path)
@@ -939,6 +943,10 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 						log.Printf("[TUNNEL ROUTING] STREAMING SUCCESS | TunnelID: %s | Path: %s | Status: %d | TotalSize: %d | Duration: %v",
 							tunnelID, r.URL.Path, statusCode, totalSize, duration)
 						return true
+					} else {
+						// DIAGNOSTIC: Log unexpected chunk type
+						log.Printf("[TUNNEL ROUTING] Unexpected chunk type | TunnelID: %s | Path: %s | Type: '%s' | Expected: 'streaming_chunk' or 'streaming_end'",
+							tunnelID, r.URL.Path, chunk.Type)
 					}
 				case <-ctx.Done():
 					log.Printf("[TUNNEL ROUTING] STREAMING TIMEOUT | TunnelID: %s | Path: %s", tunnelID, r.URL.Path)

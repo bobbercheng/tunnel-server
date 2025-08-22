@@ -118,6 +118,19 @@ type PongFrame struct {
 	TunnelID  string    `json:"tunnel_id"` // tunnel identifier (echoed from ping)
 }
 
+// HeartbeatFrame is used for streaming connection health monitoring
+type HeartbeatFrame struct {
+	Type        string              `json:"type"`              // "streaming_heartbeat"
+	ReqID       string              `json:"req_id"`            // request identifier
+	Status      int                 `json:"status"`            // HTTP status code
+	Headers     map[string][]string `json:"headers,omitempty"` // optional headers
+	ChunkIndex  int                 `json:"chunk_index"`       // -1 for heartbeat
+	TotalChunks int                 `json:"total_chunks"`      // -1 for heartbeat
+	Data        []byte              `json:"data"`              // heartbeat data
+	IsLast      bool                `json:"is_last"`           // false for heartbeat
+	Timestamp   int64               `json:"timestamp"`         // Unix timestamp
+}
+
 // TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
 type TunnelInfoFrame struct {
 	Type     string `json:"type"`     // "tunnel_info"

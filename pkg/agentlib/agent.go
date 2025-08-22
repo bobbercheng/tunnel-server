@@ -132,6 +132,19 @@ type PongFrame struct {
 	TunnelID  string    `json:"tunnel_id"` // tunnel identifier (echoed from ping)
 }
 
+// HeartbeatFrame is used for streaming connection health monitoring
+type HeartbeatFrame struct {
+	Type        string              `json:"type"`              // "streaming_heartbeat"
+	ReqID       string              `json:"req_id"`            // request identifier
+	Status      int                 `json:"status"`            // HTTP status code
+	Headers     map[string][]string `json:"headers,omitempty"` // optional headers
+	ChunkIndex  int                 `json:"chunk_index"`       // -1 for heartbeat
+	TotalChunks int                 `json:"total_chunks"`      // -1 for heartbeat
+	Data        []byte              `json:"data"`              // heartbeat data
+	IsLast      bool                `json:"is_last"`           // false for heartbeat
+	Timestamp   int64               `json:"timestamp"`         // Unix timestamp
+}
+
 // TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
 type TunnelInfoFrame struct {
 	Type     string `json:"type"`     // "tunnel_info"
@@ -688,10 +701,16 @@ func (a *Agent) runOnce() error {
 
 	select {
 	case <-waitDone:
-		// All handlers finished gracefully
-	case <-time.After(5 * time.Second):
-		// Timeout waiting for handlers
-		fmt.Println("Warning: some request handlers did not finish in time")
+		log.Printf("All request handlers completed for tunnel %s", a.ID)
+	case <-time.After(10 * time.Second):
+		log.Printf("Timeout waiting for request handlers to complete for tunnel %s", a.ID)
+	}
+
+	// Log connection closure reason
+	if returnErr != nil {
+		log.Printf("WebSocket connection closed with error for tunnel %s: %v", a.ID, returnErr)
+	} else {
+		log.Printf("WebSocket connection closed normally for tunnel %s", a.ID)
 	}
 
 	return returnErr
@@ -825,7 +844,7 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 		}
 	}
 
-	// Create HTTP client
+	// Create HTTP client with better timeout handling
 	client := &http.Client{
 		Timeout: 0, // No timeout for streaming responses
 		Transport: &http.Transport{
@@ -836,6 +855,11 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 				}
 				return net.DialTimeout(network, addr, 10*time.Second)
 			},
+			// Add connection pooling and keep-alive settings
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
 
@@ -880,17 +904,48 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 		return
 	}
 
-	// Stream data in real-time
-	buf := make([]byte, 4096)
+	// Stream data in real-time with connection health monitoring
+	buf := make([]byte, 32768) // Increased from 4KB to 32KB for better streaming
 	chunkIndex := 1
+
+	log.Printf("AGENT STREAMING: Starting stream loop | ReqID: %s | BufferSize: %d", req.ReqID, len(buf))
+
+	// Add connection health monitoring
+	lastWriteTime := time.Now()
+	healthTicker := time.NewTicker(5 * time.Second)
+	defer healthTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("AGENT STREAMING: Context cancelled | ReqID: %s", req.ReqID)
 			return
+		case <-healthTicker.C:
+			// Check if we're still able to write to the WebSocket
+			if time.Since(lastWriteTime) > 30*time.Second {
+				log.Printf("AGENT STREAMING: No writes in 30s, checking connection health | ReqID: %s", req.ReqID)
+				// Try to send a heartbeat to check connection
+				heartbeat := HeartbeatFrame{
+					Type:        "streaming_heartbeat",
+					ReqID:       req.ReqID,
+					Status:      resp.StatusCode,
+					Headers:     nil,
+					ChunkIndex:  -1, // Special index for heartbeat
+					TotalChunks: -1,
+					Data:        []byte("heartbeat"),
+					IsLast:      false,
+					Timestamp:   time.Now().Unix(),
+				}
+				if err := writeEncrypted(heartbeat); err != nil {
+					log.Printf("AGENT STREAMING: Connection health check failed | ReqID: %s | Error: %v", req.ReqID, err)
+					return
+				}
+				log.Printf("AGENT STREAMING: Connection health check passed | ReqID: %s", req.ReqID)
+			}
 		default:
 			n, err := resp.Body.Read(buf)
+			log.Printf("AGENT STREAMING: Read from response body | ReqID: %s | BytesRead: %d | Error: %v | BufferSize: %d", req.ReqID, n, err, len(buf))
+
 			if n > 0 {
 				// Send chunk immediately
 				chunkFrame := ChunkedRespFrame{
@@ -905,6 +960,8 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 				}
 				copy(chunkFrame.Data, buf[:n])
 
+				log.Printf("AGENT STREAMING: About to send chunk %d | ReqID: %s | Size: %d bytes", chunkIndex, req.ReqID, n)
+
 				if err := writeEncrypted(chunkFrame); err != nil {
 					log.Printf("AGENT STREAMING: Failed to send chunk %d | ReqID: %s | Error: %v", chunkIndex, req.ReqID, err)
 					return
@@ -912,11 +969,13 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 
 				log.Printf("AGENT STREAMING: Sent chunk %d (%d bytes) | ReqID: %s", chunkIndex, n, req.ReqID)
 				chunkIndex++
+				lastWriteTime = time.Now() // Update last write time
 			}
 
 			if err != nil {
 				if err == io.EOF {
 					// Stream ended normally
+					log.Printf("AGENT STREAMING: Stream ended with EOF | ReqID: %s | TotalChunks: %d", req.ReqID, chunkIndex)
 					endFrame := ChunkedRespFrame{
 						Type:        "streaming_end",
 						ReqID:       req.ReqID,

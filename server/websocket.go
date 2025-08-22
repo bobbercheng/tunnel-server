@@ -183,9 +183,25 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		var msgType websocket.MessageType
 		var data []byte
-		msgType, data, err = conn.Read(context.Background()) // Use background to avoid context cancellation issues
+
+		// Use a shorter timeout for reads to detect connection issues faster
+		readCtx, readCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		msgType, data, err = conn.Read(readCtx)
+		readCancel()
+
 		if err != nil {
-			log.Printf("WebSocket read error for agent %s: %v", id, err)
+			// Check if this is a normal closure or temporary network issue
+			errStr := err.Error()
+			if strings.Contains(errStr, "normal closure") || strings.Contains(errStr, "status = 1000") {
+				log.Printf("WebSocket connection closed normally for agent %s", id)
+			} else if strings.Contains(errStr, "going away") || strings.Contains(errStr, "status = 1001") {
+				log.Printf("WebSocket connection going away for agent %s", id)
+			} else if strings.Contains(errStr, "EOF") || strings.Contains(errStr, "connection reset") {
+				log.Printf("WebSocket connection lost for agent %s (network issue): %v", id, err)
+			} else {
+				log.Printf("WebSocket read error for agent %s: %v", id, err)
+			}
+
 			connCancel() // Cancel our connection context to stop all related goroutines
 			break
 		}
@@ -195,7 +211,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		go ac.handleMessage(data)
+		// Process message in goroutine but with connection context
+		go func(msgData []byte) {
+			select {
+			case <-connCtx.Done():
+				// Connection was closed, don't process message
+				return
+			default:
+				ac.handleMessage(msgData)
+			}
+		}(data)
 	}
 }
 
@@ -453,6 +478,9 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		return
 	}
 
+	// DIAGNOSTIC: Log the raw decrypted message
+	log.Printf("SERVER WEBSOCKET: Received decrypted message | AgentID: %s | RawData: %s", ac.id, string(data))
+
 	// Parse message type
 	var baseMsg struct {
 		Type string `json:"type"`
@@ -461,6 +489,9 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		log.Printf("Failed to parse message type from agent %s: %v", ac.id, err)
 		return
 	}
+
+	// DIAGNOSTIC: Log the parsed message type
+	log.Printf("SERVER WEBSOCKET: Parsed message type | AgentID: %s | Type: '%s'", ac.id, baseMsg.Type)
 
 	switch baseMsg.Type {
 	case "resp":
@@ -473,6 +504,8 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		ac.handleStreamingChunk(data)
 	case "streaming_end":
 		ac.handleStreamingEnd(data)
+	case "streaming_heartbeat":
+		ac.handleStreamingHeartbeat(data)
 	case "websocket_upgrade_success":
 		ac.handleWebSocketUpgradeSuccess(data)
 	case "websocket_frame":
@@ -708,7 +741,8 @@ func (ac *agentConn) handleTunnelInfo(data []byte) {
 
 // pingRoutine sends periodic ping messages to monitor connection health
 func (ac *agentConn) pingRoutine(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	// Use shorter intervals for better connection health monitoring
+	ticker := time.NewTicker(15 * time.Second) // Reduced from 30s to 15s
 	defer ticker.Stop()
 
 	// Check immediately on startup for already expired connections (timeout check only, no ping)
@@ -716,7 +750,8 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 	lastPong := ac.lastPong
 	ac.pingMu.RUnlock()
 
-	if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
+	// More lenient timeout for cloud environments and streaming
+	if time.Since(lastPong) > 5*time.Minute { // Increased from 3m to 5m
 		log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
 		// Force close the WebSocket to trigger cleanup
 		ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
@@ -729,7 +764,8 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 		lastPong := ac.lastPong
 		ac.pingMu.RUnlock()
 
-		if time.Since(lastPong) > 3*time.Minute { // More lenient for cloud environments
+		// More lenient timeout for cloud environments and streaming
+		if time.Since(lastPong) > 5*time.Minute { // Increased from 3m to 5m
 			log.Printf("Agent %s appears to be unresponsive (no pong in %v), forcing connection close", ac.id, time.Since(lastPong))
 			// Force close the WebSocket to trigger cleanup
 			ac.ws.Close(websocket.StatusGoingAway, "unresponsive")
@@ -747,6 +783,8 @@ func (ac *agentConn) pingRoutine(ctx context.Context) {
 			log.Printf("Failed to send ping to agent %s: %v", ac.id, err)
 			return false // Signal to stop
 		}
+
+		log.Printf("Sent ping to agent %s (last pong: %v ago)", ac.id, time.Since(lastPong))
 		return true // Continue
 	}
 
@@ -926,6 +964,9 @@ func (ac *agentConn) handleStreamingStart(data []byte) {
 
 // handleStreamingChunk processes streaming data chunks
 func (ac *agentConn) handleStreamingChunk(data []byte) {
+	// DIAGNOSTIC: Log the raw chunk data
+	log.Printf("SERVER STREAMING: Processing streaming chunk | AgentID: %s | RawData: %s", ac.id, string(data))
+
 	var frame ChunkedRespFrame
 	if err := json.Unmarshal(data, &frame); err != nil {
 		log.Printf("Failed to parse streaming_chunk from agent %s: %v", ac.id, err)
@@ -953,6 +994,10 @@ func (ac *agentConn) handleStreamingChunk(data []byte) {
 		Headers: nil, // Headers only in start frame
 		Body:    frame.Data,
 	}
+
+	// DIAGNOSTIC: Log what we're sending to the waiter
+	log.Printf("SERVER STREAMING: Sending chunk %d to waiter | ReqID: %s | Type: '%s' | Size: %d bytes",
+		frame.ChunkIndex, frame.ReqID, resp.Type, len(resp.Body))
 
 	// Send to waiter without removing it (streaming continues)
 	select {
@@ -1006,6 +1051,23 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 		log.Printf("SERVER STREAMING: Failed to send streaming_end (channel full) | ReqID: %s", frame.ReqID)
 	}
 	close(ch)
+}
+
+// handleStreamingHeartbeat processes streaming heartbeat messages
+func (ac *agentConn) handleStreamingHeartbeat(data []byte) {
+	var heartbeat HeartbeatFrame
+	if err := json.Unmarshal(data, &heartbeat); err != nil {
+		log.Printf("Failed to parse streaming_heartbeat from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("SERVER STREAMING: Received heartbeat from agent %s | ReqID: %s | Timestamp: %d",
+		ac.id, heartbeat.ReqID, heartbeat.Timestamp)
+
+	// Update last pong time for streaming connections
+	ac.pingMu.Lock()
+	ac.lastPong = time.Now()
+	ac.pingMu.Unlock()
 }
 
 // getAgent retrieves an agent connection by ID
