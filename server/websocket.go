@@ -118,14 +118,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			ac.tcpConnsMu.Unlock()
 
+			// Calculate connection duration for monitoring timeout effectiveness
+			connectionDuration := time.Since(ac.connectedAt)
+			
 			if ac.geoData != nil && ac.geoData.Country != "" {
 				if ac.geoData.City != "" {
-					log.Printf("Agent %s disconnected from %s, %s, %s (%s)", ac.id, ac.geoData.Country, ac.geoData.Region, ac.geoData.City, ac.clientIP)
+					log.Printf("Agent %s disconnected from %s, %s, %s (%s) after %v", ac.id, ac.geoData.Country, ac.geoData.Region, ac.geoData.City, ac.clientIP, connectionDuration)
 				} else {
-					log.Printf("Agent %s disconnected from %s, %s (%s)", ac.id, ac.geoData.Country, ac.geoData.Region, ac.clientIP)
+					log.Printf("Agent %s disconnected from %s, %s (%s) after %v", ac.id, ac.geoData.Country, ac.geoData.Region, ac.clientIP, connectionDuration)
 				}
 			} else {
-				log.Printf("Agent %s disconnected from %s", ac.id, ac.clientIP)
+				log.Printf("Agent %s disconnected from %s after %v", ac.id, ac.clientIP, connectionDuration)
 			}
 		}
 	}()

@@ -25,6 +25,7 @@ URL=$(gcloud run deploy $SERVICE \
   --image $IMAGE_NAME \
   --platform managed --region $REGION \
   --allow-unauthenticated --max-instances=1 \
+  --timeout=3600 \
   --format='value(status.url)') \
 && gcloud run services update $SERVICE \
   --platform managed --region $REGION \
