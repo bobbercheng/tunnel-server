@@ -74,6 +74,9 @@ func main() {
 		CustomURL:   *customURL,
 		UseRedirect: *useRedirect,
 	}
+	
+	// Initialize request queue management
+	agent.InitializeQueue()
 
 	agent.Run()
 }

@@ -175,9 +175,22 @@ type agentConn struct {
 	streamingMu       sync.Mutex
 	streamingSessions map[string]bool // reqID -> whether streaming_start has been processed
 
+	// Response queue management for connection recovery
+	responseQueueMu sync.Mutex
+	responseQueue   []*PendingResponse
+	maxResponseQueueSize int
+	responseQueueTimeout time.Duration
+
 	// Connection health monitoring
 	lastPong time.Time
 	pingMu   sync.RWMutex
+}
+
+// PendingResponse represents a response waiting to be delivered during connection recovery  
+type PendingResponse struct {
+	Response  *RespFrame
+	CreatedAt time.Time
+	ReqID     string
 }
 
 // ChunkedResponse tracks assembly of chunked responses

@@ -985,3 +985,115 @@ func init() {
 
 	initGeoIP()
 }
+
+// registerRequestCorrelation records the mapping between request ID and tunnel ID
+func registerRequestCorrelation(reqID, tunnelID string) {
+	globalRequestCorrelationMu.Lock()
+	defer globalRequestCorrelationMu.Unlock()
+	globalRequestCorrelation[reqID] = tunnelID
+}
+
+// getRequestTunnel retrieves the tunnel ID for a given request ID
+func getRequestTunnel(reqID string) (string, bool) {
+	globalRequestCorrelationMu.RLock()
+	defer globalRequestCorrelationMu.RUnlock()
+	tunnelID, exists := globalRequestCorrelation[reqID]
+	return tunnelID, exists
+}
+
+// cleanupRequestCorrelation removes the correlation for a completed request
+func cleanupRequestCorrelation(reqID string) {
+	globalRequestCorrelationMu.Lock()
+	defer globalRequestCorrelationMu.Unlock()
+	delete(globalRequestCorrelation, reqID)
+}
+
+// deliverResponseAcrossConnections attempts to deliver a response even if the original connection changed
+func deliverResponseAcrossConnections(response *RespFrame) bool {
+	// First try to get the tunnel ID for this request
+	tunnelID, exists := getRequestTunnel(response.ReqID)
+	if !exists {
+		return false
+	}
+	
+	// Try to find the current agent connection
+	agentsMu.RLock()
+	ac, exists := agents[tunnelID]
+	agentsMu.RUnlock()
+	
+	if !exists {
+		// Agent is not connected, queue the response
+		log.Printf("SERVER CORRELATION: Agent %s not connected, response %s will be lost", tunnelID, response.ReqID)
+		return false
+	}
+	
+	// Try to deliver to current connection
+	ac.respMu.Lock()
+	defer ac.respMu.Unlock()
+	
+	ch, exists := ac.waiters[response.ReqID]
+	if !exists {
+		// No waiter found, queue for later delivery
+		log.Printf("SERVER CORRELATION: No waiter for %s, queueing response", response.ReqID)
+		return ac.queueResponse(response)
+	}
+	
+	// Try to deliver immediately
+	select {
+	case ch <- response:
+		log.Printf("SERVER CORRELATION: Delivered response %s across connection boundaries", response.ReqID)
+		cleanupRequestCorrelation(response.ReqID)
+		return true
+	default:
+		// Channel full, queue it
+		log.Printf("SERVER CORRELATION: Channel full for %s, queueing response", response.ReqID)
+		return ac.queueResponse(response)
+	}
+}
+
+// monitorServerHealth monitors server resources and connection health
+func monitorServerHealth() {
+	agentsMu.RLock()
+	activeConnections := len(agents)
+	agentsMu.RUnlock()
+	
+	globalRequestCorrelationMu.RLock()
+	pendingRequests := len(globalRequestCorrelation)
+	globalRequestCorrelationMu.RUnlock()
+	
+	customURLsMu.RLock()
+	activeCustomURLs := len(customURLs)
+	customURLsMu.RUnlock()
+	
+	tunnelsMu.RLock()
+	activeTunnels := len(tunnels)
+	tunnelsMu.RUnlock()
+	
+	// Calculate total queued responses across all agents
+	totalQueuedResponses := 0
+	agentsMu.RLock()
+	for _, ac := range agents {
+		ac.responseQueueMu.Lock()
+		totalQueuedResponses += len(ac.responseQueue)
+		ac.responseQueueMu.Unlock()
+	}
+	agentsMu.RUnlock()
+	
+	// Log comprehensive health status
+	log.Printf("SERVER HEALTH: Connections=%d, Tunnels=%d, CustomURLs=%d, PendingRequests=%d, QueuedResponses=%d",
+		activeConnections, activeTunnels, activeCustomURLs, pendingRequests, totalQueuedResponses)
+	
+	// Warning thresholds
+	if pendingRequests > 100 {
+		log.Printf("SERVER HEALTH WARNING: High number of pending requests (%d), possible connection issues", pendingRequests)
+	}
+	
+	if totalQueuedResponses > 50 {
+		log.Printf("SERVER HEALTH WARNING: High number of queued responses (%d), agents may be reconnecting frequently", totalQueuedResponses)
+	}
+	
+	// Memory pressure warnings (basic check)
+	if activeConnections > 100 {
+		log.Printf("SERVER HEALTH INFO: High connection count (%d), monitoring for resource usage", activeConnections)
+	}
+}

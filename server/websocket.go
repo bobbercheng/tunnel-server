@@ -64,17 +64,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	geoData := lookupIPGeoData(clientIP)
 
 	ac := &agentConn{
-		id:               id,     // Will be empty for new connections until registration
-		secret:           secret, // Will be empty for new connections until registration
-		ws:               conn,
-		connectedAt:      time.Now(),
-		clientIP:         clientIP,
-		geoData:          geoData,
-		waiters:           make(map[string]chan *RespFrame),
-		tcpConns:          make(map[string]*TcpConn),
-		chunkedResponses:  make(map[string]*ChunkedResponse),
-		streamingSessions: make(map[string]bool),
-		lastPong:          time.Now(),
+		id:                   id,     // Will be empty for new connections until registration
+		secret:               secret, // Will be empty for new connections until registration
+		ws:                   conn,
+		connectedAt:          time.Now(),
+		clientIP:             clientIP,
+		geoData:              geoData,
+		waiters:              make(map[string]chan *RespFrame),
+		tcpConns:             make(map[string]*TcpConn),
+		chunkedResponses:     make(map[string]*ChunkedResponse),
+		streamingSessions:    make(map[string]bool),
+		responseQueue:        make([]*PendingResponse, 0, 50),
+		maxResponseQueueSize: 50,
+		responseQueueTimeout: 60 * time.Second,
+		lastPong:             time.Now(),
 	}
 
 	// For reconnections, register agent immediately
@@ -159,6 +162,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("Agent %s reconnected with encrypted tunnel (protocol: %s) from %s", id, existingTunnel.Protocol, clientIP)
 		}
+		
+		// Process any queued responses from previous connection
+		go ac.processQueuedResponses()
 	} else {
 		if geoData != nil && geoData.Country != "" {
 			if geoData.City != "" {
@@ -446,6 +452,9 @@ func (ac *agentConn) registerWaiter(reqID string, ch chan *RespFrame) {
 	ac.respMu.Lock()
 	defer ac.respMu.Unlock()
 	ac.waiters[reqID] = ch
+	
+	// Register global request correlation for cross-connection delivery
+	registerRequestCorrelation(reqID, ac.id)
 }
 
 // writeEncrypted writes an encrypted message to the WebSocket
@@ -1114,6 +1123,73 @@ func (ac *agentConn) handleStreamingEnd(data []byte) {
 	
 	log.Printf("SERVER STREAMING: Cleaned up streaming session and closing channel | ReqID: %s", frame.ReqID)
 	close(ch)
+}
+
+// queueResponse adds a response to the queue when connection is down
+func (ac *agentConn) queueResponse(response *RespFrame) bool {
+	ac.responseQueueMu.Lock()
+	defer ac.responseQueueMu.Unlock()
+	
+	// Check if queue is full
+	if len(ac.responseQueue) >= ac.maxResponseQueueSize {
+		log.Printf("SERVER QUEUE: Response queue full for agent %s, dropping response %s", ac.id, response.ReqID)
+		return false
+	}
+	
+	pending := &PendingResponse{
+		Response:  response,
+		CreatedAt: time.Now(),
+		ReqID:     response.ReqID,
+	}
+	
+	ac.responseQueue = append(ac.responseQueue, pending)
+	log.Printf("SERVER QUEUE: Queued response %s for agent %s (queue size: %d)", response.ReqID, ac.id, len(ac.responseQueue))
+	return true
+}
+
+// processQueuedResponses sends all queued responses when connection is restored
+func (ac *agentConn) processQueuedResponses() {
+	ac.responseQueueMu.Lock()
+	defer ac.responseQueueMu.Unlock()
+	
+	if len(ac.responseQueue) == 0 {
+		return
+	}
+	
+	log.Printf("SERVER QUEUE: Processing %d queued responses for agent %s after reconnection", len(ac.responseQueue), ac.id)
+	
+	processed := 0
+	for i, pending := range ac.responseQueue {
+		// Skip expired responses
+		if time.Since(pending.CreatedAt) > ac.responseQueueTimeout {
+			log.Printf("SERVER QUEUE: Response %s expired for agent %s, skipping", pending.ReqID, ac.id)
+			continue
+		}
+		
+		// Try to find a waiter for this response
+		ac.respMu.Lock()
+		ch, exists := ac.waiters[pending.ReqID]
+		if exists {
+			// Try to send the response
+			select {
+			case ch <- pending.Response:
+				log.Printf("SERVER QUEUE: Delivered queued response %s to agent %s", pending.ReqID, ac.id)
+				processed++
+			default:
+				log.Printf("SERVER QUEUE: Failed to deliver response %s to agent %s (channel full)", pending.ReqID, ac.id)
+			}
+		} else {
+			log.Printf("SERVER QUEUE: No waiter found for queued response %s for agent %s", pending.ReqID, ac.id)
+		}
+		ac.respMu.Unlock()
+		
+		// Mark as processed
+		ac.responseQueue[i] = nil
+	}
+	
+	// Clean up processed responses
+	ac.responseQueue = ac.responseQueue[:0]
+	log.Printf("SERVER QUEUE: Processed %d queued responses for agent %s", processed, ac.id)
 }
 
 // handleStreamingHeartbeat processes streaming heartbeat messages

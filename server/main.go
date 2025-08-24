@@ -54,6 +54,16 @@ func main() {
 			affinityManager.CleanupDisconnectedTunnels()              // Remove affinities for disconnected tunnels
 		}
 	}()
+	
+	// Start server health monitoring
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute) // Monitor every 5 minutes
+		defer ticker.Stop()
+
+		for range ticker.C {
+			monitorServerHealth()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__ws__", wsHandler) // agent websocket

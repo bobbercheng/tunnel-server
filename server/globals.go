@@ -25,6 +25,10 @@ var (
 	// Custom URL affinity manager
 	affinityManager *AffinityManager
 
+	// Global request correlation for cross-connection delivery
+	globalRequestCorrelation   = make(map[string]string) // reqID -> tunnelID
+	globalRequestCorrelationMu sync.RWMutex
+
 	// Metrics for usage tracking
 	tunnelMetrics = metrics.NewTunnelMetrics()
 )
