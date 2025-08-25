@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	server := flag.String("server", "", "Cloud Run base, e.g. https://<service>-<hash>-uc.a.run.app")
+	server := flag.String("server", "https://connect.vexorium.net", "Cloud Run base (default: https://connect.vexorium.net)")
 	publicURL := flag.String("public-url", "", "Public URL of the tunnel, e.g. https://<service>/__pub__/<id>")
 	local := flag.String("local", "http://127.0.0.1:8080", "local http service")
 	id := flag.String("id", "", "tunnel id (optional)")
@@ -55,10 +55,6 @@ func main() {
 		tunnelID = pathParts[1]
 		tunnelSecret = *secret
 	} else {
-		if *server == "" {
-			fmt.Println("--server is required if --public-url is not provided")
-			os.Exit(1)
-		}
 		serverURL = *server
 		tunnelID = *id
 		tunnelSecret = *secret
@@ -74,7 +70,7 @@ func main() {
 		CustomURL:   *customURL,
 		UseRedirect: *useRedirect,
 	}
-	
+
 	// Initialize request queue management
 	agent.InitializeQueue()
 

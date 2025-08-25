@@ -114,24 +114,24 @@ This path relies on the server code's fallback to `r.Host` when `PUBLIC_BASE_URL
 
 3. **Capture the service URL** (shown after deploy). Example:
    ```
-   https://tunnel-server-abc123-uc.a.run.app
+   https://connect.vexorium.net
    ```
 
 4. **Run the agent** next to your internal HTTP service
    ```bash
    cd agent
    go run . \
-     --server https://tunnel-server-abc123-uc.a.run.app \
+     --server https://connect.vexorium.net \
      --local  http://127.0.0.1:8080
    ```
    The agent will:
    - Connect to WebSocket at `/__ws__` and register over encrypted connection
-   - Print `public_url` (e.g. `https://tunnel-server-abc123-uc.a.run.app/__pub__/<id>`)
+   - Print `public_url` (e.g. `https://connect.vexorium.net/__pub__/<id>`)
    - Maintain persistent encrypted tunnel
 
 5. **Test**
    ```bash
-   curl -i https://tunnel-server-abc123-uc.a.run.app/__pub__/<id>/
+   curl -i https://connect.vexorium.net/__pub__/<id>/
    ```
    You should see the same response as your local service at `http://127.0.0.1:8080/`
 
@@ -178,7 +178,7 @@ After=network-online.target
 [Service]
 User=youruser
 ExecStart=/usr/local/bin/agent \
-  --server https://tunnel-server-abc123-uc.a.run.app \
+  --server https://connect.vexorium.net \
   --local  http://127.0.0.1:8080 \
   --custom-url myapp \
   --use-redirect
@@ -217,7 +217,7 @@ The server provides an opt-in **hybrid redirection solution** that:
 # React/Vue/Angular app with SPA redirection
 cd agent
 go run . \
-  --server https://tunnel-server-abc123-uc.a.run.app \
+  --server https://connect.vexorium.net \
   --local http://localhost:3000 \
   --custom-url myapp \
   --use-redirect
@@ -234,8 +234,8 @@ No tunnel id/secret provided, registering new tunnel...
 Registered successfully!
   ID: abc123-def456-789abc-012def
   Secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  Public URL: https://tunnel-server-abc123-uc.a.run.app/__pub__/abc123-def456-789abc-012def
-  Custom URL: https://tunnel-server-abc123-uc.a.run.app/myapp
+  Public URL: https://connect.vexorium.net/__pub__/abc123-def456-789abc-012def
+  Custom URL: https://connect.vexorium.net/myapp
   SPA Redirection: Enabled
 ```
 
@@ -250,12 +250,12 @@ npm start  # runs on http://localhost:3000
 
 # Agent with SPA redirection
 ./agent-bin \
-  --server https://tunnel-server-abc123-uc.a.run.app \
+  --server https://connect.vexorium.net \
   --local http://localhost:3000 \
   --custom-url company/dashboard \
   --use-redirect
 
-# Access via: https://tunnel-server-abc123-uc.a.run.app/company/dashboard
+# Access via: https://connect.vexorium.net/company/dashboard
 # React Router works normally - no code changes needed!
 ```
 
@@ -266,7 +266,7 @@ npm run serve  # runs on http://localhost:8080
 
 # Agent for Vue SPA
 ./agent-bin \
-  --server https://tunnel-server-abc123-uc.a.run.app \
+  --server https://connect.vexorium.net \
   --local http://localhost:8080 \
   --custom-url client/app \
   --use-redirect
@@ -279,7 +279,7 @@ ng serve  # runs on http://localhost:4200
 
 # Agent for Angular SPA
 ./agent-bin \
-  --server https://tunnel-server-abc123-uc.a.run.app \
+  --server https://connect.vexorium.net \
   --local http://localhost:4200 \
   --custom-url demo/angular \
   --use-redirect

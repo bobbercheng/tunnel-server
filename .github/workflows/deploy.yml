@@ -147,7 +147,7 @@ jobs:
         # Update with environment variables
         gcloud run services update $SERVICE_NAME \
           --platform managed --region $GCP_REGION \
-          --set-env-vars PUBLIC_BASE_URL=$URL \
+          --set-env-vars PUBLIC_BASE_URL=https://connect.vexorium.net \
           --update-annotations="prometheus.io/scrape=true,prometheus.io/path=/__metrics__,prometheus.io/port=8080"
         
         echo "Deployment complete! Service URL: $URL"

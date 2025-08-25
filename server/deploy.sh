@@ -29,7 +29,7 @@ URL=$(gcloud run deploy $SERVICE \
   --format='value(status.url)') \
 && gcloud run services update $SERVICE \
   --platform managed --region $REGION \
-  --set-env-vars PUBLIC_BASE_URL=$URL \
+  --set-env-vars PUBLIC_BASE_URL=https://connect.vexorium.net \
   --update-annotations="prometheus.io/scrape=true,prometheus.io/path=/__metrics__,prometheus.io/port=8080"
 
 echo "Deployment complete! Service URL: $URL"
