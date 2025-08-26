@@ -11,8 +11,8 @@ env:
   GCP_REGION: us-east1
   SERVICE_NAME: tunnel-server
   IMAGE_NAME: gcr.io/contact-center-insights-poc/tunnel-server
-  GO_VERSION: '1.23'
-  GOTOOLCHAIN: local
+  GO_VERSION: '1.24'
+  GOTOOLCHAIN: auto
 
 jobs:
   test:
@@ -26,7 +26,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.23'
+        go-version: '1.24'
         cache: false
     
     - name: Clean Go cache before restoration
