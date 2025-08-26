@@ -84,7 +84,7 @@ cd server && docker build -f Dockerfile -t gcp-proxy-server ..
 cd server && ./deploy.sh
 
 # Other useful scripts
-cd server && ./logs.sh          # View Cloud Run logs
+cd server && ./logs.sh -l 1000          # View Cloud Run logs, 1000 is log line number.
 cd server && ./quick-logs.sh    # View recent logs
 cd server && ./restart.sh       # Restart Cloud Run service
 cd server && make build         # Build using Makefile
@@ -210,14 +210,14 @@ curl https://server/__pub__/abc123-def456/users
 - Streaming responses supported with timeouts
 - Use server/deploy.sh to deploy server to GCP
 - Always use GCP server to test client and proxy
-- GCP server url is https://tunnel-server-56084501768.us-east1.run.app
+- GCP server url is https://connect.vexorium.net
 - Always write new unit test for new feature and run unit test for regression test
 - Smart routing requires no application changes - works transparently with SPAs
 - TCP tunneling supports databases, SSH, and other TCP services
 - Health endpoint `/__health__` provides connection status and custom URL metrics
 - Custom URLs are case-sensitive and must be unique across the server
 - System endpoints use uncommon names (`__health__`, `__pub__`, etc.) to free up namespace
-- For server issue, please check GCP cloud run log for trouble shooting
+- For server issue, please check GCP cloud run log for trouble shooting. You can use tool `server/logs.sh -l 1000` to check server log.
 
 ## Client Updates Required
 

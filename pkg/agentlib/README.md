@@ -43,6 +43,8 @@ AgentLib implements a transparent proxy agent that:
 - **Session affinity** for multi-request workflows
 - **Geographic routing** support
 - **SPA redirection** for Single Page Applications
+- **Content rewriting** for HTML/JS/CSS URL replacement
+- **Header rewriting** for CORS and security headers
 - **Request/response metrics** and logging
 
 ## Usage
@@ -51,15 +53,42 @@ AgentLib implements a transparent proxy agent that:
 
 ```go
 agent := &agentlib.Agent{
-    ServerURL:   "https://tunnel-server.example.com",
-    LocalURL:    "http://localhost:8080",
-    Protocol:    "http",
-    CustomURL:   "my-app",
-    UseRedirect: true,
+    ServerURL:      "https://tunnel-server.example.com",
+    LocalURL:       "http://localhost:8080",
+    Protocol:       "http",
+    CustomURL:      "my-app",
+    UseRedirect:    true,
+    RewriteContent: false, // Optional: enable URL rewriting
+    RewriteHeaders: false, // Optional: enable CORS header rewriting
 }
 
 agent.InitializeQueue()
 agent.Run() // Blocks and maintains connection
+```
+
+### HTTP Tunnel with Content Rewriting
+
+```go
+agent := &agentlib.Agent{
+    ServerURL:      "https://tunnel-server.example.com",
+    LocalURL:       "http://localhost:8080",
+    Protocol:       "http",
+    CustomURL:      "my-app",
+    UseRedirect:    true,
+    RewriteContent: true,  // Enable content rewriting
+    RewriteHeaders: true,  // Enable header rewriting
+}
+
+agent.InitializeQueue()
+
+// Load custom rewrite rules (optional)
+err := agent.LoadRewriteConfig("custom-rules.json")
+if err != nil {
+    // Falls back to default rules if file loading fails
+    log.Printf("Using default rewrite rules: %v", err)
+}
+
+agent.Run()
 ```
 
 ### TCP Tunnel
@@ -91,6 +120,135 @@ agent.InitializeQueue()
 agent.Run()
 ```
 
+## Content Rewriting Configuration
+
+The agent supports user-configurable content rewriting to replace URLs in HTML, JavaScript, CSS, and JSON responses. This ensures all requests route through the tunnel properly.
+
+### Default Rules
+
+When content rewriting is enabled (`RewriteContent: true`), the agent automatically applies default rules based on the original domain extracted from `LocalURL`:
+
+```go
+// Default rules are generated automatically
+agent := &agentlib.Agent{
+    LocalURL: "https://chatgpt.com",  // Original domain: chatgpt.com
+    // ...
+    RewriteContent: true,
+}
+// Automatically creates rules to replace chatgpt.com → tunnel-domain.com
+```
+
+### Custom Rewrite Rules
+
+For advanced scenarios, you can define custom rewrite rules in a JSON configuration file:
+
+```json
+{
+  "rules": [
+    {
+      "name": "basic-url-replacement",
+      "pattern": "https://chatgpt\\.com",
+      "replacement": "https://connect.vexorium.net",
+      "content_types": ["text/html", "application/javascript", "text/css"],
+      "enabled": true
+    },
+    {
+      "name": "javascript-fetch-calls",
+      "pattern": "fetch\\s*\\(\\s*[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": "fetch(\"https://connect.vexorium.net$1\"",
+      "content_types": ["application/javascript"],
+      "enabled": true
+    },
+    {
+      "name": "css-url-function",
+      "pattern": "url\\s*\\(\\s*[\"']?https://chatgpt\\.com(/[^\"'\\)]*)?[\"']?\\s*\\)",
+      "replacement": "url(\"https://connect.vexorium.net$1\")",
+      "content_types": ["text/css", "text/html"],
+      "enabled": false
+    }
+  ]
+}
+```
+
+### Rule Configuration Fields
+
+- **name**: Human-readable identifier for the rule
+- **pattern**: Regular expression pattern to match (uses Go regex syntax)
+- **replacement**: Replacement template (supports capture groups `$1`, `$2`, etc.)
+- **content_types**: Array of MIME types where this rule applies
+- **enabled**: Boolean to toggle the rule on/off
+
+### Content Type Matching
+
+Rules are applied only to responses with matching Content-Type headers:
+
+- **text/html**: Web pages, HTML fragments
+- **application/javascript**: JavaScript files, API responses
+- **text/css**: Stylesheets, CSS files
+- **application/json**: JSON API responses, configuration files
+- **text/plain**: Plain text (sometimes used for JavaScript)
+
+### Command-Line Usage
+
+```bash
+# Use default rules
+./agent-bin --rewrite-content --local https://chatgpt.com
+
+# Use custom rules file
+./agent-bin --rewrite-content --rewrite-rules-file custom-rules.json --local https://chatgpt.com
+
+# Enable both content and header rewriting
+./agent-bin --rewrite-content --rewrite-headers --local https://chatgpt.com
+```
+
+### Regex Pattern Examples
+
+Common patterns for different scenarios:
+
+```json
+{
+  "rules": [
+    {
+      "name": "absolute-urls",
+      "pattern": "https://example\\.com(/[^\"'\\s\\)>]*)?",
+      "replacement": "https://tunnel.example.com$1"
+    },
+    {
+      "name": "api-endpoints",
+      "pattern": "\"/api/([^\"]*)",
+      "replacement": "\"https://tunnel.example.com/api/$1"
+    },
+    {
+      "name": "javascript-variables",
+      "pattern": "(const|let|var)\\s+(\\w+)\\s*=\\s*[\"']https://example\\.com[\"']",
+      "replacement": "$1 $2 = \"https://tunnel.example.com\""
+    }
+  ]
+}
+```
+
+### Performance Considerations
+
+- Rules are compiled once at startup for optimal performance
+- Only enabled rules matching the content type are processed
+- Rules are applied in the order they appear in the configuration
+- Large rule sets may impact response latency for text-heavy content
+
+### Debugging Rewrite Rules
+
+Enable detailed logging to debug rule matching:
+
+```bash
+AGENT_LOG_LEVEL=debug ./agent-bin --rewrite-content --rewrite-rules-file debug-rules.json
+```
+
+Log output shows which rules matched and what replacements were made:
+
+```
+REWRITE: Applied rule 'basic-url-replacement' | Matches: 3 | Patterns: [...] | ReqID: abc123
+REWRITE SUCCESS: Content modified | Original: 1024 bytes → Rewritten: 1056 bytes | Total matches: 5
+```
+
 ## Architecture
 
 ### Agent Structure
@@ -102,10 +260,13 @@ type Agent struct {
     LocalURL    string // Local service URL
     ID          string // Tunnel identifier
     Secret      string // Authentication secret
-    Protocol    string // "http" or "tcp"
-    Port        int    // TCP port (for TCP tunnels)
-    CustomURL   string // Human-readable URL path
-    UseRedirect bool   // Enable SPA redirection
+    Protocol       string // "http" or "tcp"
+    Port           int    // TCP port (for TCP tunnels)
+    CustomURL      string // Human-readable URL path
+    UseRedirect    bool   // Enable SPA redirection
+    RewriteContent bool   // Enable content rewriting for HTML/JS/CSS
+    RewriteHeaders bool   // Enable response header rewriting for CORS
+    RewriteConfig  *RewriteConfig // User-defined rewriting rules
 
     // Browser Client (for HTTP)
     browserClient *http.Client // Browser-configured HTTP client
@@ -124,6 +285,24 @@ type Agent struct {
     
     // TCP Connections
     tcpConns map[string]net.Conn // Active TCP connections
+}
+```
+
+### Rewrite Configuration Types
+
+```go
+// RewriteRule defines a user-configurable content rewriting pattern
+type RewriteRule struct {
+    Name         string   `json:"name"`          // Human-readable rule name
+    Pattern      string   `json:"pattern"`       // Regex pattern to match
+    Replacement  string   `json:"replacement"`   // Replacement template (supports $1, $2, etc.)
+    ContentTypes []string `json:"content_types"` // Apply only to these content types
+    Enabled      bool     `json:"enabled"`       // Toggle rule on/off
+}
+
+// RewriteConfig holds the complete rewriting configuration
+type RewriteConfig struct {
+    Rules []RewriteRule `json:"rules"` // List of rewrite rules
 }
 ```
 

@@ -1,0 +1,74 @@
+{
+  "rules": [
+    {
+      "name": "basic-url-replacement",
+      "pattern": "https://chatgpt\\.com",
+      "replacement": "https://connect.vexorium.net",
+      "content_types": ["text/html", "application/javascript", "text/css", "application/json"],
+      "enabled": true
+    },
+    {
+      "name": "protocol-relative-urls",
+      "pattern": "//chatgpt\\.com",
+      "replacement": "//connect.vexorium.net",
+      "content_types": ["text/html", "application/javascript", "text/css"],
+      "enabled": true
+    },
+    {
+      "name": "javascript-variable-assignment",
+      "pattern": "(const|let|var)\\s+(\\w+)\\s*=\\s*[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": "$1 $2 = \"https://connect.vexorium.net$3\"",
+      "content_types": ["application/javascript", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "javascript-template-literals",
+      "pattern": "`([^`]*https://)chatgpt\\.com(/[^`]*)?`",
+      "replacement": "`$1connect.vexorium.net$2`",
+      "content_types": ["application/javascript", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "json-property-urls",
+      "pattern": "\"([^\"]*)\": \"https://chatgpt\\.com(/[^\"]*)?",
+      "replacement": "\"$1\": \"https://connect.vexorium.net$2\"",
+      "content_types": ["application/json", "application/javascript"],
+      "enabled": true
+    },
+    {
+      "name": "css-url-function",
+      "pattern": "url\\s*\\(\\s*[\"']?https://chatgpt\\.com(/[^\"'\\)]*)?[\"']?\\s*\\)",
+      "replacement": "url(\"https://connect.vexorium.net$1\")",
+      "content_types": ["text/css", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "css-import-statement",
+      "pattern": "@import\\s+(?:url\\s*\\(\\s*)?[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": "@import \"https://connect.vexorium.net$1\"",
+      "content_types": ["text/css", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "fetch-api-calls",
+      "pattern": "fetch\\s*\\(\\s*[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": "fetch(\"https://connect.vexorium.net$1\"",
+      "content_types": ["application/javascript", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "xmlhttprequest-open",
+      "pattern": "\\.open\\s*\\(\\s*[\"'](GET|POST|PUT|DELETE)[\"']\\s*,\\s*[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": ".open(\"$1\", \"https://connect.vexorium.net$2\"",
+      "content_types": ["application/javascript", "text/html"],
+      "enabled": true
+    },
+    {
+      "name": "new-url-constructor",
+      "pattern": "new\\s+URL\\s*\\(\\s*[\"']https://chatgpt\\.com(/[^\"']*)?[\"']",
+      "replacement": "new URL(\"https://connect.vexorium.net$1\"",
+      "content_types": ["application/javascript", "text/html"],
+      "enabled": true
+    }
+  ]
+}

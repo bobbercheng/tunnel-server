@@ -4,21 +4,28 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	crypto "tunnel.local/crypto"
+	utls "github.com/refraction-networking/utls"
 
+	"golang.org/x/net/http2"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -145,6 +152,21 @@ type HeartbeatFrame struct {
 	Timestamp   int64               `json:"timestamp"`         // Unix timestamp
 }
 
+// RewriteRule defines a user-configurable content rewriting pattern
+type RewriteRule struct {
+	Name         string   `json:"name"`          // Human-readable rule name
+	Pattern      string   `json:"pattern"`       // Regex pattern to match
+	Replacement  string   `json:"replacement"`   // Replacement template (supports $1, $2, etc.)
+	ContentTypes []string `json:"content_types"` // Apply only to these content types
+	Enabled      bool     `json:"enabled"`       // Toggle rule on/off
+	compiledRegex *regexp.Regexp // cached compiled regex (not exported)
+}
+
+// RewriteConfig holds the complete rewriting configuration
+type RewriteConfig struct {
+	Rules []RewriteRule `json:"rules"` // List of rewrite rules
+}
+
 // TunnelInfoFrame is sent by agent to provide tunnel details during reconnection
 type TunnelInfoFrame struct {
 	Type     string `json:"type"`     // "tunnel_info"
@@ -160,14 +182,17 @@ var (
 )
 
 type Agent struct {
-	ServerURL   string
-	LocalURL    string
-	ID          string
-	Secret      string
-	Protocol    string // "http" or "tcp"
-	Port        int    // for TCP tunnels
-	CustomURL   string // custom URL for this tunnel
-	UseRedirect bool   // enable SPA redirection
+	ServerURL      string
+	LocalURL       string
+	ID             string
+	Secret         string
+	Protocol       string // "http" or "tcp"
+	Port           int    // for TCP tunnels
+	CustomURL      string // custom URL for this tunnel
+	UseRedirect    bool   // enable SPA redirection
+	RewriteContent bool   // enable content rewriting for HTML/JS/CSS
+	RewriteHeaders bool   // enable response header rewriting for CORS
+	RewriteConfig  *RewriteConfig // user-defined rewriting rules
 
 	// Retry state
 	consecutiveDNSFailures     int
@@ -226,6 +251,105 @@ func (a *Agent) InitializeQueue() {
 	a.chunkedResps = make(map[string]*ChunkedResponse)
 	a.streamingResps = make(map[string]*http.Response)
 	a.tcpConns = make(map[string]net.Conn)
+}
+
+// LoadRewriteConfig loads rewrite rules from a JSON file
+func (a *Agent) LoadRewriteConfig(filePath string) error {
+	if filePath == "" {
+		// Initialize with default rules
+		a.RewriteConfig = a.getDefaultRewriteConfig()
+		return nil
+	}
+	
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read rewrite config file: %w", err)
+	}
+	
+	var config RewriteConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("failed to parse rewrite config JSON: %w", err)
+	}
+	
+	// Compile regex patterns for enabled rules
+	for i := range config.Rules {
+		rule := &config.Rules[i]
+		if rule.Enabled && rule.Pattern != "" {
+			compiled, err := regexp.Compile(rule.Pattern)
+			if err != nil {
+				return fmt.Errorf("failed to compile regex pattern '%s' for rule '%s': %w", 
+					rule.Pattern, rule.Name, err)
+			}
+			rule.compiledRegex = compiled
+		}
+	}
+	
+	a.RewriteConfig = &config
+	log.Printf("REWRITE CONFIG: Loaded %d rules from %s", len(config.Rules), filePath)
+	return nil
+}
+
+// getDefaultRewriteConfig returns a set of common rewrite rules
+func (a *Agent) getDefaultRewriteConfig() *RewriteConfig {
+	originalDomain := a.getOriginalDomain()
+	if originalDomain == "" {
+		originalDomain = "example.com" // fallback for generic rules
+	}
+	tunnelBase := "https://" + a.getServerDomain()
+	
+	rules := []RewriteRule{
+		{
+			Name:         "basic-url-replacement",
+			Pattern:      fmt.Sprintf("https://%s", regexp.QuoteMeta(originalDomain)),
+			Replacement:  tunnelBase,
+			ContentTypes: []string{"text/html", "application/javascript", "text/css", "application/json"},
+			Enabled:      true,
+		},
+		{
+			Name:         "protocol-relative-urls",
+			Pattern:      fmt.Sprintf("//%s", regexp.QuoteMeta(originalDomain)),
+			Replacement:  "//" + a.getServerDomain(),
+			ContentTypes: []string{"text/html", "application/javascript", "text/css"},
+			Enabled:      true,
+		},
+		{
+			Name:         "javascript-variable-assignment",
+			Pattern:      fmt.Sprintf(`(const|let|var)\s+(\w+)\s*=\s*["']https://%s(/[^"']*)?["']`, regexp.QuoteMeta(originalDomain)),
+			Replacement:  fmt.Sprintf(`$1 $2 = "%s$3"`, tunnelBase),
+			ContentTypes: []string{"application/javascript", "text/html"},
+			Enabled:      true,
+		},
+		{
+			Name:         "json-property-urls",
+			Pattern:      fmt.Sprintf(`"([^"]*)":\s*"https://%s(/[^"]*)?`, regexp.QuoteMeta(originalDomain)),
+			Replacement:  fmt.Sprintf(`"$1": "%s$2"`, tunnelBase),
+			ContentTypes: []string{"application/json", "application/javascript"},
+			Enabled:      true,
+		},
+		{
+			Name:         "css-url-function",
+			Pattern:      fmt.Sprintf(`url\s*\(\s*["']?https://%s(/[^"'\)]*)?["']?\s*\)`, regexp.QuoteMeta(originalDomain)),
+			Replacement:  fmt.Sprintf(`url("%s$1")`, tunnelBase),
+			ContentTypes: []string{"text/css", "text/html"},
+			Enabled:      true,
+		},
+	}
+	
+	// Compile all default patterns
+	for i := range rules {
+		rule := &rules[i]
+		if rule.Enabled && rule.Pattern != "" {
+			compiled, err := regexp.Compile(rule.Pattern)
+			if err != nil {
+				log.Printf("REWRITE CONFIG: Warning - failed to compile default pattern '%s': %v", rule.Pattern, err)
+				rule.Enabled = false
+				continue
+			}
+			rule.compiledRegex = compiled
+		}
+	}
+	
+	return &RewriteConfig{Rules: rules}
 }
 
 // setConnectionState updates the connection state thread-safely
@@ -833,6 +957,597 @@ func (a *Agent) runOnce() error {
 	return returnErr
 }
 
+// Browser client specifications for realistic TLS fingerprinting
+var browserSpecs = []utls.ClientHelloID{
+	utls.HelloChrome_Auto,    // Latest Chrome
+	utls.HelloFirefox_120,    // Firefox 120
+	utls.HelloSafari_16_0,    // Safari 16.0
+	utls.HelloEdge_106,       // Edge 106
+}
+
+// uTLSRoundTripper implements http.RoundTripper with proper HTTP/2 protocol handling
+type uTLSRoundTripper struct {
+	spec utls.ClientHelloID
+	h2Transport  *http2.Transport
+	h1Transport  *http.Transport
+}
+
+// newUTLSRoundTripper creates a new uTLS round tripper with the specified browser fingerprint
+func newUTLSRoundTripper(spec utls.ClientHelloID) *uTLSRoundTripper {
+	return &uTLSRoundTripper{
+		spec: spec,
+		h2Transport: &http2.Transport{
+			AllowHTTP: false,
+			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return dialUTLS(network, addr, cfg, spec)
+			},
+		},
+		h1Transport: &http.Transport{
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DialTLS: func(network, addr string) (net.Conn, error) {
+				return dialUTLS(network, addr, nil, spec)
+			},
+		},
+	}
+}
+
+// dialUTLS creates a uTLS connection with the specified browser fingerprint
+func dialUTLS(network, addr string, cfg *tls.Config, spec utls.ClientHelloID) (net.Conn, error) {
+	// Establish TCP connection
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	
+	tcpConn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("TCP dial failed: %w", err)
+	}
+	
+	// Extract hostname for SNI
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // Fallback if port is missing
+	}
+	
+	// Configure uTLS
+	config := &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: false,
+	}
+	
+	// Copy additional config if provided
+	if cfg != nil {
+		config.NextProtos = cfg.NextProtos
+		config.ServerName = cfg.ServerName
+	}
+	
+	// Create uTLS connection with browser fingerprint
+	uConn := utls.UClient(tcpConn, config, spec)
+	
+	// Perform TLS handshake
+	if err := uConn.Handshake(); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("uTLS handshake failed: %w", err)
+	}
+	
+	// Log connection details
+	connState := uConn.ConnectionState()
+	log.Printf("uTLS: Connection established | Host: %s | Protocol: %s | TLS: %x | Spec: %s",
+		host, connState.NegotiatedProtocol, connState.Version, spec.Str())
+	
+	return uConn, nil
+}
+
+// rewriteContent rewrites response content using configurable user-defined rules
+func (a *Agent) rewriteContent(body []byte, contentType string, req *ReqFrame) []byte {
+	// Only rewrite HTML, CSS, and JavaScript content
+	if !a.shouldRewriteContent(contentType) {
+		return body
+	}
+
+	// Ensure we have rewrite config loaded (fallback to defaults)
+	if a.RewriteConfig == nil {
+		a.RewriteConfig = a.getDefaultRewriteConfig()
+	}
+
+	content := string(body)
+	originalSize := len(content)
+	rewritten := content
+	totalMatches := 0
+
+	log.Printf("REWRITE: Processing content | ContentType: %s | Size: %d bytes | Rules: %d | ReqID: %s",
+		contentType, originalSize, len(a.RewriteConfig.Rules), req.ReqID)
+
+	// Apply each enabled rule that matches the content type
+	for _, rule := range a.RewriteConfig.Rules {
+		if !rule.Enabled || rule.compiledRegex == nil {
+			continue
+		}
+
+		// Check if this rule applies to the current content type
+		if !a.ruleMatchesContentType(rule, contentType) {
+			continue
+		}
+
+		// Apply the rule
+		matches := rule.compiledRegex.FindAllString(rewritten, -1)
+		if len(matches) > 0 {
+			rewritten = rule.compiledRegex.ReplaceAllString(rewritten, rule.Replacement)
+			totalMatches += len(matches)
+			log.Printf("REWRITE: Applied rule '%s' | Matches: %d | Patterns: %v | ReqID: %s",
+				rule.Name, len(matches), matches, req.ReqID)
+		}
+	}
+
+	rewrittenSize := len(rewritten)
+	if totalMatches > 0 {
+		log.Printf("REWRITE SUCCESS: Content modified | Original: %d bytes → Rewritten: %d bytes | Total matches: %d | ReqID: %s",
+			originalSize, rewrittenSize, totalMatches, req.ReqID)
+	} else {
+		log.Printf("REWRITE: No rules matched | ContentType: %s | Size: %d bytes | ReqID: %s",
+			contentType, originalSize, req.ReqID)
+	}
+
+	return []byte(rewritten)
+}
+
+// ruleMatchesContentType checks if a rewrite rule should be applied to the given content type
+func (a *Agent) ruleMatchesContentType(rule RewriteRule, contentType string) bool {
+	if len(rule.ContentTypes) == 0 {
+		return true // No restrictions - apply to all content types
+	}
+
+	contentType = strings.ToLower(contentType)
+	for _, ruleType := range rule.ContentTypes {
+		if strings.Contains(contentType, strings.ToLower(ruleType)) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldRewriteContent determines if content should be rewritten based on Content-Type
+func (a *Agent) shouldRewriteContent(contentType string) bool {
+	contentType = strings.ToLower(contentType)
+	
+	rewriteTypes := []string{
+		"text/html",
+		"application/javascript",
+		"text/javascript", 
+		"application/x-javascript",
+		"text/css",
+		"application/json",
+		"text/plain", // Sometimes JavaScript is served as text/plain
+		"text/x-json",
+	}
+
+	for _, t := range rewriteTypes {
+		if strings.Contains(contentType, t) {
+			return true
+		}
+	}
+	return false
+}
+
+
+// rewriteResponseHeaders rewrites HTTP response headers to replace original domain references
+func (a *Agent) rewriteResponseHeaders(headers http.Header, req *ReqFrame) {
+	originalDomain := a.getOriginalDomain()
+	tunnelDomain := a.getServerDomain()
+	
+	if originalDomain == "" || tunnelDomain == "" {
+		return
+	}
+
+	headersModified := 0
+
+	// CORS headers that need domain rewriting
+	corsHeaders := []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Credentials", 
+		"Access-Control-Allow-Headers",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Expose-Headers",
+	}
+
+	// Security headers that may reference domains
+	securityHeaders := []string{
+		"Content-Security-Policy",
+		"Content-Security-Policy-Report-Only",
+		"Referrer-Policy",
+		"Permissions-Policy",
+		"Feature-Policy",
+	}
+
+	// Location headers for redirects
+	locationHeaders := []string{
+		"Location",
+		"Refresh",
+	}
+
+	// Process CORS headers
+	for _, header := range corsHeaders {
+		if values := headers[header]; len(values) > 0 {
+			for i, value := range values {
+				originalValue := value
+				// Replace domain references in CORS headers
+				newValue := strings.ReplaceAll(value, originalDomain, tunnelDomain)
+				newValue = strings.ReplaceAll(newValue, "https://"+originalDomain, "https://"+tunnelDomain)
+				newValue = strings.ReplaceAll(newValue, "http://"+originalDomain, "https://"+tunnelDomain) // Force HTTPS
+				
+				if newValue != originalValue {
+					headers[header][i] = newValue
+					headersModified++
+					log.Printf("REWRITE: CORS header %s | Original: %s | Rewritten: %s | ReqID: %s", 
+						header, originalValue, newValue, req.ReqID)
+				}
+			}
+		}
+	}
+
+	// Process security headers with more complex patterns
+	for _, header := range securityHeaders {
+		if values := headers[header]; len(values) > 0 {
+			for i, value := range values {
+				originalValue := value
+				newValue := value
+				
+				// Handle Content-Security-Policy directives
+				if header == "Content-Security-Policy" || header == "Content-Security-Policy-Report-Only" {
+					// Replace domain in various CSP directives
+					newValue = strings.ReplaceAll(newValue, "https://"+originalDomain, "https://"+tunnelDomain)
+					newValue = strings.ReplaceAll(newValue, "http://"+originalDomain, "https://"+tunnelDomain)
+					newValue = strings.ReplaceAll(newValue, "wss://"+originalDomain, "wss://"+tunnelDomain)
+					newValue = strings.ReplaceAll(newValue, "ws://"+originalDomain, "wss://"+tunnelDomain)
+					// Handle wildcards and subdomains
+					newValue = strings.ReplaceAll(newValue, "*."+originalDomain, "*."+tunnelDomain)
+				} else {
+					// For other security headers, do basic domain replacement
+					newValue = strings.ReplaceAll(newValue, originalDomain, tunnelDomain)
+				}
+				
+				if newValue != originalValue {
+					headers[header][i] = newValue
+					headersModified++
+					log.Printf("REWRITE: Security header %s | Original: %s | Rewritten: %s | ReqID: %s", 
+						header, originalValue, newValue, req.ReqID)
+				}
+			}
+		}
+	}
+
+	// Process location headers for redirects
+	for _, header := range locationHeaders {
+		if values := headers[header]; len(values) > 0 {
+			for i, value := range values {
+				originalValue := value
+				
+				// Handle absolute URLs in location headers
+				newValue := strings.ReplaceAll(value, "https://"+originalDomain, "https://"+tunnelDomain+a.getCustomURLPath())
+				newValue = strings.ReplaceAll(newValue, "http://"+originalDomain, "https://"+tunnelDomain+a.getCustomURLPath())
+				
+				// Handle relative URLs that might become absolute
+				if strings.HasPrefix(newValue, "/") && !strings.HasPrefix(newValue, "//") {
+					newValue = "https://" + tunnelDomain + a.getCustomURLPath() + newValue
+				}
+				
+				if newValue != originalValue {
+					headers[header][i] = newValue
+					headersModified++
+					log.Printf("REWRITE: Location header %s | Original: %s | Rewritten: %s | ReqID: %s", 
+						header, originalValue, newValue, req.ReqID)
+				}
+			}
+		}
+	}
+
+	// Handle Set-Cookie headers to update domain attributes
+	if cookies := headers["Set-Cookie"]; len(cookies) > 0 {
+		for i, cookie := range cookies {
+			originalCookie := cookie
+			
+			// Replace domain attributes in cookies
+			newCookie := strings.ReplaceAll(cookie, "Domain="+originalDomain, "Domain="+tunnelDomain)
+			newCookie = strings.ReplaceAll(newCookie, "domain="+originalDomain, "domain="+tunnelDomain)
+			newCookie = strings.ReplaceAll(newCookie, "Domain=."+originalDomain, "Domain=."+tunnelDomain)
+			newCookie = strings.ReplaceAll(newCookie, "domain=."+originalDomain, "domain=."+tunnelDomain)
+			
+			if newCookie != originalCookie {
+				headers["Set-Cookie"][i] = newCookie  
+				headersModified++
+				log.Printf("REWRITE: Cookie header | Original: %s | Rewritten: %s | ReqID: %s", 
+					originalCookie, newCookie, req.ReqID)
+			}
+		}
+	}
+
+	if headersModified > 0 {
+		log.Printf("REWRITE: Headers modified | Count: %d | ReqID: %s", headersModified, req.ReqID)
+	}
+}
+
+// getOriginalDomain extracts domain from LocalURL (e.g., "chatgpt.com" from "https://chatgpt.com")
+func (a *Agent) getOriginalDomain() string {
+	if a.LocalURL == "" {
+		return ""
+	}
+	
+	// Parse the URL to extract hostname
+	if u, err := url.Parse(a.LocalURL); err == nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// getServerDomain returns the tunnel server domain (e.g., "connect.vexorium.net")
+func (a *Agent) getServerDomain() string {
+	if a.ServerURL == "" {
+		return ""
+	}
+	
+	if u, err := url.Parse(a.ServerURL); err == nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// getCustomURLPath returns the custom URL path (e.g., "/chatgpt-roundtripper-test")
+func (a *Agent) getCustomURLPath() string {
+	if a.CustomURL == "" {
+		return ""
+	}
+	return "/" + a.CustomURL
+}
+
+// getTunnelBaseURL returns the full tunnel base URL
+func (a *Agent) getTunnelBaseURL() string {
+	serverDomain := a.getServerDomain()
+	customPath := a.getCustomURLPath()
+	
+	if serverDomain == "" || customPath == "" {
+		return ""
+	}
+	
+	return "https://" + serverDomain + customPath
+}
+
+// rewriteJavaScriptAPICalls handles JavaScript fetch() and XMLHttpRequest rewriting
+func (a *Agent) rewriteJavaScriptAPICalls(content, originalDomain, tunnelBase string) string {
+	// Pattern for fetch() calls with absolute URLs
+	// fetch("https://chatgpt.com/api/...") → fetch("/chatgpt-tunnel/api/...")
+	
+	// Simple regex-like replacements for common patterns
+	patterns := []struct {
+		old string
+		new string
+	}{
+		// fetch() with double quotes
+		{`fetch("https://` + originalDomain + `/`, `fetch("` + tunnelBase + `/`},
+		{`fetch("https://` + originalDomain + `"`, `fetch("` + tunnelBase + `"`},
+		// fetch() with single quotes  
+		{`fetch('https://` + originalDomain + `/`, `fetch('` + tunnelBase + `/`},
+		{`fetch('https://` + originalDomain + `'`, `fetch('` + tunnelBase + `'`},
+		// XMLHttpRequest.open()
+		{`.open("GET", "https://` + originalDomain + `/`, `.open("GET", "` + tunnelBase + `/`},
+		{`.open('GET', 'https://` + originalDomain + `/`, `.open('GET', '` + tunnelBase + `/`},
+		// jQuery and axios
+		{`$.get("https://` + originalDomain + `/`, `$.get("` + tunnelBase + `/`},
+		{`axios.get("https://` + originalDomain + `/`, `axios.get("` + tunnelBase + `/`},
+		// WebSocket connections
+		{`new WebSocket("wss://` + originalDomain + `/`, `new WebSocket("wss://` + a.getServerDomain() + a.getCustomURLPath() + `/`},
+	}
+	
+	result := content
+	for _, p := range patterns {
+		result = strings.ReplaceAll(result, p.old, p.new)
+	}
+	
+	return result
+}
+
+// rewriteCSSURLs handles CSS url() and @import rewriting
+func (a *Agent) rewriteCSSURLs(content, originalDomain, tunnelBase string) string {
+	patterns := []struct {
+		old string
+		new string
+	}{
+		// CSS url() with various quote styles
+		{`url("https://` + originalDomain + `/`, `url("` + tunnelBase + `/`},
+		{`url('https://` + originalDomain + `/`, `url('` + tunnelBase + `/`},
+		{`url(https://` + originalDomain + `/`, `url(` + tunnelBase + `/`},
+		// @import statements
+		{`@import "https://` + originalDomain + `/`, `@import "` + tunnelBase + `/`},
+		{`@import 'https://` + originalDomain + `/`, `@import '` + tunnelBase + `/`},
+		{`@import url("https://` + originalDomain + `/`, `@import url("` + tunnelBase + `/`},
+	}
+	
+	result := content
+	for _, p := range patterns {
+		result = strings.ReplaceAll(result, p.old, p.new)
+	}
+	
+	return result
+}
+
+// RoundTrip implements the RoundTripper interface with protocol detection
+func (u *uTLSRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	log.Printf("uTLS: RoundTrip called for %s | Spec: %s", req.URL.String(), u.spec.Str())
+	
+	// For HTTP/2, try h2 transport first since it can negotiate protocol
+	if req.URL.Scheme == "https" {
+		resp, err := u.h2Transport.RoundTrip(req)
+		if err != nil {
+			// If H2 fails, fall back to H1
+			log.Printf("uTLS: HTTP/2 failed, falling back to HTTP/1.1: %v", err)
+			return u.h1Transport.RoundTrip(req)
+		}
+		return resp, nil
+	}
+	
+	// For HTTP, use h1 transport
+	return u.h1Transport.RoundTrip(req)
+}
+
+// createUTLSTransport creates a HTTP transport with uTLS for browser-like TLS handshakes
+func createUTLSTransport(isLocalhost bool) *http.Transport {
+	// Select a random browser spec for TLS fingerprint diversity
+	spec := browserSpecs[rand.Intn(len(browserSpecs))]
+	
+	// Create custom dialer with uTLS
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConnsPerHost:   20,
+		ForceAttemptHTTP2:     false, // Disable HTTP/2 to avoid protocol issues with uTLS
+		
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Force IPv4 for localhost connections to avoid IPv6 issues
+			if isLocalhost && (strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:")) {
+				return dialer.DialContext(ctx, "tcp4", addr)
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+		
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Use uTLS for external connections to avoid detection
+			if !isLocalhost {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				
+				// Establish TCP connection first
+				conn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				
+				// Create uTLS connection with browser-like handshake
+				uConn := utls.UClient(conn, &utls.Config{
+					ServerName:         host,
+					InsecureSkipVerify: false,
+					NextProtos:         []string{"http/1.1"}, // Force HTTP/1.1 only
+				}, spec)
+				
+				// Perform TLS handshake
+				err = uConn.HandshakeContext(ctx)
+				if err != nil {
+					conn.Close()
+					return nil, err
+				}
+				
+				log.Printf("uTLS: Established connection using %s fingerprint | Host: %s:%s", 
+					spec.Str(), host, port)
+				return uConn, nil
+			}
+			
+			// Use standard TLS for localhost
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+	
+	return transport
+}
+
+// createBrowserClient creates an HTTP client with uTLS and browser-like characteristics
+func createBrowserClient(isLocalhost bool) *http.Client {
+	// Create cookie jar for session persistence
+	jar, _ := cookiejar.New(&cookiejar.Options{})
+	
+	var transport http.RoundTripper
+	if isLocalhost {
+		// Use standard transport for localhost
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}
+				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
+					return dialer.DialContext(ctx, "tcp4", addr)
+				}
+				return dialer.DialContext(ctx, network, addr)
+			},
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	} else {
+		// Use uTLS round tripper for external requests with proper HTTP/2 support
+		spec := browserSpecs[rand.Intn(len(browserSpecs))]
+		transport = newUTLSRoundTripper(spec)
+	}
+	
+	return &http.Client{
+		Timeout:   120 * time.Second,
+		Transport: transport,
+		Jar:       jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Allow up to 10 redirects (browser-like)
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+}
+
+// createStreamingBrowserClient creates an HTTP client for streaming with no timeout
+func createStreamingBrowserClient(isLocalhost bool) *http.Client {
+	// Create cookie jar for session persistence
+	jar, _ := cookiejar.New(&cookiejar.Options{})
+	
+	var transport http.RoundTripper
+	if isLocalhost {
+		// Use standard transport for localhost
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}
+				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
+					return dialer.DialContext(ctx, "tcp4", addr)
+				}
+				return dialer.DialContext(ctx, network, addr)
+			},
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	} else {
+		// Use uTLS round tripper for external requests with proper HTTP/2 support
+		spec := browserSpecs[rand.Intn(len(browserSpecs))]
+		transport = newUTLSRoundTripper(spec)
+	}
+	
+	return &http.Client{
+		Timeout:   0, // No timeout for streaming responses
+		Transport: transport,
+		Jar:       jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Allow up to 10 redirects (browser-like)
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+}
+
 func (a *Agent) forward(rd *ReqFrame) (int, map[string][]string, []byte, error) {
 	return a.forwardInternal(rd, nil, nil)
 }
@@ -865,18 +1580,16 @@ func (a *Agent) forwardInternal(rd *ReqFrame, ctx context.Context, writeEncrypte
 		}
 	}
 
-	// Create HTTP client that forces IPv4 for localhost connections
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Force IPv4 for localhost connections to avoid IPv6 issues
-				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
-					return net.DialTimeout("tcp4", addr, 10*time.Second)
-				}
-				return net.DialTimeout(network, addr, 10*time.Second)
-			},
-		},
+	// Determine if this is a localhost request
+	isLocalhost := strings.Contains(target, "127.0.0.1") || strings.Contains(target, "localhost")
+	
+	// Create uTLS-enabled HTTP client for browser-like TLS fingerprinting
+	client := createBrowserClient(isLocalhost)
+	
+	if isLocalhost {
+		log.Printf("FORWARD: Using standard TLS for localhost | Target: %s | ReqID: %s", target, rd.ReqID)
+	} else {
+		log.Printf("FORWARD: Using uTLS browser fingerprint for external target | Target: %s | ReqID: %s", target, rd.ReqID)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -926,6 +1639,16 @@ func (a *Agent) forwardInternal(rd *ReqFrame, ctx context.Context, writeEncrypte
 		log.Printf("FORWARD ERROR: Failed to read response body | Target: %s | ReqID: %s | Error: %v",
 			target, rd.ReqID, err)
 		return resp.StatusCode, resp.Header, nil, err
+	}
+
+	// Apply content rewriting for HTML/CSS/JS responses (if enabled)
+	if a.RewriteContent {
+		b = a.rewriteContent(b, contentType, rd)
+	}
+
+	// Rewrite CORS and security headers (if enabled)
+	if a.RewriteHeaders {
+		a.rewriteResponseHeaders(resp.Header, rd)
 	}
 
 	// Check if we hit the limit
@@ -1166,23 +1889,16 @@ func (a *Agent) handleStreamingRequest(ctx context.Context, req *ReqFrame, statu
 		}
 	}
 
-	// Create HTTP client with better timeout handling
-	client := &http.Client{
-		Timeout: 0, // No timeout for streaming responses
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Force IPv4 for localhost connections to avoid IPv6 issues
-				if strings.Contains(addr, "127.0.0.1:") || strings.Contains(addr, "localhost:") {
-					return net.DialTimeout("tcp4", addr, 10*time.Second)
-				}
-				return net.DialTimeout(network, addr, 10*time.Second)
-			},
-			// Add connection pooling and keep-alive settings
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+	// Determine if this is a localhost request
+	isLocalhost := strings.Contains(target, "127.0.0.1") || strings.Contains(target, "localhost")
+	
+	// Create uTLS-enabled streaming HTTP client for browser-like TLS fingerprinting
+	client := createStreamingBrowserClient(isLocalhost)
+	
+	if isLocalhost {
+		log.Printf("AGENT STREAMING: Using standard TLS for localhost | Target: %s | ReqID: %s", target, req.ReqID)
+	} else {
+		log.Printf("AGENT STREAMING: Using uTLS browser fingerprint for external target | Target: %s | ReqID: %s", target, req.ReqID)
 	}
 
 	resp, err := client.Do(httpReq)
