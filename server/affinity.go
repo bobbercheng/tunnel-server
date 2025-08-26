@@ -34,6 +34,10 @@ type AffinityActivity struct {
 	TunnelID    string    `json:"tunnel_id"`
 	CustomURL   string    `json:"custom_url"`
 	Reason      string    `json:"reason,omitempty"`
+	ClientIP    string    `json:"client_ip,omitempty"`
+	Country     string    `json:"country,omitempty"`
+	Region      string    `json:"region,omitempty"`
+	City        string    `json:"city,omitempty"`
 }
 
 // AffinityManager manages client-to-tunnel affinities based on custom URL access
@@ -56,6 +60,11 @@ func NewAffinityManager() *AffinityManager {
 
 // SetAffinity creates or updates a client's affinity to a tunnel
 func (am *AffinityManager) SetAffinity(clientKey, tunnelID, customURL, source string) {
+	am.SetAffinityWithIP(clientKey, tunnelID, customURL, source, "")
+}
+
+// SetAffinityWithIP creates or updates a client's affinity to a tunnel with client IP for geo tracking
+func (am *AffinityManager) SetAffinityWithIP(clientKey, tunnelID, customURL, source, clientIP string) {
 	am.mutex.Lock()
 	defer am.mutex.Unlock()
 
@@ -89,9 +98,15 @@ func (am *AffinityManager) SetAffinity(clientKey, tunnelID, customURL, source st
 				   clientKey, tunnelID, customURL, source)
 	}
 
+	// Lookup geolocation data if client IP is provided
+	var geoData *IPGeoData
+	if clientIP != "" {
+		geoData = lookupIPGeoData(clientIP)
+	}
+
 	// Update metrics
 	am.metrics.AffinitiesByURL[customURL]++
-	am.addActivity("created", clientKey, tunnelID, customURL, "")
+	am.addActivityWithGeo("created", clientKey, tunnelID, customURL, "", clientIP, geoData)
 }
 
 // GetAffinity retrieves a client's current affinity
@@ -141,6 +156,11 @@ func (am *AffinityManager) GetValidatedAffinity(clientKey string) *CustomURLAffi
 
 // UpdateAccess updates the last access time and increments access count
 func (am *AffinityManager) UpdateAccess(clientKey string) {
+	am.UpdateAccessWithIP(clientKey, "")
+}
+
+// UpdateAccessWithIP updates access with client IP for geo tracking
+func (am *AffinityManager) UpdateAccessWithIP(clientKey, clientIP string) {
 	am.mutex.Lock()
 	defer am.mutex.Unlock()
 
@@ -148,7 +168,14 @@ func (am *AffinityManager) UpdateAccess(clientKey string) {
 	if exists {
 		affinity.LastAccess = time.Now()
 		affinity.AccessCount++
-		am.addActivity("used", clientKey, affinity.TunnelID, affinity.CustomURL, "")
+
+		// Lookup geolocation data if client IP is provided
+		var geoData *IPGeoData
+		if clientIP != "" {
+			geoData = lookupIPGeoData(clientIP)
+		}
+
+		am.addActivityWithGeo("used", clientKey, affinity.TunnelID, affinity.CustomURL, "", clientIP, geoData)
 	}
 }
 
@@ -309,6 +336,11 @@ func (am *AffinityManager) updateHitRate() {
 
 // Helper method to add activity (keeps last 100 events)
 func (am *AffinityManager) addActivity(action, clientKey, tunnelID, customURL, reason string) {
+	am.addActivityWithGeo(action, clientKey, tunnelID, customURL, reason, "", nil)
+}
+
+// addActivityWithGeo adds activity with client IP and geolocation information
+func (am *AffinityManager) addActivityWithGeo(action, clientKey, tunnelID, customURL, reason, clientIP string, geoData *IPGeoData) {
 	activity := AffinityActivity{
 		Timestamp: time.Now(),
 		Action:    action,
@@ -316,6 +348,14 @@ func (am *AffinityManager) addActivity(action, clientKey, tunnelID, customURL, r
 		TunnelID:  tunnelID,
 		CustomURL: customURL,
 		Reason:    reason,
+		ClientIP:  clientIP,
+	}
+
+	// Add geolocation data if available
+	if geoData != nil {
+		activity.Country = geoData.Country
+		activity.Region = geoData.Region
+		activity.City = geoData.City
 	}
 
 	am.metrics.RecentActivity = append(am.metrics.RecentActivity, activity)

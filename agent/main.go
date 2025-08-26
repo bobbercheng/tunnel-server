@@ -23,6 +23,8 @@ func main() {
 	rewriteContent := flag.Bool("rewrite-content", false, "enable content rewriting to replace URLs in HTML/JS/CSS responses")
 	rewriteHeaders := flag.Bool("rewrite-headers", false, "enable response header rewriting for CORS and security headers")
 	rewriteRulesFile := flag.String("rewrite-rules-file", "", "path to JSON file containing custom rewrite rules (optional)")
+	debugLog := flag.Bool("debug-log", false, "enable debug logging of all requests and responses to file")
+	debugFile := flag.String("debug-file", "", "path to debug log file (defaults to debug_<tunnel_id>.log)")
 	flag.Parse()
 
 	// Validate TCP configuration
@@ -74,6 +76,8 @@ func main() {
 		UseRedirect:    *useRedirect,
 		RewriteContent: *rewriteContent,
 		RewriteHeaders: *rewriteHeaders,
+		DebugLog:       *debugLog,
+		DebugFile:      *debugFile,
 	}
 
 	// Initialize request queue management

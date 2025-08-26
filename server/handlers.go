@@ -410,7 +410,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[REDIRECT ALWAYS] UseRedirect: %t | ForwardPath: %s | ClientKey: %s | RequestURL: %s", useRedirect, forwardPath, clientKey, r.URL.Path)
 
 			// NEW: Set custom URL affinity for persistent routing (even when redirecting)
-			affinityManager.SetAffinity(clientKey, tunnelID, path, "custom_url_redirect")
+			clientIP := extractRealClientIP(r)
+			affinityManager.SetAffinityWithIP(clientKey, tunnelID, path, "custom_url_redirect", clientIP)
 
 			// Create or update redirection session for analytics tracking
 			redirectSession := getRedirectSession(clientKey, path)
@@ -448,7 +449,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 			clientKey := generateClientKey(r)
 
 			// NEW: Set custom URL affinity for persistent routing
-			affinityManager.SetAffinity(clientKey, tunnelID, path, "custom_url_visit")
+			clientIP := extractRealClientIP(r)
+			affinityManager.SetAffinityWithIP(clientKey, tunnelID, path, "custom_url_visit", clientIP)
 
 			// Create immediate tunnel binding for 2-second affinity window (legacy)
 			clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url")
@@ -489,7 +491,8 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 					clientKey := generateClientKey(r)
 
 					// NEW: Set custom URL affinity for persistent routing
-					affinityManager.SetAffinity(clientKey, tunnelID, parentPath, "custom_url_prefix")
+					clientIP := extractRealClientIP(r)
+					affinityManager.SetAffinityWithIP(clientKey, tunnelID, parentPath, "custom_url_prefix", clientIP)
 
 					// Create immediate tunnel binding for 2-second affinity window (legacy)
 					clientTracker.CreateImmediateBinding(clientKey, tunnelID, "custom_url_prefix")

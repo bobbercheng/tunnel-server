@@ -446,6 +446,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Generate client key for enhanced tracking
 	clientKey := generateClientKey(r)
+	clientIP := extractRealClientIP(r)
 	isAsset := isAssetRequest(r.URL.Path)
 	isAPI := isAPIRequest(r.URL.Path)
 
@@ -470,7 +471,7 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 			clientKey, affinity.TunnelID, affinity.CustomURL, affinity.Source, affinity.AccessCount)
 
 		if tryTunnelRouteWithBufferedBody(w, r, bodyBytes, affinity.TunnelID, isAsset) {
-			affinityManager.UpdateAccess(clientKey) // Update last access time and count
+			affinityManager.UpdateAccessWithIP(clientKey, clientIP) // Update last access time and count
 			log.Printf("[AFFINITY] Affinity routing successful | URL: %s | TunnelID: %s | CustomURL: %s", r.URL.Path, affinity.TunnelID, affinity.CustomURL)
 			return
 		} else {
@@ -496,7 +497,6 @@ func smartFallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// PRIORITY 1: Check for ANY redirect session associated with this IP (ultra-protective)
-	clientIP := extractRealClientIP(r)
 	clientTracker.mu.RLock()
 	if ipClients, exists := clientTracker.ipMappings[clientIP]; exists {
 		for _, ipClientKey := range ipClients {
@@ -610,10 +610,9 @@ continueRouting:
 
 				// CRITICAL: Set smart routing affinity for successful requests
 				customURL := getTunnelCustomURL(tunnelID)
-				affinityManager.SetAffinity(clientKey, tunnelID, customURL, "client_tracker_route")
+				affinityManager.SetAffinityWithIP(clientKey, tunnelID, customURL, "client_tracker_route", clientIP)
 
 				// Record geographical routing success (NEW)
-				clientIP := extractRealClientIP(r)
 				recordIPTunnelMapping(clientIP, tunnelID)
 
 				// Record asset mapping for non-asset requests (main pages)
@@ -642,7 +641,7 @@ continueRouting:
 
 			// CRITICAL: Set smart routing affinity for successful requests
 			customURL := getTunnelCustomURL(tunnelID)
-			affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ip_mapping_route")
+			affinityManager.SetAffinityWithIP(clientKey, tunnelID, customURL, "ip_mapping_route", clientIP)
 
 			// Record asset mapping for non-asset requests (main pages)
 			if !isAsset {
@@ -824,7 +823,7 @@ continueRouting:
 
 			// CRITICAL: Set smart routing affinity for successful requests
 			customURL := getTunnelCustomURL(successfulTunnelID)
-			affinityManager.SetAffinity(clientKey, successfulTunnelID, customURL, "parallel_route")
+			affinityManager.SetAffinityWithIP(clientKey, successfulTunnelID, customURL, "parallel_route", clientIP)
 
 			// Record geographical mapping (NEW)
 			recordIPTunnelMapping(clientIP, successfulTunnelID)
@@ -881,7 +880,7 @@ continueRouting:
 
 					// CRITICAL: Set smart routing affinity for successful requests
 					customURL := getTunnelCustomURL(tunnelID)
-					affinityManager.SetAffinity(clientKey, tunnelID, customURL, "ultimate_fallback_route")
+					affinityManager.SetAffinityWithIP(clientKey, tunnelID, customURL, "ultimate_fallback_route", clientIP)
 
 					// Record geographical mapping (NEW)
 					recordIPTunnelMapping(clientIP, tunnelID)

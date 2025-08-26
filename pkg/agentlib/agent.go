@@ -193,6 +193,8 @@ type Agent struct {
 	RewriteContent bool   // enable content rewriting for HTML/JS/CSS
 	RewriteHeaders bool   // enable response header rewriting for CORS
 	RewriteConfig  *RewriteConfig // user-defined rewriting rules
+	DebugLog       bool   // enable debug logging to file
+	DebugFile      string // path to debug log file
 
 	// Retry state
 	consecutiveDNSFailures     int
@@ -223,6 +225,10 @@ type Agent struct {
 	// Connection health monitoring
 	lastPong time.Time
 	pingMu   sync.RWMutex
+
+	// Debug logging
+	debugLogFile  *os.File
+	debugLogMu    sync.Mutex
 }
 
 // ChunkedResponse tracks partial chunked responses
@@ -433,6 +439,16 @@ func (a *Agent) queueRequest(reqFrame *ReqFrame, responseCh chan *RespFrame) boo
 }
 
 func (a *Agent) Run() {
+	// Initialize debug logging if enabled
+	if a.DebugLog {
+		err := a.initDebugLogging()
+		if err != nil {
+			log.Printf("AGENT DEBUG: Failed to initialize debug logging: %v", err)
+		} else {
+			log.Printf("AGENT DEBUG: Debug logging enabled to file: %s", a.getDebugFileName())
+		}
+	}
+
 	// Note: Registration now happens over WebSocket during connection
 
 	for {
@@ -471,6 +487,16 @@ func (a *Agent) Run() {
 			// Reset failure counters after successful re-registration
 			a.consecutiveDNSFailures = 0
 			a.consecutiveNetworkFailures = 0
+
+			// Re-initialize debug logging with new tunnel ID
+			if a.DebugLog {
+				err := a.initDebugLogging()
+				if err != nil {
+					log.Printf("AGENT DEBUG: Failed to re-initialize debug logging: %v", err)
+				} else {
+					log.Printf("AGENT DEBUG: Debug logging re-initialized for new tunnel ID: %s", a.ID)
+				}
+			}
 			log.Println("REREGISTRATION: Re-registered successfully!")
 			log.Printf("  Previous ID: %s", previousID)
 			log.Printf("  New ID: %s", a.ID)
@@ -2154,6 +2180,16 @@ func (a *Agent) registerOverWebSocket(ctx context.Context, ws *websocket.Conn, c
 	a.ID = regResp.ID
 	a.Secret = regResp.Secret
 
+	// Initialize debug logging now that we have tunnel ID
+	if a.DebugLog {
+		err := a.initDebugLogging()
+		if err != nil {
+			log.Printf("AGENT DEBUG: Failed to initialize debug logging: %v", err)
+		} else {
+			log.Printf("AGENT DEBUG: Debug logging initialized for tunnel ID: %s", a.ID)
+		}
+	}
+
 	// Log the URLs from server response
 	fmt.Println("  Public URL:", regResp.PublicURL)
 	if regResp.CustomURL != "" {
@@ -2531,6 +2567,9 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 	go func() {
 		defer wg.Done()
 
+		// Log debug request if enabled
+		a.logDebugRequest(req)
+
 		// Check if connection is still alive before processing
 		select {
 		case <-ctx.Done():
@@ -2583,6 +2622,9 @@ func (a *Agent) handleHttpRequest(ctx context.Context, req *ReqFrame, writeEncry
 			log.Printf("AGENT: Request completed successfully | ReqID: %s | TunnelID: %s | Status: %d | BodySize: %d",
 				req.ReqID, a.ID, status, len(body))
 		}
+
+		// Log debug response if enabled
+		a.logDebugResponse(req.ReqID, resp.Status, resp.Headers, resp.Body)
 
 		// Check if connection is still alive before writing
 		select {
@@ -2835,4 +2877,167 @@ func classifyNetworkError(err error) error {
 
 	// Default to network failure for unknown connection errors
 	return ErrNetworkFailure
+}
+
+// Debug logging functions
+
+// getDebugFileName returns the debug log file name, using tunnel ID if available
+func (a *Agent) getDebugFileName() string {
+	if a.DebugFile != "" {
+		return a.DebugFile
+	}
+	if a.ID != "" {
+		return fmt.Sprintf("debug_%s.log", a.ID)
+	}
+	return "debug_unknown.log"
+}
+
+// initDebugLogging sets up debug logging to file
+func (a *Agent) initDebugLogging() error {
+	if !a.DebugLog {
+		return nil
+	}
+
+	fileName := a.getDebugFileName()
+	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open debug log file %s: %v", fileName, err)
+	}
+
+	a.debugLogMu.Lock()
+	defer a.debugLogMu.Unlock()
+
+	// Close existing file if any
+	if a.debugLogFile != nil {
+		a.debugLogFile.Close()
+	}
+
+	a.debugLogFile = file
+	
+	// Write session start marker
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	header := fmt.Sprintf("\n=== DEBUG SESSION START: %s ===\n", timestamp)
+	_, err = a.debugLogFile.WriteString(header)
+	if err != nil {
+		return fmt.Errorf("failed to write debug log header: %v", err)
+	}
+
+	return nil
+}
+
+// logDebugRequest logs request details to debug file
+func (a *Agent) logDebugRequest(req *ReqFrame) {
+	if !a.DebugLog || a.debugLogFile == nil {
+		return
+	}
+
+	a.debugLogMu.Lock()
+	defer a.debugLogMu.Unlock()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+	
+	var logEntry strings.Builder
+	logEntry.WriteString(fmt.Sprintf("\n--- REQUEST %s ---\n", timestamp))
+	logEntry.WriteString(fmt.Sprintf("Tunnel ID: %s\n", a.ID))
+	logEntry.WriteString(fmt.Sprintf("Request ID: %s\n", req.ReqID))
+	logEntry.WriteString(fmt.Sprintf("Method: %s\n", req.Method))
+	logEntry.WriteString(fmt.Sprintf("Path: %s\n", req.Path))
+	if req.Query != "" {
+		logEntry.WriteString(fmt.Sprintf("Query: %s\n", req.Query))
+	}
+	
+	logEntry.WriteString("Headers:\n")
+	for name, values := range req.Headers {
+		for _, value := range values {
+			logEntry.WriteString(fmt.Sprintf("  %s: %s\n", name, value))
+		}
+	}
+	
+	if len(req.Body) > 0 {
+		logEntry.WriteString(fmt.Sprintf("Body Length: %d bytes\n", len(req.Body)))
+		// Log body content (truncated if too large)
+		bodyStr := string(req.Body)
+		if len(bodyStr) > 1000 {
+			bodyStr = bodyStr[:1000] + "... (truncated)"
+		}
+		logEntry.WriteString(fmt.Sprintf("Body Content:\n%s\n", bodyStr))
+	}
+	
+	a.debugLogFile.WriteString(logEntry.String())
+	a.debugLogFile.Sync() // Force write to disk
+}
+
+// logDebugResponse logs response details to debug file
+func (a *Agent) logDebugResponse(reqID string, status int, headers map[string][]string, body []byte) {
+	if !a.DebugLog || a.debugLogFile == nil {
+		return
+	}
+
+	a.debugLogMu.Lock()
+	defer a.debugLogMu.Unlock()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+	
+	var logEntry strings.Builder
+	logEntry.WriteString(fmt.Sprintf("\n--- RESPONSE %s ---\n", timestamp))
+	logEntry.WriteString(fmt.Sprintf("Tunnel ID: %s\n", a.ID))
+	logEntry.WriteString(fmt.Sprintf("Request ID: %s\n", reqID))
+	logEntry.WriteString(fmt.Sprintf("Status: %d\n", status))
+	
+	logEntry.WriteString("Headers:\n")
+	for name, values := range headers {
+		for _, value := range values {
+			logEntry.WriteString(fmt.Sprintf("  %s: %s\n", name, value))
+		}
+	}
+	
+	if len(body) > 0 {
+		logEntry.WriteString(fmt.Sprintf("Body Length: %d bytes\n", len(body)))
+		// Log body content (truncated if too large and non-binary)
+		if isBinaryContent(headers) {
+			logEntry.WriteString("Body Content: [Binary data]\n")
+		} else {
+			bodyStr := string(body)
+			if len(bodyStr) > 1000 {
+				bodyStr = bodyStr[:1000] + "... (truncated)"
+			}
+			logEntry.WriteString(fmt.Sprintf("Body Content:\n%s\n", bodyStr))
+		}
+	}
+	
+	a.debugLogFile.WriteString(logEntry.String())
+	a.debugLogFile.Sync() // Force write to disk
+}
+
+// isBinaryContent checks if the content is binary based on headers
+func isBinaryContent(headers map[string][]string) bool {
+	if contentType, exists := headers["Content-Type"]; exists && len(contentType) > 0 {
+		ct := strings.ToLower(contentType[0])
+		return strings.Contains(ct, "image/") || 
+			   strings.Contains(ct, "video/") || 
+			   strings.Contains(ct, "audio/") ||
+			   strings.Contains(ct, "application/octet-stream") ||
+			   strings.Contains(ct, "application/pdf")
+	}
+	return false
+}
+
+// closeDebugLogging closes the debug log file if open
+func (a *Agent) closeDebugLogging() {
+	if !a.DebugLog || a.debugLogFile == nil {
+		return
+	}
+
+	a.debugLogMu.Lock()
+	defer a.debugLogMu.Unlock()
+
+	// Write session end marker
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	footer := fmt.Sprintf("\n=== DEBUG SESSION END: %s ===\n", timestamp)
+	a.debugLogFile.WriteString(footer)
+	a.debugLogFile.Sync()
+
+	// Close the file
+	a.debugLogFile.Close()
+	a.debugLogFile = nil
 }
