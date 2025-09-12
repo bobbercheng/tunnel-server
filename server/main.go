@@ -72,7 +72,16 @@ func main() {
 	mux.HandleFunc("/__health__", healthHandler)
 	mux.Handle("/__metrics__", promhttp.Handler()) // Prometheus metrics endpoint
 	// Custom URL handler with smart fallback - must be last (catch-all)
-	mux.HandleFunc("/", customURLHandler)
+	// Wrap customURLHandler with proxy detection
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Check if this is an HTTP proxy request first
+		if isProxyRequest(r) {
+			proxyHandler(w, r)
+			return
+		}
+		// Otherwise, handle as normal custom URL or fallback
+		customURLHandler(w, r)
+	})
 
 	// Cloud Run: No tunnel persistence needed - agents will reconnect and provide tunnel info
 	log.Println("Starting stateless server for Cloud Run - agents will re-register tunnel info on reconnection")

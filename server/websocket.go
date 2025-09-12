@@ -549,6 +549,8 @@ func (ac *agentConn) handleMessage(encryptedData []byte) {
 		ac.handlePong(data)
 	case "tunnel_info":
 		ac.handleTunnelInfo(data)
+	case "proxy_resp":
+		ac.handleProxyResponse(data)
 	case "register":
 		// Registration should be handled during initial connection, not here
 		log.Printf("Unexpected register message from agent %s", ac.id)
@@ -1317,5 +1319,45 @@ func (ac *agentConn) handleWebSocketClose(data []byte) {
 	if exists && session.ClientConn != nil {
 		log.Printf("SERVER WEBSOCKET: Closing client connection | ReqID: %s", frame.ReqID)
 		session.ClientConn.Close(websocket.StatusNormalClosure, "Agent closed connection")
+	}
+}
+
+// handleProxyResponse processes HTTP proxy response messages from agent
+func (ac *agentConn) handleProxyResponse(data []byte) {
+	var proxyResp ProxyRespFrame
+	if err := json.Unmarshal(data, &proxyResp); err != nil {
+		log.Printf("Failed to parse proxy response from agent %s: %v", ac.id, err)
+		return
+	}
+
+	log.Printf("[HTTP PROXY] Received proxy response from agent %s: ReqID=%s, Status=%d, BodySize=%d", 
+		ac.id, proxyResp.ReqID, proxyResp.Status, len(proxyResp.Body))
+
+	// Convert ProxyRespFrame to RespFrame for compatibility with existing waiter system
+	resp := &RespFrame{
+		Type:    "proxy_resp",
+		ReqID:   proxyResp.ReqID,
+		Status:  proxyResp.Status,
+		Headers: proxyResp.Headers,
+		Body:    proxyResp.Body,
+	}
+
+	// Find and notify waiter
+	ac.respMu.Lock()
+	ch, exists := ac.waiters[proxyResp.ReqID]
+	if exists {
+		delete(ac.waiters, proxyResp.ReqID)
+	}
+	ac.respMu.Unlock()
+
+	if exists {
+		select {
+		case ch <- resp:
+			log.Printf("[HTTP PROXY] Sent proxy response to waiter: ReqID=%s", proxyResp.ReqID)
+		case <-time.After(1 * time.Second):
+			log.Printf("[HTTP PROXY] Timeout sending proxy response for reqID %s from agent %s", proxyResp.ReqID, ac.id)
+		}
+	} else {
+		log.Printf("[HTTP PROXY] No waiter found for proxy response: ReqID=%s", proxyResp.ReqID)
 	}
 }

@@ -22,6 +22,7 @@ AgentLib implements a transparent proxy agent that:
 - **HTTP Tunneling**: Forward HTTP requests with streaming support
 - **TCP Tunneling**: Raw TCP connection forwarding
 - **WebSocket Tunneling**: Bidirectional WebSocket frame forwarding
+- **HTTP Proxy Support**: Act as HTTP proxy destination for external requests
 - **Custom URLs**: Human-readable URLs instead of UUIDs
 
 ### 🤖 **Browser-Like HTTP Client**
@@ -328,6 +329,28 @@ type RespFrame struct {
     Status  int                 `json:"status"`
     Headers map[string][]string `json:"headers"`
     Body    []byte              `json:"body"`
+}
+```
+
+#### HTTP Proxy Messages
+```go
+// Proxy request from server to agent
+type ProxyReqFrame struct {
+    Type     string              `json:"type"`     // "proxy_req"
+    ReqID    string              `json:"req_id"`   // unique request identifier
+    Method   string              `json:"method"`   // HTTP method (GET, POST, etc.)
+    URL      string              `json:"url"`      // Full target URL to request
+    Headers  map[string][]string `json:"headers"`  // HTTP headers
+    Body     []byte              `json:"body"`     // Request body
+}
+
+// Proxy response from agent to server
+type ProxyRespFrame struct {
+    Type     string              `json:"type"`     // "proxy_resp"
+    ReqID    string              `json:"req_id"`   // request identifier
+    Status   int                 `json:"status"`   // HTTP status code
+    Headers  map[string][]string `json:"headers"`  // Response headers
+    Body     []byte              `json:"body"`     // Response body
 }
 ```
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -650,4 +651,189 @@ func startWebSocketForwarding(session *WebSocketSession) {
 
 	log.Printf("SERVER WEBSOCKET: Bidirectional forwarding started | ReqID: %s | TunnelID: %s",
 		session.ReqID, session.TunnelID)
+}
+
+// isProxyRequest detects if this is an HTTP proxy request
+func isProxyRequest(r *http.Request) bool {
+	// CONNECT method is used for HTTPS proxy tunneling
+	if r.Method == "CONNECT" {
+		return true
+	}
+	
+	// Check for absolute URLs in regular HTTP proxy requests
+	// Normal requests have relative paths, proxy requests have absolute URLs
+	if r.URL.IsAbs() && r.URL.Host != "" && r.URL.Host != r.Host {
+		return true
+	}
+	
+	// Check for proxy-style Host header that differs from URL
+	// This catches cases where URL was made relative but Host header remains absolute
+	if r.Host != "" && !strings.Contains(r.Host, "vexorium.net") && 
+	   !strings.Contains(r.Host, "localhost") && !strings.Contains(r.Host, "127.0.0.1") {
+		return strings.Contains(r.Header.Get("User-Agent"), "curl") || 
+			   strings.Contains(r.Header.Get("User-Agent"), "Chrome") ||
+			   strings.Contains(r.Header.Get("User-Agent"), "Firefox")
+	}
+	
+	return false
+}
+
+// proxyHandler handles HTTP proxy requests
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
+	log.Printf("[HTTP PROXY] Request: %s %s | Host: %s | Client IP: %s | User-Agent: %s", 
+		r.Method, r.URL.String(), r.Host, r.RemoteAddr, r.Header.Get("User-Agent"))
+	
+	// Extract Proxy-Authorization credentials
+	username, password, ok := parseProxyBasicAuth(r)
+	if !ok {
+		log.Printf("[HTTP PROXY] No proxy basic auth provided")
+		w.Header().Set("Proxy-Authenticate", "Basic realm=\"Tunnel Proxy\"")
+		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		return
+	}
+	
+	log.Printf("[HTTP PROXY] Basic auth: username=%s, password_len=%d", username, len(password))
+	
+	// Map username (custom URL) to tunnel ID
+	customURLsMu.RLock()
+	tunnelID := customURLs[username]
+	customURLsMu.RUnlock()
+	
+	if tunnelID == "" {
+		log.Printf("[HTTP PROXY] No tunnel found for custom URL: %s", username)
+		http.Error(w, "Tunnel not found for provided credentials", http.StatusUnauthorized)
+		return
+	}
+	
+	// Get agent connection
+	ac := getAgent(tunnelID)
+	if ac == nil {
+		log.Printf("[HTTP PROXY] Agent not connected for tunnel: %s", tunnelID)
+		http.Error(w, "Tunnel agent not connected", http.StatusBadGateway)
+		return
+	}
+	
+	log.Printf("[HTTP PROXY] Found tunnel: %s for custom URL: %s", tunnelID, username)
+	
+	// Handle CONNECT method for HTTPS tunneling
+	if r.Method == "CONNECT" {
+		handleCONNECTProxy(w, r, ac, tunnelID, startTime)
+		return
+	}
+	
+	// Handle regular HTTP proxy request
+	handleHTTPProxy(w, r, ac, tunnelID, startTime)
+}
+
+// handleHTTPProxy handles regular HTTP proxy requests (non-CONNECT)
+func handleHTTPProxy(w http.ResponseWriter, r *http.Request, ac *agentConn, tunnelID string, startTime time.Time) {
+	reqID := uuid.NewString()
+	
+	// Read request body
+	body, _ := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	
+	// Determine target URL
+	var targetURL string
+	if r.URL.IsAbs() {
+		targetURL = r.URL.String()
+	} else {
+		// Reconstruct absolute URL from Host header
+		scheme := "http"
+		if r.Header.Get("X-Forwarded-Proto") == "https" || r.TLS != nil {
+			scheme = "https"
+		}
+		targetURL = fmt.Sprintf("%s://%s%s", scheme, r.Host, r.URL.RequestURI())
+	}
+	
+	log.Printf("[HTTP PROXY] Proxying HTTP request: %s %s -> tunnel %s", r.Method, targetURL, tunnelID)
+	
+	// Create proxy request frame
+	proxyReq := &ProxyReqFrame{
+		Type:    "proxy_req",
+		ReqID:   reqID,
+		Method:  r.Method,
+		URL:     targetURL,
+		Headers: r.Header,
+		Body:    body,
+	}
+	
+	// Set up response channel
+	respCh := make(chan *RespFrame, 1)
+	ac.registerWaiter(reqID, respCh)
+	
+	// Send request to agent
+	if err := ac.writeEncrypted(r.Context(), proxyReq); err != nil {
+		log.Printf("[HTTP PROXY] Failed to send request to agent: %v", err)
+		http.Error(w, "Failed to send request to tunnel", http.StatusBadGateway)
+		return
+	}
+	
+	// Wait for response with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	
+	select {
+	case resp := <-respCh:
+		if resp.Type != "proxy_resp" {
+			log.Printf("[HTTP PROXY] Unexpected response type: %s", resp.Type)
+			http.Error(w, "Invalid response from tunnel", http.StatusBadGateway)
+			return
+		}
+		
+		// Forward response to client
+		for k, vs := range resp.Headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		
+		w.WriteHeader(resp.Status)
+		w.Write(resp.Body)
+		
+		// Log metrics
+		duration := time.Since(startTime).Seconds()
+		log.Printf("[HTTP PROXY] Response: %d | Size: %d bytes | Duration: %.2fs | URL: %s", 
+			resp.Status, len(resp.Body), duration, targetURL)
+		
+	case <-ctx.Done():
+		log.Printf("[HTTP PROXY] Timeout waiting for response from tunnel %s", tunnelID)
+		http.Error(w, "Timeout waiting for tunnel response", http.StatusGatewayTimeout)
+	}
+}
+
+// handleCONNECTProxy handles CONNECT method for HTTPS tunneling
+func handleCONNECTProxy(w http.ResponseWriter, r *http.Request, ac *agentConn, tunnelID string, startTime time.Time) {
+	log.Printf("[HTTP PROXY] CONNECT method not yet implemented: %s", r.Host)
+	http.Error(w, "CONNECT method not yet supported", http.StatusNotImplemented)
+	// TODO: Implement CONNECT tunneling for HTTPS support
+}
+
+// parseProxyBasicAuth parses the Proxy-Authorization header for Basic authentication
+func parseProxyBasicAuth(r *http.Request) (username, password string, ok bool) {
+	proxyAuth := r.Header.Get("Proxy-Authorization")
+	if proxyAuth == "" {
+		return "", "", false
+	}
+	
+	// Parse "Basic base64(username:password)"
+	if !strings.HasPrefix(proxyAuth, "Basic ") {
+		return "", "", false
+	}
+	
+	encoded := strings.TrimPrefix(proxyAuth, "Basic ")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", "", false
+	}
+	
+	credentials := string(decoded)
+	if colonIndex := strings.Index(credentials, ":"); colonIndex >= 0 {
+		return credentials[:colonIndex], credentials[colonIndex+1:], true
+	}
+	
+	// If no colon found, treat the whole string as username with empty password
+	return credentials, "", true
 }

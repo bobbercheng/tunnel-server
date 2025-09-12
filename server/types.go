@@ -364,3 +364,21 @@ type discardResponseWriter struct {
 	headers map[string][]string
 	status  int
 }
+
+// HTTP Proxy Frame types for proxying HTTP requests through tunnels
+type ProxyReqFrame struct {
+	Type     string              `json:"type"`     // "proxy_req"
+	ReqID    string              `json:"req_id"`   // unique request identifier
+	Method   string              `json:"method"`   // HTTP method (GET, POST, etc.)
+	URL      string              `json:"url"`      // Full target URL to request
+	Headers  map[string][]string `json:"headers"`  // HTTP headers
+	Body     []byte              `json:"body"`     // Request body
+}
+
+type ProxyRespFrame struct {
+	Type     string              `json:"type"`     // "proxy_resp"
+	ReqID    string              `json:"req_id"`   // request identifier (matches ProxyReqFrame)
+	Status   int                 `json:"status"`   // HTTP status code
+	Headers  map[string][]string `json:"headers"`  // Response headers
+	Body     []byte              `json:"body"`     // Response body
+}

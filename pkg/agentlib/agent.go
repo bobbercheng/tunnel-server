@@ -174,6 +174,24 @@ type TunnelInfoFrame struct {
 	Port     int    `json:"port"`     // for TCP tunnels
 }
 
+// HTTP Proxy Frame types for proxying HTTP requests through tunnels
+type ProxyReqFrame struct {
+	Type     string              `json:"type"`     // "proxy_req"
+	ReqID    string              `json:"req_id"`   // unique request identifier
+	Method   string              `json:"method"`   // HTTP method (GET, POST, etc.)
+	URL      string              `json:"url"`      // Full target URL to request
+	Headers  map[string][]string `json:"headers"`  // HTTP headers
+	Body     []byte              `json:"body"`     // Request body
+}
+
+type ProxyRespFrame struct {
+	Type     string              `json:"type"`     // "proxy_resp"
+	ReqID    string              `json:"req_id"`   // request identifier (matches ProxyReqFrame)
+	Status   int                 `json:"status"`   // HTTP status code
+	Headers  map[string][]string `json:"headers"`  // Response headers
+	Body     []byte              `json:"body"`     // Response body
+}
+
 var (
 	ErrUnauthorized   = errors.New("unauthorized: credentials rejected by server")
 	ErrNetworkFailure = errors.New("network failure: unable to reach server")
@@ -831,6 +849,14 @@ func (a *Agent) runOnce() error {
 				}
 				log.Printf("AGENT: %s %s | ReqID: %s", req.Method, req.Path, req.ReqID)
 				a.handleHttpRequest(ctx, &req, writeEncrypted, &wg)
+			case "proxy_req":
+				var proxyReq ProxyReqFrame
+				if err := json.Unmarshal(plaintext, &proxyReq); err != nil {
+					log.Printf("AGENT: Failed to parse proxy request: %v", err)
+					continue
+				}
+				log.Printf("AGENT: HTTP Proxy %s %s | ReqID: %s", proxyReq.Method, proxyReq.URL, proxyReq.ReqID)
+				go a.handleProxyRequest(ctx, &proxyReq, writeEncrypted)
 			case "chunked_resp":
 				var chunk ChunkedRespFrame
 				if err := json.Unmarshal(plaintext, &chunk); err != nil {
@@ -3040,4 +3066,91 @@ func (a *Agent) closeDebugLogging() {
 	// Close the file
 	a.debugLogFile.Close()
 	a.debugLogFile = nil
+}
+
+// handleProxyRequest handles HTTP proxy requests from the server
+func (a *Agent) handleProxyRequest(ctx context.Context, proxyReq *ProxyReqFrame, writeEncrypted func(interface{}) error) {
+	log.Printf("[AGENT PROXY] Processing proxy request: %s %s | ReqID: %s", proxyReq.Method, proxyReq.URL, proxyReq.ReqID)
+
+	// Create HTTP client with a reasonable timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true, // Prevent connection pooling issues
+		},
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, proxyReq.Method, proxyReq.URL, bytes.NewReader(proxyReq.Body))
+	if err != nil {
+		log.Printf("[AGENT PROXY] Failed to create request for %s: %v", proxyReq.URL, err)
+		a.sendProxyErrorResponse(proxyReq.ReqID, http.StatusBadRequest, "Failed to create request", writeEncrypted)
+		return
+	}
+
+	// Set headers from proxy request
+	for name, values := range proxyReq.Headers {
+		// Skip certain headers that should be set by the HTTP client
+		if name == "Content-Length" || name == "Host" {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+
+	log.Printf("[AGENT PROXY] Making request to %s", proxyReq.URL)
+
+	// Make the HTTP request
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[AGENT PROXY] Request failed for %s: %v", proxyReq.URL, err)
+		a.sendProxyErrorResponse(proxyReq.ReqID, http.StatusBadGateway, fmt.Sprintf("Request failed: %v", err), writeEncrypted)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[AGENT PROXY] Failed to read response body from %s: %v", proxyReq.URL, err)
+		a.sendProxyErrorResponse(proxyReq.ReqID, http.StatusBadGateway, "Failed to read response", writeEncrypted)
+		return
+	}
+
+	log.Printf("[AGENT PROXY] Received response from %s: %d %s | Size: %d bytes", proxyReq.URL, resp.StatusCode, http.StatusText(resp.StatusCode), len(body))
+
+	// Create proxy response frame
+	proxyResp := ProxyRespFrame{
+		Type:    "proxy_resp",
+		ReqID:   proxyReq.ReqID,
+		Status:  resp.StatusCode,
+		Headers: resp.Header,
+		Body:    body,
+	}
+
+	// Send response back to server
+	if err := writeEncrypted(proxyResp); err != nil {
+		log.Printf("[AGENT PROXY] Failed to send proxy response: %v", err)
+		return
+	}
+
+	log.Printf("[AGENT PROXY] Sent proxy response: ReqID=%s, Status=%d, Size=%d bytes", proxyReq.ReqID, resp.StatusCode, len(body))
+}
+
+// sendProxyErrorResponse sends an error response for proxy requests
+func (a *Agent) sendProxyErrorResponse(reqID string, statusCode int, message string, writeEncrypted func(interface{}) error) {
+	proxyResp := ProxyRespFrame{
+		Type:   "proxy_resp",
+		ReqID:  reqID,
+		Status: statusCode,
+		Headers: map[string][]string{
+			"Content-Type": {"text/plain"},
+		},
+		Body: []byte(message),
+	}
+
+	if err := writeEncrypted(proxyResp); err != nil {
+		log.Printf("[AGENT PROXY] Failed to send proxy error response: %v", err)
+	}
 }

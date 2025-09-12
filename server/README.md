@@ -12,6 +12,7 @@ The tunnel server is the cloud component of a reverse tunneling system that allo
 
 - **WebSocket Server**: Handles persistent connections from tunnel agents
 - **Public HTTP Gateway**: Exposes tunneled services through `/__pub__/{id}/` endpoints and custom URLs
+- **HTTP Proxy Server**: Enables standard HTTP proxy functionality using custom URLs for authentication
 - **Enhanced Smart Routing System**: Multi-header client fingerprinting with learning capabilities
 - **Client Tracker**: Intelligent client identification and tunnel mapping with adaptive learning
 - **Encryption Layer**: ChaCha20-Poly1305 AEAD encryption for all tunnel communication
@@ -20,8 +21,14 @@ The tunnel server is the cloud component of a reverse tunneling system that allo
 
 ### Request Flow
 
+#### Standard Tunnel Request
 ```
 Public Request → Custom URL Router → Enhanced Smart Router → Client Fingerprinting → Tunnel Selection → Agent → Local Service → Response
+```
+
+#### HTTP Proxy Request
+```
+HTTP Proxy Request → Proxy Detection → Basic Auth → Custom URL → Tunnel ID → Agent → External Service → Response
 ```
 
 ## Endpoints
@@ -576,6 +583,7 @@ The SPA redirection feature seamlessly integrates with the existing smart routin
 
 ### Access Control
 - **Tunnel Secrets**: 256-bit random secrets for agent authentication
+- **HTTP Proxy Auth**: Basic authentication using custom URLs as usernames
 - **Session Isolation**: Each tunnel has independent encryption context
 - **No Shared State**: Tunnels cannot access each other's data
 
@@ -1405,5 +1413,87 @@ For detailed documentation, see [LOG_VIEWER.md](./LOG_VIEWER.md).
 ./quick-logs.sh recent        # Check for wrong server URLs
 ```
 
+## HTTP Proxy Feature
+
+### Overview
+The server supports standard HTTP proxy functionality, allowing clients to configure the tunnel server as an HTTP proxy and route external requests through tunnel agents.
+
+### Configuration
+```bash
+# Configure HTTP proxy in applications
+export https_proxy=https://custom_url@server.example.com
+export http_proxy=http://custom_url@server.example.com
+
+# Example with custom URL "mycompany/proxy"
+export https_proxy=https://mycompany%2Fproxy@connect.vexorium.net
+```
+
+### Authentication
+- **Username**: Custom URL (URL-encoded, e.g., `mycompany%2Fproxy` for `mycompany/proxy`)
+- **Password**: Optional (can be empty)
+- **Method**: Standard HTTP Basic Authentication via `Proxy-Authorization` header
+
+### Usage Examples
+
+#### curl
+```bash
+# Using explicit proxy-user parameter
+curl --proxy http://server.example.com --proxy-user "custom/url:" https://external-api.com/data
+
+# Using proxy URL with embedded credentials  
+curl --proxy http://custom%2Furl@server.example.com https://external-api.com/data
+```
+
+#### Browser/Application Configuration
+```
+HTTP Proxy: server.example.com:443
+HTTPS Proxy: server.example.com:443
+Username: custom/url
+Password: (leave empty)
+```
+
+### Protocol Flow
+1. **Client Request**: HTTP proxy request with `Proxy-Authorization: Basic base64(custom_url:)`
+2. **Server Processing**: 
+   - Detects proxy request via absolute URL or CONNECT method
+   - Parses Basic Auth credentials from `Proxy-Authorization` header
+   - Maps custom URL (username) to tunnel ID
+   - Creates `ProxyReqFrame` with target URL and headers
+3. **Agent Processing**: 
+   - Receives `ProxyReqFrame` over encrypted WebSocket
+   - Makes HTTP request to target URL
+   - Returns `ProxyRespFrame` with response
+4. **Client Response**: Standard HTTP response forwarded to client
+
+### Supported Features
+- ✅ **HTTP Requests**: GET, POST, PUT, DELETE, etc.
+- ✅ **Authentication**: Standard Basic Auth with custom URLs
+- ✅ **Encryption**: All tunnel communication encrypted with ChaCha20-Poly1305
+- ✅ **Error Handling**: Proper HTTP status codes for auth failures, tunnel offline, etc.
+- ⏳ **HTTPS/CONNECT**: Planned future enhancement
+
+### Message Types
+```go
+// HTTP Proxy request (server → agent)
+type ProxyReqFrame struct {
+    Type     string              `json:"type"`     // "proxy_req"
+    ReqID    string              `json:"req_id"`   // unique request ID
+    Method   string              `json:"method"`   // HTTP method
+    URL      string              `json:"url"`      // full target URL
+    Headers  map[string][]string `json:"headers"`  // HTTP headers
+    Body     []byte              `json:"body"`     // request body
+}
+
+// HTTP Proxy response (agent → server)  
+type ProxyRespFrame struct {
+    Type     string              `json:"type"`     // "proxy_resp"
+    ReqID    string              `json:"req_id"`   // matching request ID
+    Status   int                 `json:"status"`   // HTTP status code
+    Headers  map[string][]string `json:"headers"`  // response headers
+    Body     []byte              `json:"body"`     // response body
+}
+```
+
 # TODO
 1. Test geolite db from maxmind
+2. Implement CONNECT method support for HTTPS proxy tunneling
