@@ -120,6 +120,17 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate that this is an HTTP tunnel (not TCP)
+	tunnelsMu.RLock()
+	tunnel, exists := tunnels[id]
+	tunnelsMu.RUnlock()
+
+	if exists && tunnel.Protocol == "tcp" {
+		tunnelMetrics.RecordError(id, "http_request_to_tcp_tunnel")
+		http.Error(w, "Cannot make HTTP requests to TCP tunnel. Use TCP client to connect to this tunnel.", http.StatusBadRequest)
+		return
+	}
+
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 
@@ -403,6 +414,13 @@ func customURLHandler(w http.ResponseWriter, r *http.Request) {
 		useRedirect := tunnel != nil && tunnel.UseRedirect
 		log.Printf("[TUNNEL REDIRECT CONFIG] TunnelID: %s | Tunnel exists: %v | UseRedirect: %v", tunnelID, tunnel != nil, useRedirect)
 		tunnelsMu.RUnlock()
+
+		// Validate that this is an HTTP tunnel (not TCP)
+		if tunnel != nil && tunnel.Protocol == "tcp" {
+			log.Printf("[ROUTING REJECT] TCP tunnel %s cannot handle HTTP requests from custom URL %s", tunnelID, path)
+			http.Error(w, "Cannot make HTTP requests to TCP tunnel. Use TCP client to connect to this tunnel.", http.StatusBadRequest)
+			return
+		}
 
 		// Handle redirection for SPA base path issues
 		if useRedirect && forwardPath == "/" {

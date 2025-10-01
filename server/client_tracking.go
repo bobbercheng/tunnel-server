@@ -733,7 +733,14 @@ func getActiveTunnelIDs() []string {
 
 	tunnelIDs := make([]string, 0, len(agents))
 	for id := range agents {
-		tunnelIDs = append(tunnelIDs, id)
+		// Only include HTTP tunnels for smart routing (exclude TCP tunnels)
+		tunnelsMu.RLock()
+		tunnel, exists := tunnels[id]
+		tunnelsMu.RUnlock()
+
+		if !exists || tunnel.Protocol != "tcp" {
+			tunnelIDs = append(tunnelIDs, id)
+		}
 	}
 	return tunnelIDs
 }
@@ -773,6 +780,16 @@ func tryTunnelRouteWithBufferedBody(w http.ResponseWriter, r *http.Request, body
 
 	log.Printf("[TUNNEL ROUTING] Starting tunnel attempt (buffered body) | TunnelID: %s | Path: %s | Method: %s | Asset: %v | BodySize: %d | Agent connected: %v",
 		tunnelID, r.URL.Path, r.Method, isAsset, len(bodyBytes), ac.connectedAt)
+
+	// Validate that this is an HTTP tunnel (not TCP)
+	tunnelsMu.RLock()
+	tunnel, exists := tunnels[tunnelID]
+	tunnelsMu.RUnlock()
+
+	if exists && tunnel.Protocol == "tcp" {
+		log.Printf("[TUNNEL ROUTING] FAILED - Cannot route HTTP request to TCP tunnel | TunnelID: %s | Path: %s", tunnelID, r.URL.Path)
+		return false // This will trigger fallback to other routing strategies
+	}
 
 	// Prepare the request path (remove leading slash if present)
 	requestPath := strings.TrimPrefix(r.URL.Path, "/")
