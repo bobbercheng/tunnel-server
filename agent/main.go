@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/url"
@@ -20,8 +21,6 @@ func main() {
 	port := flag.Int("port", 0, "port number (required for TCP tunnels)")
 	customURL := flag.String("custom-url", "", "custom URL path, e.g. 'bob/chatbot'")
 	useRedirect := flag.Bool("use-redirect", false, "enable SPA redirection for React/Vue/Angular apps (requires custom URL)")
-	rewriteContent := flag.Bool("rewrite-content", false, "enable content rewriting to replace URLs in HTML/JS/CSS responses")
-	rewriteHeaders := flag.Bool("rewrite-headers", false, "enable response header rewriting for CORS and security headers")
 	rewriteRulesFile := flag.String("rewrite-rules-file", "", "path to JSON file containing custom rewrite rules (optional)")
 	debugLog := flag.Bool("debug-log", false, "enable debug logging of all requests and responses to file")
 	debugFile := flag.String("debug-file", "", "path to debug log file (defaults to debug_<tunnel_id>.log)")
@@ -66,31 +65,20 @@ func main() {
 	}
 
 	agent := &agentlib.Agent{
-		ServerURL:      serverURL,
-		LocalURL:       *local,
-		ID:             tunnelID,
-		Secret:         tunnelSecret,
-		Protocol:       *protocol,
-		Port:           *port,
-		CustomURL:      *customURL,
-		UseRedirect:    *useRedirect,
-		RewriteContent: *rewriteContent,
-		RewriteHeaders: *rewriteHeaders,
-		DebugLog:       *debugLog,
-		DebugFile:      *debugFile,
+		ServerURL:        serverURL,
+		LocalURL:         *local,
+		ID:               tunnelID,
+		Secret:           tunnelSecret,
+		Protocol:         *protocol,
+		Port:             *port,
+		CustomURL:        *customURL,
+		UseRedirect:      *useRedirect,
+		DebugLog:         *debugLog,
+		DebugFile:        *debugFile,
+		RewriteRulesFile: *rewriteRulesFile,
 	}
 
-	// Initialize request queue management
-	agent.InitializeQueue()
-
-	// Load rewrite configuration (if content rewriting is enabled)
-	if *rewriteContent {
-		err := agent.LoadRewriteConfig(*rewriteRulesFile)
-		if err != nil {
-			fmt.Printf("Failed to load rewrite configuration: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	agent.Run()
+	// Run the agent (initialization is now handled automatically)
+	ctx := context.Background()
+	agent.Run(ctx)
 }
