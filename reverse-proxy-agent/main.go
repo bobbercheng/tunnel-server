@@ -116,36 +116,33 @@ func startTcpProxy(publicURL, localPort string) {
 func handleTcpConnection(localConn net.Conn, publicURL string) {
 	defer localConn.Close()
 
-	// Convert HTTP URL to WebSocket URL for TCP endpoint
-	tcpURL := strings.Replace(publicURL, "http://", "ws://", 1)
-	tcpURL = strings.Replace(tcpURL, "https://", "wss://", 1)
+	// Convert HTTP(S) URL to WebSocket URL
+	wsURL := strings.Replace(publicURL, "http://", "ws://", 1)
+	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
 
+	// Establish WebSocket connection
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Connect to tunnel server's TCP WebSocket endpoint
-	ws, _, err := websocket.Dial(ctx, tcpURL, nil)
+	ws, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		log.Printf("Failed to connect to TCP tunnel: %v", err)
+		log.Printf("Failed to connect to WebSocket TCP tunnel: %v", err)
 		return
 	}
 	defer ws.Close(websocket.StatusNormalClosure, "connection closed")
 
-	log.Printf("TCP: Established tunnel connection")
+	log.Printf("TCP: Established WebSocket tunnel connection")
 
-	// Handle bidirectional data flow
-	done := make(chan struct{})
+	// Handle bidirectional data flow using WebSocket binary messages
+	done := make(chan struct{}, 2)
 
-	// Forward data from local connection to tunnel
+	// Forward data from local connection to tunnel (via WebSocket)
 	go func() {
 		defer func() {
-			select {
-			case done <- struct{}{}:
-			default:
-			}
+			done <- struct{}{}
 		}()
 
-		buf := make([]byte, 4096)
+		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			n, err := localConn.Read(buf)
 			if err != nil {
@@ -155,30 +152,37 @@ func handleTcpConnection(localConn net.Conn, publicURL string) {
 				return
 			}
 
-			if err := ws.Write(context.Background(), websocket.MessageBinary, buf[:n]); err != nil {
-				log.Printf("Error writing to tunnel: %v", err)
+			if n == 0 {
+				continue
+			}
+
+			// Send data as WebSocket binary message
+			if err := ws.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
+				log.Printf("Error writing to WebSocket tunnel: %v", err)
 				return
 			}
 		}
 	}()
 
-	// Forward data from tunnel to local connection
+	// Forward data from tunnel to local connection (via WebSocket)
 	go func() {
 		defer func() {
-			select {
-			case done <- struct{}{}:
-			default:
-			}
+			done <- struct{}{}
 		}()
 
 		for {
-			_, data, err := ws.Read(context.Background())
+			msgType, data, err := ws.Read(ctx)
 			if err != nil {
-				status := websocket.CloseStatus(err)
-				if status != websocket.StatusNormalClosure && status != websocket.StatusGoingAway {
-					log.Printf("Error reading from tunnel: %v", err)
+				if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+					log.Printf("Error reading from WebSocket tunnel: %v", err)
 				}
 				return
+			}
+
+			// We expect binary messages for TCP data
+			if msgType != websocket.MessageBinary {
+				log.Printf("Unexpected WebSocket message type: %v", msgType)
+				continue
 			}
 
 			if _, err := localConn.Write(data); err != nil {
