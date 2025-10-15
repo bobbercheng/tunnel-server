@@ -106,6 +106,8 @@ func (a *Agent) handleMessagesNew(ctx context.Context, conn *websocket.Conn, cip
 			go a.handleWebSocketFrameMessage(decrypted)
 		case "websocket_close":
 			go a.handleWebSocketCloseMessage(decrypted)
+		case "ping":
+			go a.handlePingNew(decrypted, writeEncrypted)
 		default:
 			log.Printf("Unknown message type: %s", msgType)
 		}
@@ -153,4 +155,27 @@ func (a *Agent) handleWebSocketCloseMessage(data []byte) {
 		return
 	}
 	a.handleWebSocketCloseNew(&frame)
+}
+
+// handlePingNew responds to ping messages with pong (delegation)
+func (a *Agent) handlePingNew(data []byte, writeEncrypted func(v any) error) {
+	var ping PingFrame
+	if err := json.Unmarshal(data, &ping); err != nil {
+		log.Printf("Failed to parse ping frame: %v", err)
+		return
+	}
+
+	// Respond with pong, echoing the timestamp and tunnel ID
+	pong := &PongFrame{
+		Type:      "pong",
+		Timestamp: ping.Timestamp,
+		TunnelID:  ping.TunnelID,
+	}
+
+	if err := writeEncrypted(pong); err != nil {
+		log.Printf("Failed to send pong response: %v", err)
+		return
+	}
+
+	log.Printf("Responded to ping from server | TunnelID: %s", ping.TunnelID)
 }

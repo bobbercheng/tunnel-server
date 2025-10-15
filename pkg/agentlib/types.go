@@ -83,10 +83,9 @@ type RegisterResponseFrame struct {
 
 // TCP tunnel frames
 type TcpConnectFrame struct {
-	Type    string `json:"type"`
-	ConnID  string `json:"conn_id"`
-	Address string `json:"address"`
-	Port    int    `json:"port"`
+	Type   string `json:"type"`
+	ConnID string `json:"conn_id"`
+	Port   int    `json:"port"`
 }
 
 type TcpDataFrame struct {
@@ -98,20 +97,21 @@ type TcpDataFrame struct {
 type TcpDisconnectFrame struct {
 	Type   string `json:"type"`
 	ConnID string `json:"conn_id"`
-	Reason string `json:"reason,omitempty"`
+	Reason string `json:"reason"`
 }
 
-type TcpConnectRespFrame struct {
-	Type    string `json:"type"`
-	ConnID  string `json:"conn_id"`
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
+// PingFrame is sent by server to monitor connection health
+type PingFrame struct {
+	Type      string    `json:"type"`      // "ping"
+	Timestamp time.Time `json:"timestamp"` // when ping was sent
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier
 }
 
-// HeartbeatFrame for connection monitoring
-type HeartbeatFrame struct {
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp"`
+// PongFrame is sent by agent in response to ping
+type PongFrame struct {
+	Type      string    `json:"type"`      // "pong"
+	Timestamp time.Time `json:"timestamp"` // original ping timestamp
+	TunnelID  string    `json:"tunnel_id"` // tunnel identifier (echoed from ping)
 }
 
 // Streaming response management
@@ -161,14 +161,6 @@ type Action struct {
 	Replace    string            `json:"replace,omitempty"`
 	Headers    map[string]string `json:"headers,omitempty"`
 	StatusCode int               `json:"status_code,omitempty"`
-}
-
-// Agent statistics and state
-type AgentStats struct {
-	RequestsProcessed int64     `json:"requests_processed"`
-	BytesTransferred  int64     `json:"bytes_transferred"`
-	ConnectionStart   time.Time `json:"connection_start"`
-	LastActivity      time.Time `json:"last_activity"`
 }
 
 // Proxy frames for HTTP proxy functionality

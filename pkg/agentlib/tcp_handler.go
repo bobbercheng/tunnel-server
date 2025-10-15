@@ -14,13 +14,21 @@ import (
 // handleTcpConnect establishes a new TCP connection to the local service
 func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, writeEncrypted func(v any) error) {
 	// Connect to local TCP service
-	target := fmt.Sprintf("%s:%d", strings.Split(a.LocalURL, "://")[1], frame.Port)
+	var target string
+
 	if strings.Contains(a.LocalURL, "://") {
-		// Extract host from URL
+		// Parse URL format (e.g., tcp://hostname:port or http://hostname)
 		u, err := url.Parse(a.LocalURL)
-		if err == nil {
+		if err != nil {
+			log.Printf("TCP: Failed to parse LocalURL '%s': %v", a.LocalURL, err)
+			// Fallback to localhost
+			target = fmt.Sprintf("localhost:%d", frame.Port)
+		} else {
 			target = fmt.Sprintf("%s:%d", u.Hostname(), frame.Port)
 		}
+	} else {
+		// Bare hostname or IP address (e.g., internet.ford.com, 192.168.1.1, localhost)
+		target = fmt.Sprintf("%s:%d", a.LocalURL, frame.Port)
 	}
 
 	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
