@@ -93,15 +93,20 @@ func (a *Agent) handleMessagesNew(ctx context.Context, conn *websocket.Conn, cip
 		}
 
 		// Handle different message types by delegating to appropriate modules
+		// CRITICAL: TCP messages must be processed sequentially to preserve ordering
+		// (tcp_connect must complete before tcp_data, tcp_data before tcp_disconnect)
 		switch msgType {
 		case "req":
 			go a.handleHTTPRequestNew(decrypted, writeEncrypted)
 		case "tcp_connect":
-			go a.handleTcpConnectNew(decrypted, writeEncrypted)
+			// Process TCP connect synchronously to ensure connection exists before data arrives
+			a.handleTcpConnectNew(decrypted, writeEncrypted)
 		case "tcp_data":
-			go a.handleTcpDataNew(decrypted, writeEncrypted)
+			// Process TCP data synchronously to maintain data ordering
+			a.handleTcpDataNew(decrypted, writeEncrypted)
 		case "tcp_disconnect":
-			go a.handleTcpDisconnectNew(decrypted, writeEncrypted)
+			// Process TCP disconnect synchronously to ensure all data is sent first
+			a.handleTcpDisconnectNew(decrypted, writeEncrypted)
 		case "websocket_frame":
 			go a.handleWebSocketFrameMessage(decrypted)
 		case "websocket_close":

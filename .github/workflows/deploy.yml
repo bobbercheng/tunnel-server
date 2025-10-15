@@ -15,10 +15,34 @@ env:
   GOTOOLCHAIN: auto
 
 jobs:
+  # Optimization: Detect which files changed to avoid unnecessary deployments
+  # Deploy jobs only run when server-related files are modified
+  detect-changes:
+    name: Detect Changed Files
+    runs-on: ubuntu-latest
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Check for server changes
+      uses: dorny/paths-filter@v2
+      id: filter
+      with:
+        filters: |
+          server:
+            - 'server/**'
+            - 'pkg/crypto/**'
+            - 'pkg/metrics/**'
+            - 'go.work'
+            - 'go.work.sum'
+
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -80,8 +104,11 @@ jobs:
   deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [test, detect-changes]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.detect-changes.outputs.server == 'true'
     
     permissions:
       contents: read
@@ -187,8 +214,10 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'pull_request'
+    needs: [test, detect-changes]
+    if: |
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.server == 'true'
     
     permissions:
       contents: read
@@ -279,6 +308,40 @@ jobs:
           **📊 Metrics:** ${{ env.STAGING_URL }}/__metrics__
 
           The staging service will be automatically cleaned up when the PR is merged or closed.
+          `
+          })
+
+  skip-staging-notification:
+    name: Notify Staging Skipped
+    runs-on: ubuntu-latest
+    needs: [test, detect-changes]
+    if: |
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.server == 'false'
+
+    permissions:
+      pull-requests: write
+
+    steps:
+    - name: Comment on PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## ℹ️ Staging Deployment Skipped
+
+          No changes detected in server code. Staging deployment was skipped to save resources.
+
+          **Files monitored:**
+          - \`server/**\` (server code)
+          - \`pkg/crypto/**\` (encryption library)
+          - \`pkg/metrics/**\` (metrics library)
+          - \`go.work\` / \`go.work.sum\` (workspace config)
+
+          If you believe this is an error, please check that your changes include server-related files.
           `
           })
 

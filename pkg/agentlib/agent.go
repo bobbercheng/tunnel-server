@@ -49,8 +49,10 @@ type Agent struct {
 	streamingMu     sync.RWMutex
 
 	// TCP connections - handled by tcp_handler.go
-	tcpConns   map[string]net.Conn
-	tcpConnsMu sync.RWMutex
+	tcpConns        map[string]net.Conn
+	tcpConnsMu      sync.RWMutex
+	tcpPendingData  map[string][]*TcpDataFrame // Buffer for data received before connection established
+	tcpPendingMu    sync.RWMutex
 
 	// Debug logging - handled by debug.go
 	debugLogFile *os.File
@@ -65,6 +67,9 @@ type Agent struct {
 func (a *Agent) Run(ctx context.Context) error {
 	// Initialize all modular components
 	a.InitializeQueueNew()
+
+	// Initialize TCP pending data buffer
+	a.tcpPendingData = make(map[string][]*TcpDataFrame)
 
 	// Initialize debug logging (delegated to debug.go)
 	if err := a.initDebugLoggingNew(); err != nil {

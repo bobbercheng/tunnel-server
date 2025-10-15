@@ -120,11 +120,11 @@ func handleTcpConnection(localConn net.Conn, publicURL string) {
 	wsURL := strings.Replace(publicURL, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
 
-	// Establish WebSocket connection
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Establish WebSocket connection with timeout for dial only
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer dialCancel()
 
-	ws, _, err := websocket.Dial(ctx, wsURL, nil)
+	ws, _, err := websocket.Dial(dialCtx, wsURL, nil)
 	if err != nil {
 		log.Printf("Failed to connect to WebSocket TCP tunnel: %v", err)
 		return
@@ -132,6 +132,9 @@ func handleTcpConnection(localConn net.Conn, publicURL string) {
 	defer ws.Close(websocket.StatusNormalClosure, "connection closed")
 
 	log.Printf("TCP: Established WebSocket tunnel connection")
+
+	// Use background context for data transfer (no timeout)
+	dataCtx := context.Background()
 
 	// Handle bidirectional data flow using WebSocket binary messages
 	done := make(chan struct{}, 2)
@@ -157,7 +160,7 @@ func handleTcpConnection(localConn net.Conn, publicURL string) {
 			}
 
 			// Send data as WebSocket binary message
-			if err := ws.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
+			if err := ws.Write(dataCtx, websocket.MessageBinary, buf[:n]); err != nil {
 				log.Printf("Error writing to WebSocket tunnel: %v", err)
 				return
 			}
@@ -171,7 +174,7 @@ func handleTcpConnection(localConn net.Conn, publicURL string) {
 		}()
 
 		for {
-			msgType, data, err := ws.Read(ctx)
+			msgType, data, err := ws.Read(dataCtx)
 			if err != nil {
 				if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
 					log.Printf("Error reading from WebSocket tunnel: %v", err)

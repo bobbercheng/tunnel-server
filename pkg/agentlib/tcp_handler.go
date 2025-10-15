@@ -53,6 +53,28 @@ func (a *Agent) handleTcpConnect(ctx context.Context, frame *TcpConnectFrame, wr
 	a.tcpConns[frame.ConnID] = conn
 	a.tcpConnsMu.Unlock()
 
+	// Process any buffered data that arrived before connection was established
+	a.tcpPendingMu.Lock()
+	bufferedFrames, hasPending := a.tcpPendingData[frame.ConnID]
+	if hasPending {
+		delete(a.tcpPendingData, frame.ConnID)
+	}
+	a.tcpPendingMu.Unlock()
+
+	if hasPending && len(bufferedFrames) > 0 {
+		log.Printf("TCP: Processing %d buffered data frames | ConnID: %s", len(bufferedFrames), frame.ConnID)
+		for _, bufferedFrame := range bufferedFrames {
+			// Forward buffered data to local connection
+			_, err := conn.Write(bufferedFrame.Data)
+			if err != nil {
+				log.Printf("TCP: Error writing buffered data to local connection | ConnID: %s | Error: %v", frame.ConnID, err)
+				// Continue processing other frames even if one fails
+			} else {
+				log.Printf("TCP: Forwarded buffered %d bytes to local connection | ConnID: %s", len(bufferedFrame.Data), frame.ConnID)
+			}
+		}
+	}
+
 	// Start reading from local connection and forwarding to server
 	go func() {
 		defer func() {
@@ -113,7 +135,15 @@ func (a *Agent) handleTcpData(frame *TcpDataFrame) {
 	a.tcpConnsMu.Unlock()
 
 	if !exists {
-		log.Printf("TCP: Received data for unknown connection | ConnID: %s", frame.ConnID)
+		// Connection doesn't exist yet - buffer the data until tcp_connect arrives
+		log.Printf("TCP: Received data for connection not yet established, buffering | ConnID: %s | Size: %d bytes", frame.ConnID, len(frame.Data))
+
+		a.tcpPendingMu.Lock()
+		a.tcpPendingData[frame.ConnID] = append(a.tcpPendingData[frame.ConnID], frame)
+		bufferSize := len(a.tcpPendingData[frame.ConnID])
+		a.tcpPendingMu.Unlock()
+
+		log.Printf("TCP: Buffered data frame | ConnID: %s | BufferSize: %d frames", frame.ConnID, bufferSize)
 		return
 	}
 
@@ -140,6 +170,15 @@ func (a *Agent) handleTcpDisconnect(frame *TcpDisconnectFrame) {
 		delete(a.tcpConns, frame.ConnID)
 	}
 	a.tcpConnsMu.Unlock()
+
+	// Clean up any pending buffered data for this connection
+	a.tcpPendingMu.Lock()
+	_, hadPending := a.tcpPendingData[frame.ConnID]
+	if hadPending {
+		delete(a.tcpPendingData, frame.ConnID)
+		log.Printf("TCP: Cleared buffered data for disconnected connection | ConnID: %s", frame.ConnID)
+	}
+	a.tcpPendingMu.Unlock()
 
 	if exists {
 		conn.Close()
