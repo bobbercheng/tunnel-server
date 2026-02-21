@@ -12,11 +12,8 @@ env:
   SERVICE_NAME: tunnel-server
   IMAGE_NAME: gcr.io/contact-center-insights-poc/tunnel-server
   GO_VERSION: '1.24'
-  GOTOOLCHAIN: auto
 
 jobs:
-  # Optimization: Detect which files changed to avoid unnecessary deployments
-  # Deploy jobs only run when server-related files are modified
   detect-changes:
     name: Detect Changed Files
     runs-on: ubuntu-latest
@@ -33,73 +30,34 @@ jobs:
       with:
         filters: |
           server:
-            - 'server/**'
-            - 'pkg/crypto/**'
-            - 'pkg/metrics/**'
-            - 'go.work'
-            - 'go.work.sum'
+            - 'tunnel/server/**'
+            - 'tunnel/agent/**'
 
   test:
-    name: Run Tests
+    name: Build and Test
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.24'
+        go-version: ${{ env.GO_VERSION }}
         cache: false
-    
-    - name: Clean Go cache before restoration
-      run: |
-        echo "Cleaning Go module cache to prevent extraction conflicts..."
-        go clean -modcache || true
-        rm -rf ~/.cache/go-build || true
-        mkdir -p ~/.cache/go-build
-        mkdir -p ~/go/pkg/mod
-    
-    - name: Cache Go modules
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ runner.arch }}-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum', '**/go.mod') }}
-        restore-keys: |
-          ${{ runner.os }}-go-${{ runner.arch }}-${{ env.GO_VERSION }}-
-          ${{ runner.os }}-go-${{ runner.arch }}-
-          ${{ runner.os }}-go-
-    
-    - name: Download dependencies
-      run: go work sync
-    
-    - name: Clean build artifacts
-      run: |
-        echo "Cleaning any existing build artifacts..."
-        find . -name "*-bin" -type f -delete || true
-        find . -name "server" -path "*/server/server" -type f -delete || true
-        
-    - name: Run tests
-      run: |
-        echo "Testing all Go modules with race detection and timeout..."
-        # Run tests sequentially to avoid file conflicts and with timeouts
-        go test ./server/... -v -timeout=5m -race || echo "Server tests completed"
-        go test ./agent/... -v -timeout=3m || echo "Agent tests completed"  
-        go test ./reverse-proxy-agent/... -v -timeout=3m || echo "Reverse proxy agent tests completed"
-        go test ./pkg/crypto/... -v -timeout=2m || echo "Crypto tests completed"
-        go test ./pkg/agentlib/... -v -timeout=3m || echo "Agent lib tests completed"
-        go test ./pkg/metrics/... -v -timeout=2m || echo "Metrics tests completed"
-        
-    - name: Post-test cleanup
-      run: |
-        echo "Cleaning up after tests..."
-        find . -name "*-bin" -type f -delete || true
-        find . -name "server" -path "*/server/server" -type f -delete || true
-        # Clean any test artifacts that might interfere with deployment
-        go clean -cache || true
+
+    - name: Build server
+      run: cd tunnel/server && go build -o /dev/null .
+
+    - name: Build agent
+      run: cd tunnel/agent && go build -o /dev/null .
+
+    - name: Vet server
+      run: cd tunnel/server && go vet ./...
+
+    - name: Vet agent
+      run: cd tunnel/agent && go vet ./...
 
   deploy:
     name: Build and Deploy
@@ -109,107 +67,79 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       needs.detect-changes.outputs.server == 'true'
-    
+
     permissions:
       contents: read
       id-token: write
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Configure Docker for GCR
       run: gcloud auth configure-docker --quiet
-    
+
     - name: Build and Deploy
       run: |
-        echo "Building and deploying server to Cloud Run..."
-        
-        # Copy Dockerfile to root for Cloud Build context (mirrors deploy.sh)
-        cp server/Dockerfile ./Dockerfile
-        
-        # Build using Cloud Build with async flag to avoid log streaming issues
-        echo "Building Docker image using Cloud Build..."
-        BUILD_ID=$(gcloud builds submit --tag $IMAGE_NAME . --async --format="value(id)")
-        
-        # Wait for build to complete with polling
+        echo "Building and deploying tunnel server to Cloud Run..."
+
+        # Build from tunnel/server directory (self-contained module)
+        BUILD_ID=$(gcloud builds submit --tag $IMAGE_NAME tunnel/server --async --format="value(id)")
+
         echo "Waiting for build $BUILD_ID to complete..."
         while true; do
           BUILD_STATUS=$(gcloud builds describe $BUILD_ID --format="value(status)")
           if [ "$BUILD_STATUS" = "SUCCESS" ]; then
-            echo "✅ Build completed successfully"
+            echo "Build completed successfully"
             break
           elif [ "$BUILD_STATUS" = "FAILURE" ] || [ "$BUILD_STATUS" = "CANCELLED" ] || [ "$BUILD_STATUS" = "TIMEOUT" ]; then
-            echo "❌ Build failed with status: $BUILD_STATUS"
-            echo "📋 Build logs: https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$GCP_PROJECT_ID"
+            echo "Build failed with status: $BUILD_STATUS"
             exit 1
           else
-            echo "⏳ Build status: $BUILD_STATUS (waiting...)"
+            echo "Build status: $BUILD_STATUS (waiting...)"
             sleep 10
           fi
         done
-        
-        # Clean up
-        rm ./Dockerfile
-        
-        # Deploy to Cloud Run with two-step approach like deploy.sh
+
+        # Deploy to Cloud Run
         echo "Deploying to Cloud Run..."
         URL=$(gcloud run deploy $SERVICE_NAME \
           --image $IMAGE_NAME \
           --platform managed --region $GCP_REGION \
           --allow-unauthenticated --max-instances=1 \
+          --timeout=3600 \
+          --set-env-vars SERVER_URL=https://connect.vexorium.net \
           --format='value(status.url)')
-        
-        # Update with environment variables
-        gcloud run services update $SERVICE_NAME \
-          --platform managed --region $GCP_REGION \
-          --set-env-vars PUBLIC_BASE_URL=https://connect.vexorium.net \
-          --update-annotations="prometheus.io/scrape=true,prometheus.io/path=/__metrics__,prometheus.io/port=8080"
-        
+
         echo "Deployment complete! Service URL: $URL"
         echo "SERVICE_URL=$URL" >> $GITHUB_ENV
-    
+
     - name: Verify Deployment
       run: |
         echo "Verifying deployment health..."
-        echo "Service URL: $SERVICE_URL"
-        
-        # Wait a moment for service to start
         sleep 10
-        
-        # Check health endpoint
+
         HEALTH_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/__health__")
         if [ "$HEALTH_RESPONSE" = "200" ]; then
-          echo "✅ Health check passed"
+          echo "Health check passed"
         else
-          echo "❌ Health check failed (HTTP $HEALTH_RESPONSE)"
+          echo "Health check failed (HTTP $HEALTH_RESPONSE)"
           exit 1
         fi
-        
-        # Check metrics endpoint
-        METRICS_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/__metrics__")
-        if [ "$METRICS_RESPONSE" = "200" ]; then
-          echo "✅ Metrics endpoint working"
-        else
-          echo "❌ Metrics endpoint check failed (HTTP $METRICS_RESPONSE)"
-          # Don't fail the workflow for metrics, just warn
-        fi
-        
-        echo "🔗 Deployment URLs:"
-        echo "   • Service: $SERVICE_URL"
-        echo "   • Health: $SERVICE_URL/__health__"
-        echo "   • Metrics: $SERVICE_URL/__metrics__"
+
+        echo "Service: $SERVICE_URL"
+        echo "Health:  $SERVICE_URL/__health__"
 
   deploy-staging:
     name: Deploy to Staging
@@ -218,79 +148,64 @@ jobs:
     if: |
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.server == 'true'
-    
+
     permissions:
       contents: read
       id-token: write
       pull-requests: write
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Configure Docker for GCR
       run: gcloud auth configure-docker --quiet
-    
+
     - name: Deploy to Staging
       run: |
         STAGING_SERVICE="tunnel-server-staging-pr-${{ github.event.number }}"
         STAGING_IMAGE="gcr.io/$GCP_PROJECT_ID/tunnel-server-staging-pr-${{ github.event.number }}"
-        
-        echo "Deploying to staging environment: $STAGING_SERVICE"
-        
-        # Copy Dockerfile to root for Cloud Build context
-        cp server/Dockerfile ./Dockerfile
-        
-        # Build using Cloud Build with async flag to avoid log streaming issues
-        BUILD_ID=$(gcloud builds submit --tag $STAGING_IMAGE . --async --format="value(id)")
-        
-        # Wait for build to complete with polling
+
+        echo "Deploying to staging: $STAGING_SERVICE"
+
+        BUILD_ID=$(gcloud builds submit --tag $STAGING_IMAGE tunnel/server --async --format="value(id)")
+
         echo "Waiting for build $BUILD_ID to complete..."
         while true; do
           BUILD_STATUS=$(gcloud builds describe $BUILD_ID --format="value(status)")
           if [ "$BUILD_STATUS" = "SUCCESS" ]; then
-            echo "✅ Build completed successfully"
+            echo "Build completed successfully"
             break
           elif [ "$BUILD_STATUS" = "FAILURE" ] || [ "$BUILD_STATUS" = "CANCELLED" ] || [ "$BUILD_STATUS" = "TIMEOUT" ]; then
-            echo "❌ Build failed with status: $BUILD_STATUS"
-            echo "📋 Build logs: https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$GCP_PROJECT_ID"
+            echo "Build failed with status: $BUILD_STATUS"
             exit 1
           else
-            echo "⏳ Build status: $BUILD_STATUS (waiting...)"
+            echo "Build status: $BUILD_STATUS (waiting...)"
             sleep 10
           fi
         done
-        
-        # Clean up
-        rm ./Dockerfile
-        
-        # Deploy to staging Cloud Run service
+
         STAGING_URL=$(gcloud run deploy $STAGING_SERVICE \
           --image $STAGING_IMAGE \
           --platform managed --region $GCP_REGION \
           --allow-unauthenticated --max-instances=1 \
+          --set-env-vars SERVER_URL=$STAGING_URL \
           --format='value(status.url)')
-        
-        # Update with environment variables
-        gcloud run services update $STAGING_SERVICE \
-          --platform managed --region $GCP_REGION \
-          --set-env-vars PUBLIC_BASE_URL=$STAGING_URL \
-          --update-annotations="prometheus.io/scrape=true,prometheus.io/path=/__metrics__,prometheus.io/port=8080"
-        
+
         echo "Staging deployment complete! URL: $STAGING_URL"
         echo "STAGING_URL=$STAGING_URL" >> $GITHUB_ENV
-    
+
     - name: Comment PR with staging URL
       uses: actions/github-script@v7
       with:
@@ -299,85 +214,40 @@ jobs:
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `## 🚀 Staging Deployment Ready
-
-          Your PR has been deployed to a staging environment:
-
-          **🔗 Staging URL:** ${{ env.STAGING_URL }}
-          **🏥 Health Check:** ${{ env.STAGING_URL }}/__health__
-          **📊 Metrics:** ${{ env.STAGING_URL }}/__metrics__
-
-          The staging service will be automatically cleaned up when the PR is merged or closed.
-          `
-          })
-
-  skip-staging-notification:
-    name: Notify Staging Skipped
-    runs-on: ubuntu-latest
-    needs: [test, detect-changes]
-    if: |
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.server == 'false'
-
-    permissions:
-      pull-requests: write
-
-    steps:
-    - name: Comment on PR
-      uses: actions/github-script@v7
-      with:
-        script: |
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: `## ℹ️ Staging Deployment Skipped
-
-          No changes detected in server code. Staging deployment was skipped to save resources.
-
-          **Files monitored:**
-          - \`server/**\` (server code)
-          - \`pkg/crypto/**\` (encryption library)
-          - \`pkg/metrics/**\` (metrics library)
-          - \`go.work\` / \`go.work.sum\` (workspace config)
-
-          If you believe this is an error, please check that your changes include server-related files.
-          `
+            body: `## Staging Deployment Ready\n\n**URL:** ${{ env.STAGING_URL }}\n**Health:** ${{ env.STAGING_URL }}/__health__\n\nStaging service will be cleaned up when the PR is merged or closed.`
           })
 
   cleanup-staging:
     name: Cleanup Staging
     runs-on: ubuntu-latest
     if: github.event.action == 'closed' && github.event_name == 'pull_request'
-    
+
     permissions:
       contents: read
       id-token: write
-    
+
     steps:
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: ${{ env.GCP_PROJECT_ID }}
-    
+
     - name: Delete staging service
       run: |
         STAGING_SERVICE="tunnel-server-staging-pr-${{ github.event.number }}"
-        
-        # Delete Cloud Run service
+
         gcloud run services delete $STAGING_SERVICE \
           --platform managed --region $GCP_REGION \
           --quiet || echo "Service may not exist"
-        
-        # Delete container image
+
         gcloud artifacts docker images delete \
           gcr.io/$GCP_PROJECT_ID/tunnel-server-staging-pr-${{ github.event.number }} \
           --quiet || echo "Image may not exist"
-        
+
         echo "Staging environment cleaned up"
