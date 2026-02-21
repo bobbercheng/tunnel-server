@@ -119,6 +119,13 @@ func run() error {
 	secret = resp.Secret
 	log.Printf("Registered! Public URL: %s", resp.PublicURL)
 
+	// Print QR code for easy mobile access
+	if resp.PublicURL != "" {
+		fmt.Println("\nScan to open on your phone:")
+		printQR(resp.PublicURL)
+		fmt.Printf("  %s\n\n", resp.PublicURL)
+	}
+
 	// Active WS connections to local service
 	wsConns := make(map[string]*websocket.Conn)
 
