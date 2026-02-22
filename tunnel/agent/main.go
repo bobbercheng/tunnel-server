@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -126,8 +127,8 @@ func run() error {
 		fmt.Printf("  %s\n\n", resp.PublicURL)
 	}
 
-	// Active WS connections to local service
-	wsConns := make(map[string]*websocket.Conn)
+	// Active WS connections to local service (sync.Map for goroutine safety)
+	var wsConns sync.Map // conn_id → *websocket.Conn
 
 	// Message loop
 	for {
@@ -146,19 +147,29 @@ func run() error {
 		case "request":
 			go handleHTTPRequest(ctx, conn, frame)
 		case "ws_open":
-			go handleWSOpen(ctx, conn, frame, wsConns)
+			log.Printf("[WS:%s] Received ws_open: path=%s query=%s", frame.ConnID, frame.Path, frame.Query)
+			go handleWSOpen(ctx, conn, frame, &wsConns)
 		case "ws_data":
-			if ws, ok := wsConns[frame.ConnID]; ok {
+			if val, ok := wsConns.Load(frame.ConnID); ok {
+				ws := val.(*websocket.Conn)
 				msgType := websocket.MessageText
 				if frame.MessageType == int(websocket.MessageBinary) {
 					msgType = websocket.MessageBinary
 				}
-				ws.Write(ctx, msgType, []byte(frame.Data))
+				log.Printf("[WS:%s] Server→Local: type=%d len=%d", frame.ConnID, msgType, len(frame.Data))
+				if err := ws.Write(ctx, msgType, []byte(frame.Data)); err != nil {
+					log.Printf("[WS:%s] Failed to write to local WS: %v", frame.ConnID, err)
+				}
+			} else {
+				log.Printf("[WS:%s] ws_data for unknown conn (not yet opened or already closed)", frame.ConnID)
 			}
 		case "ws_close":
-			if ws, ok := wsConns[frame.ConnID]; ok {
+			log.Printf("[WS:%s] Received ws_close from server", frame.ConnID)
+			if val, ok := wsConns.Load(frame.ConnID); ok {
+				ws := val.(*websocket.Conn)
 				ws.Close(websocket.StatusNormalClosure, "")
-				delete(wsConns, frame.ConnID)
+				wsConns.Delete(frame.ConnID)
+				log.Printf("[WS:%s] Closed local WS connection", frame.ConnID)
 			}
 		case "ping":
 			pong := Frame{Type: "pong"}
@@ -282,7 +293,9 @@ func handleStreamingHTTP(ctx context.Context, conn *websocket.Conn, reqID string
 	conn.Write(ctx, websocket.MessageText, data)
 }
 
-func handleWSOpen(ctx context.Context, agentConn *websocket.Conn, frame Frame, wsConns map[string]*websocket.Conn) {
+func handleWSOpen(ctx context.Context, agentConn *websocket.Conn, frame Frame, wsConns *sync.Map) {
+	connID := frame.ConnID
+
 	// Build local WS URL
 	wsURL := strings.Replace(localAddr, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
@@ -291,40 +304,51 @@ func handleWSOpen(ctx context.Context, agentConn *websocket.Conn, frame Frame, w
 		wsURL += "?" + frame.Query
 	}
 
+	log.Printf("[WS:%s] Dialing local WS: %s", connID, wsURL)
 	localConn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		log.Printf("ws_open to %s failed: %v", wsURL, err)
-		closeFrame := Frame{Type: "ws_close", ConnID: frame.ConnID}
+		log.Printf("[WS:%s] Local WS dial failed: %v", connID, err)
+		closeFrame := Frame{Type: "ws_close", ConnID: connID}
 		data, _ := json.Marshal(closeFrame)
 		agentConn.Write(ctx, websocket.MessageText, data)
 		return
 	}
 	localConn.SetReadLimit(1 * 1024 * 1024)
-	wsConns[frame.ConnID] = localConn
+	wsConns.Store(connID, localConn)
+	log.Printf("[WS:%s] Local WS connected", connID)
 
 	// Read from local WS → send to server
 	go func() {
 		defer func() {
 			localConn.Close(websocket.StatusNormalClosure, "")
-			delete(wsConns, frame.ConnID)
-			closeFrame := Frame{Type: "ws_close", ConnID: frame.ConnID}
+			wsConns.Delete(connID)
+			closeFrame := Frame{Type: "ws_close", ConnID: connID}
 			data, _ := json.Marshal(closeFrame)
-			agentConn.Write(ctx, websocket.MessageText, data)
+			if err := agentConn.Write(ctx, websocket.MessageText, data); err != nil {
+				log.Printf("[WS:%s] Failed to send ws_close to server: %v", connID, err)
+			} else {
+				log.Printf("[WS:%s] Sent ws_close to server (local WS closed)", connID)
+			}
 		}()
 		for {
 			msgType, msg, err := localConn.Read(ctx)
 			if err != nil {
+				log.Printf("[WS:%s] Local WS read error: %v", connID, err)
 				return
 			}
+			log.Printf("[WS:%s] Local→Server: type=%d len=%d", connID, msgType, len(msg))
 			fwd := Frame{
 				Type:        "ws_data",
-				ConnID:      frame.ConnID,
+				ConnID:      connID,
 				Data:        string(msg),
 				MessageType: int(msgType),
 				Direction:   "to_client",
 			}
 			data, _ := json.Marshal(fwd)
-			agentConn.Write(ctx, websocket.MessageText, data)
+			if err := agentConn.Write(ctx, websocket.MessageText, data); err != nil {
+				log.Printf("[WS:%s] Failed to forward local msg to server: %v", connID, err)
+				return
+			}
 		}
 	}()
 }

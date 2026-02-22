@@ -491,18 +491,42 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, p
 // --- WebSocket forwarding ---
 
 func handleWSForward(w http.ResponseWriter, r *http.Request, t *Tunnel, path string) {
+	connID := uuid.New().String()[:8]
+	log.Printf("[WS:%s] New WebSocket forward request: path=%s query=%s tunnel=%s client=%s",
+		connID, path, r.URL.RawQuery, t.ID, clientIP(r))
+
 	// Accept the client's WebSocket
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		log.Printf("ws forward accept: %v", err)
+		log.Printf("[WS:%s] Accept failed: %v", connID, err)
 		return
 	}
-	defer clientConn.Close(websocket.StatusNormalClosure, "")
+	defer func() {
+		clientConn.Close(websocket.StatusNormalClosure, "")
+		log.Printf("[WS:%s] Client connection closed", connID)
+	}()
 	clientConn.SetReadLimit(1 * 1024 * 1024)
+	log.Printf("[WS:%s] Client WebSocket accepted", connID)
 
-	connID := uuid.New().String()[:8]
+	// Register channel BEFORE sending ws_open to avoid race with agent response
+	fromAgent := make(chan *Frame, 64)
+	t.WSConns.Store(connID, fromAgent)
+	defer func() {
+		t.WSConns.Delete(connID)
+		// Tell agent to close the backend WS
+		closeFrame := Frame{Type: "ws_close", ConnID: connID}
+		data, _ := json.Marshal(closeFrame)
+		t.Mu.Lock()
+		err := t.Conn.Write(context.Background(), websocket.MessageText, data)
+		t.Mu.Unlock()
+		if err != nil {
+			log.Printf("[WS:%s] Failed to send ws_close to agent: %v", connID, err)
+		} else {
+			log.Printf("[WS:%s] Sent ws_close to agent", connID)
+		}
+	}()
 
 	// Tell agent to open a WS connection to the local service
 	openFrame := Frame{
@@ -516,34 +540,27 @@ func handleWSForward(w http.ResponseWriter, r *http.Request, t *Tunnel, path str
 	err = t.Conn.Write(r.Context(), websocket.MessageText, data)
 	t.Mu.Unlock()
 	if err != nil {
-		log.Printf("ws forward: agent unreachable: %v", err)
+		log.Printf("[WS:%s] Failed to send ws_open to agent: %v", connID, err)
 		return
 	}
-
-	// Channel for messages from agent → client
-	fromAgent := make(chan *Frame, 64)
-	t.WSConns.Store(connID, fromAgent)
-	defer func() {
-		t.WSConns.Delete(connID)
-		// Tell agent to close the backend WS
-		closeFrame := Frame{Type: "ws_close", ConnID: connID}
-		data, _ := json.Marshal(closeFrame)
-		t.Mu.Lock()
-		t.Conn.Write(context.Background(), websocket.MessageText, data)
-		t.Mu.Unlock()
-	}()
+	log.Printf("[WS:%s] Sent ws_open to agent (path=%s, query=%s)", connID, path, r.URL.RawQuery)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	// Client → Agent
 	go func() {
-		defer cancel()
+		defer func() {
+			log.Printf("[WS:%s] Client→Agent goroutine exiting", connID)
+			cancel()
+		}()
 		for {
 			msgType, msg, err := clientConn.Read(ctx)
 			if err != nil {
+				log.Printf("[WS:%s] Client read error: %v", connID, err)
 				return
 			}
+			log.Printf("[WS:%s] Client→Agent: type=%d len=%d", connID, msgType, len(msg))
 			fwd := Frame{
 				Type:        "ws_data",
 				ConnID:      connID,
@@ -553,26 +570,35 @@ func handleWSForward(w http.ResponseWriter, r *http.Request, t *Tunnel, path str
 			}
 			data, _ := json.Marshal(fwd)
 			t.Mu.Lock()
-			t.Conn.Write(ctx, websocket.MessageText, data)
+			err = t.Conn.Write(ctx, websocket.MessageText, data)
 			t.Mu.Unlock()
+			if err != nil {
+				log.Printf("[WS:%s] Failed to forward client msg to agent: %v", connID, err)
+				return
+			}
 		}
 	}()
 
 	// Agent → Client
+	log.Printf("[WS:%s] Starting Agent→Client relay loop", connID)
 	for {
 		select {
 		case frame, ok := <-fromAgent:
 			if !ok {
+				log.Printf("[WS:%s] fromAgent channel closed (agent sent ws_close)", connID)
 				return
 			}
 			msgType := websocket.MessageText
 			if frame.MessageType == int(websocket.MessageBinary) {
 				msgType = websocket.MessageBinary
 			}
+			log.Printf("[WS:%s] Agent→Client: type=%d len=%d", connID, msgType, len(frame.Data))
 			if err := clientConn.Write(ctx, msgType, []byte(frame.Data)); err != nil {
+				log.Printf("[WS:%s] Failed to write to client: %v", connID, err)
 				return
 			}
 		case <-ctx.Done():
+			log.Printf("[WS:%s] Context cancelled: %v", connID, ctx.Err())
 			return
 		}
 	}
