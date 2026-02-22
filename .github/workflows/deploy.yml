@@ -2,7 +2,7 @@ name: CI/CD
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'claude/**' ]
   pull_request:
     branches: [ main ]
 
@@ -45,7 +45,7 @@ jobs:
     name: Deploy to Cloud Run
     runs-on: ubuntu-latest
     needs: [test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'push'
 
     permissions:
       contents: read
@@ -54,6 +54,20 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Set deploy target
+      id: target
+      run: |
+        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          echo "service_name=${{ env.SERVICE_NAME }}" >> $GITHUB_OUTPUT
+          echo "image_tag=latest" >> $GITHUB_OUTPUT
+          echo "env=production" >> $GITHUB_OUTPUT
+        else
+          # Staging service for non-main branches
+          echo "service_name=${{ env.SERVICE_NAME }}-staging" >> $GITHUB_OUTPUT
+          echo "image_tag=staging" >> $GITHUB_OUTPUT
+          echo "env=staging" >> $GITHUB_OUTPUT
+        fi
 
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
@@ -71,10 +85,17 @@ jobs:
 
     - name: Build and Deploy
       run: |
-        echo "Building and deploying tunnel server to Cloud Run..."
+        DEPLOY_SERVICE="${{ steps.target.outputs.service_name }}"
+        DEPLOY_TAG="${{ steps.target.outputs.image_tag }}"
+        DEPLOY_ENV="${{ steps.target.outputs.env }}"
+        DEPLOY_IMAGE="${IMAGE_NAME}:${DEPLOY_TAG}"
+
+        echo "Building and deploying tunnel server to Cloud Run ($DEPLOY_ENV)..."
+        echo "Service: $DEPLOY_SERVICE"
+        echo "Image:   $DEPLOY_IMAGE"
 
         # Build from tunnel/server directory (self-contained module)
-        BUILD_ID=$(gcloud builds submit --tag $IMAGE_NAME tunnel/server --async --format="value(id)")
+        BUILD_ID=$(gcloud builds submit --tag $DEPLOY_IMAGE tunnel/server --async --format="value(id)")
 
         echo "Waiting for build $BUILD_ID to complete..."
         while true; do
@@ -92,9 +113,9 @@ jobs:
         done
 
         # Deploy to Cloud Run
-        echo "Deploying to Cloud Run..."
-        URL=$(gcloud run deploy $SERVICE_NAME \
-          --image $IMAGE_NAME \
+        echo "Deploying to Cloud Run ($DEPLOY_ENV)..."
+        URL=$(gcloud run deploy $DEPLOY_SERVICE \
+          --image $DEPLOY_IMAGE \
           --platform managed --region $GCP_REGION \
           --allow-unauthenticated --max-instances=1 \
           --timeout=3600 \
