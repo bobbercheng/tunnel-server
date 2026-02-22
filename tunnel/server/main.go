@@ -69,9 +69,16 @@ type Tunnel struct {
 
 // --- Global state ---
 
+// clientMapping tracks which tunnel a client last visited.
+type clientMapping struct {
+	tunnelID string
+	lastSeen time.Time
+}
+
 var (
-	tunnels   = sync.Map{} // id → *Tunnel
-	serverURL string
+	tunnels       = sync.Map{} // id → *Tunnel
+	clientTracker = sync.Map{} // client IP → *clientMapping
+	serverURL     string
 )
 
 func main() {
@@ -227,16 +234,61 @@ func pingLoop(t *Tunnel) {
 	}
 }
 
+// clientIP extracts the client IP from the request.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// First IP in the chain is the original client
+		if i := strings.IndexByte(xff, ','); i != -1 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	// Strip port from RemoteAddr
+	addr := r.RemoteAddr
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		return addr[:i]
+	}
+	return addr
+}
+
+// trackClient records client → tunnel mapping for SPA asset routing.
+func trackClient(r *http.Request, tunnelID string) {
+	ip := clientIP(r)
+	clientTracker.Store(ip, &clientMapping{
+		tunnelID: tunnelID,
+		lastSeen: time.Now(),
+	})
+}
+
 // --- Public HTTP handler ---
 
 func handlePublic(w http.ResponseWriter, r *http.Request) {
-	// Extract tunnel ID from path: /__pub__/{id}/...
 	path := r.URL.Path
+
+	// If the path is not under /__pub__/, try to route via client tracker.
+	// This handles SPA assets requested at root (e.g., /assets/index.js).
 	if !strings.HasPrefix(path, "/__pub__/") {
+		ip := clientIP(r)
+		if val, ok := clientTracker.Load(ip); ok {
+			cm := val.(*clientMapping)
+			// Expire mappings after 30 minutes
+			if time.Since(cm.lastSeen) < 30*time.Minute {
+				// Verify the tunnel still exists
+				if _, tunnelOk := tunnels.Load(cm.tunnelID); tunnelOk {
+					target := "/__pub__/" + cm.tunnelID + path
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+					return
+				}
+			}
+		}
 		http.NotFound(w, r)
 		return
 	}
 
+	// Extract tunnel ID from path: /__pub__/{id}/...
 	rest := strings.TrimPrefix(path, "/__pub__/")
 	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) == 0 {
@@ -256,6 +308,9 @@ func handlePublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tunnel := val.(*Tunnel)
+
+	// Track this client so subsequent bare-path requests (SPA assets) route here
+	trackClient(r, tunnelID)
 
 	// Check if this is a WebSocket upgrade
 	if isWebSocketUpgrade(r) {
