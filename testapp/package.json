@@ -1,0 +1,16 @@
+{
+  "name": "testapp",
+  "private": true,
+  "scripts": {
+    "dev:backend": "node server.js",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev": "node server.js & cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "cors": "^2.8.5"
+  }
+}
