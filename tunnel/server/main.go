@@ -144,7 +144,16 @@ func handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		tunnels.Store(id, tunnel)
 	}
 
-	pubURL := fmt.Sprintf("%s/__pub__/%s/", serverURL, id)
+	// Derive public URL from the request so it works on any deployment
+	pubBase := serverURL
+	if host := r.Host; host != "" {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		pubBase = scheme + "://" + host
+	}
+	pubURL := fmt.Sprintf("%s/__pub__/%s/", pubBase, id)
 	resp := Frame{
 		Type:      "register_response",
 		ID:        id,
