@@ -265,52 +265,54 @@ func trackClient(r *http.Request, tunnelID string) {
 func handlePublic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// If the path is not under /__pub__/, try to route via client tracker.
-	// This handles SPA assets requested at root (e.g., /assets/index.js).
-	if !strings.HasPrefix(path, "/__pub__/") {
-		ip := clientIP(r)
-		if val, ok := clientTracker.Load(ip); ok {
-			cm := val.(*clientMapping)
-			// Expire mappings after 30 minutes
-			if time.Since(cm.lastSeen) < 30*time.Minute {
-				// Verify the tunnel still exists
-				if _, tunnelOk := tunnels.Load(cm.tunnelID); tunnelOk {
-					target := "/__pub__/" + cm.tunnelID + path
-					if r.URL.RawQuery != "" {
-						target += "?" + r.URL.RawQuery
-					}
-					http.Redirect(w, r, target, http.StatusTemporaryRedirect)
-					return
-				}
-			}
+	var tunnelID string
+	var fwdPath string
+	var tunnel *Tunnel
+
+	if strings.HasPrefix(path, "/__pub__/") {
+		// Extract tunnel ID from path: /__pub__/{id}/...
+		rest := strings.TrimPrefix(path, "/__pub__/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 0 {
+			http.NotFound(w, r)
+			return
 		}
-		http.NotFound(w, r)
-		return
+		tunnelID = parts[0]
+		fwdPath = "/"
+		if len(parts) > 1 {
+			fwdPath = "/" + parts[1]
+		}
+		val, ok := tunnels.Load(tunnelID)
+		if !ok {
+			http.Error(w, "tunnel not found", http.StatusBadGateway)
+			return
+		}
+		tunnel = val.(*Tunnel)
+		// Track this client so subsequent bare-path requests (SPA assets) route here
+		trackClient(r, tunnelID)
+	} else {
+		// Not under /__pub__/ — try to route via client tracker.
+		// This handles SPA assets requested at root (e.g., /assets/index.js).
+		ip := clientIP(r)
+		val, ok := clientTracker.Load(ip)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		cm := val.(*clientMapping)
+		if time.Since(cm.lastSeen) >= 30*time.Minute {
+			http.NotFound(w, r)
+			return
+		}
+		tval, tok := tunnels.Load(cm.tunnelID)
+		if !tok {
+			http.NotFound(w, r)
+			return
+		}
+		tunnelID = cm.tunnelID
+		fwdPath = path
+		tunnel = tval.(*Tunnel)
 	}
-
-	// Extract tunnel ID from path: /__pub__/{id}/...
-	rest := strings.TrimPrefix(path, "/__pub__/")
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) == 0 {
-		http.NotFound(w, r)
-		return
-	}
-
-	tunnelID := parts[0]
-	fwdPath := "/"
-	if len(parts) > 1 {
-		fwdPath = "/" + parts[1]
-	}
-
-	val, ok := tunnels.Load(tunnelID)
-	if !ok {
-		http.Error(w, "tunnel not found", http.StatusBadGateway)
-		return
-	}
-	tunnel := val.(*Tunnel)
-
-	// Track this client so subsequent bare-path requests (SPA assets) route here
-	trackClient(r, tunnelID)
 
 	// Check if this is a WebSocket upgrade
 	if isWebSocketUpgrade(r) {
