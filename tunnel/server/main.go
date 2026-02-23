@@ -20,6 +20,9 @@ import (
 // --- Types ---
 
 // Frame types exchanged between server and agent over WebSocket.
+//
+// Unified protocol: all HTTP responses use response_start/response_data/response_end.
+// The agent doesn't distinguish between SSE, streaming, or regular HTTP — it just proxies.
 type Frame struct {
 	Type string `json:"type"`
 
@@ -36,16 +39,13 @@ type Frame struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    string            `json:"body,omitempty"`
 
-	// HTTP response (agent → server)
-	Status     int               `json:"status,omitempty"`
+	// HTTP response (agent → server) — unified streaming protocol
+	// response_start: Status + RespHeaders
+	// response_data:  Data (base64-encoded body chunk)
+	// response_end:   signals body complete
+	Status      int               `json:"status,omitempty"`
 	RespHeaders map[string]string `json:"resp_headers,omitempty"`
-	RespBody   string            `json:"resp_body,omitempty"`
-
-	// Streaming
-	ChunkIndex  int    `json:"chunk_index,omitempty"`
-	TotalChunks int    `json:"total_chunks,omitempty"`
-	Data        string `json:"data,omitempty"`
-	Done        bool   `json:"done,omitempty"`
+	Data        string            `json:"data,omitempty"`
 
 	// WebSocket forwarding
 	ConnID      string `json:"conn_id,omitempty"`
@@ -193,13 +193,13 @@ func handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch frame.Type {
-		case "response":
+		case "response_start", "response_data", "response_end":
 			if ch, ok := tunnel.Pending.Load(frame.ReqID); ok {
-				ch.(chan *Frame) <- &frame
-			}
-		case "streaming_start", "streaming_chunk", "streaming_end":
-			if ch, ok := tunnel.Pending.Load(frame.ReqID); ok {
-				ch.(chan *Frame) <- &frame
+				select {
+				case ch.(chan *Frame) <- &frame:
+				default:
+					log.Printf("Agent %s: dropping frame for req %s (channel full)", id, frame.ReqID)
+				}
 			}
 		case "ws_data":
 			if ch, ok := tunnel.WSConns.Load(frame.ConnID); ok {
@@ -320,13 +320,8 @@ func handlePublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a streaming request (SSE)
-	if isStreamingRequest(r, fwdPath) {
-		handleStreamingRequest(w, r, tunnel, fwdPath)
-		return
-	}
-
-	// Regular HTTP request
+	// All HTTP requests (regular, SSE, streaming) go through the same unified handler.
+	// The agent streams response bytes back regardless of response type.
 	handleHTTPRequest(w, r, tunnel, fwdPath)
 }
 
@@ -334,14 +329,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
-func isStreamingRequest(r *http.Request, path string) bool {
-	accept := r.Header.Get("Accept")
-	return strings.Contains(accept, "text/event-stream") ||
-		strings.Contains(path, "/stream") ||
-		strings.Contains(path, "/events")
-}
-
-// --- Regular HTTP proxying ---
+// --- Unified HTTP proxying ---
 
 func handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, path string) {
 	reqID := uuid.New().String()[:8]
@@ -373,60 +361,6 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, path s
 		Body:    body,
 	}
 
-	ch := make(chan *Frame, 1)
-	t.Pending.Store(reqID, ch)
-	defer t.Pending.Delete(reqID)
-
-	data, _ := json.Marshal(frame)
-	t.Mu.Lock()
-	err := t.Conn.Write(r.Context(), websocket.MessageText, data)
-	t.Mu.Unlock()
-	if err != nil {
-		http.Error(w, "agent unreachable", http.StatusBadGateway)
-		return
-	}
-
-	// Wait for response
-	select {
-	case resp := <-ch:
-		respBody, _ := base64.StdEncoding.DecodeString(resp.RespBody)
-		for k, v := range resp.RespHeaders {
-			// Skip Content-Length — let Go recalculate after base64 decode
-			if strings.EqualFold(k, "Content-Length") {
-				continue
-			}
-			w.Header().Set(k, v)
-		}
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
-		w.WriteHeader(resp.Status)
-		w.Write(respBody)
-	case <-time.After(30 * time.Second):
-		http.Error(w, "timeout waiting for agent", http.StatusGatewayTimeout)
-	case <-r.Context().Done():
-	}
-}
-
-// --- Streaming (SSE) proxying ---
-
-func handleStreamingRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, path string) {
-	reqID := uuid.New().String()[:8]
-
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if !hopHeaders[k] {
-			headers[k] = v[0]
-		}
-	}
-
-	frame := Frame{
-		Type:    "request",
-		ReqID:   reqID,
-		Method:  r.Method,
-		Path:    path,
-		Query:   r.URL.RawQuery,
-		Headers: headers,
-	}
-
 	ch := make(chan *Frame, 64)
 	t.Pending.Store(reqID, ch)
 	defer t.Pending.Delete(reqID)
@@ -440,13 +374,14 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, p
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
-
+	// Unified response relay: receive response_start, then stream response_data
+	// chunks, then response_end. Works identically for regular HTTP, SSE, and
+	// chunked responses — the agent just proxies bytes from the local service.
+	flusher, _ := w.(http.Flusher)
 	headersWritten := false
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+
 	for {
 		select {
 		case frame := <-ch:
@@ -454,34 +389,39 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, t *Tunnel, p
 				return
 			}
 			switch frame.Type {
-			case "streaming_start":
+			case "response_start":
 				for k, v := range frame.RespHeaders {
 					w.Header().Set(k, v)
 				}
 				w.WriteHeader(frame.Status)
-				flusher.Flush()
 				headersWritten = true
-			case "streaming_chunk":
+				if flusher != nil {
+					flusher.Flush()
+				}
+				timeout.Reset(60 * time.Second)
+
+			case "response_data":
 				if !headersWritten {
-					w.Header().Set("Content-Type", "text/event-stream")
 					w.WriteHeader(200)
 					headersWritten = true
 				}
-				w.Write([]byte(frame.Data))
-				flusher.Flush()
-			case "streaming_end":
-				return
-			case "response":
-				// Non-streaming fallback
-				for k, v := range frame.RespHeaders {
-					w.Header().Set(k, v)
+				chunk, _ := base64.StdEncoding.DecodeString(frame.Data)
+				w.Write(chunk)
+				if flusher != nil {
+					flusher.Flush()
 				}
-				w.WriteHeader(frame.Status)
-				w.Write([]byte(frame.RespBody))
+				timeout.Reset(60 * time.Second)
+
+			case "response_end":
 				return
 			}
-		case <-time.After(60 * time.Second):
+
+		case <-timeout.C:
+			if !headersWritten {
+				http.Error(w, "timeout waiting for agent", http.StatusGatewayTimeout)
+			}
 			return
+
 		case <-r.Context().Done():
 			return
 		}

@@ -28,6 +28,7 @@ jobs:
         cache-dependency-path: |
           tunnel/server/go.sum
           tunnel/agent/go.sum
+          tunnel/integration_test/go.sum
 
     - name: Build server
       run: cd tunnel/server && go build -v .
@@ -40,6 +41,9 @@ jobs:
 
     - name: Vet agent
       run: cd tunnel/agent && go vet ./...
+
+    - name: Integration tests
+      run: cd tunnel/integration_test && go test -v -timeout 90s ./...
 
   deploy:
     name: Deploy to Cloud Run

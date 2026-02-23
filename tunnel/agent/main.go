@@ -18,6 +18,9 @@ import (
 )
 
 // Frame matches the server's JSON protocol.
+//
+// Unified protocol: all HTTP responses use response_start/response_data/response_end.
+// The agent doesn't distinguish between SSE, streaming, or regular HTTP — it just proxies.
 type Frame struct {
 	Type string `json:"type"`
 
@@ -26,7 +29,7 @@ type Frame struct {
 	Secret    string `json:"secret,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
 
-	// HTTP request
+	// HTTP request (server → agent)
 	ReqID   string            `json:"req_id,omitempty"`
 	Method  string            `json:"method,omitempty"`
 	Path    string            `json:"path,omitempty"`
@@ -34,14 +37,13 @@ type Frame struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    string            `json:"body,omitempty"`
 
-	// HTTP response
+	// HTTP response (agent → server) — unified streaming protocol
+	// response_start: Status + RespHeaders
+	// response_data:  Data (base64-encoded body chunk)
+	// response_end:   signals body complete
 	Status      int               `json:"status,omitempty"`
 	RespHeaders map[string]string `json:"resp_headers,omitempty"`
-	RespBody    string            `json:"resp_body,omitempty"`
-
-	// Streaming
-	Data string `json:"data,omitempty"`
-	Done bool   `json:"done,omitempty"`
+	Data        string            `json:"data,omitempty"`
 
 	// WebSocket forwarding
 	ConnID      string `json:"conn_id,omitempty"`
@@ -50,11 +52,13 @@ type Frame struct {
 }
 
 var (
-	serverAddr string
-	localAddr  string
-	tunnelID   string
-	secret     string
-	httpClient = &http.Client{Timeout: 30 * time.Second}
+	serverAddr  string
+	localAddr   string
+	tunnelID    string
+	secret      string
+	// No timeout — the server enforces timeouts. This lets SSE, chunked, and
+	// long-running responses stream for as long as the local service needs.
+	proxyClient = &http.Client{}
 )
 
 func main() {
@@ -181,6 +185,10 @@ func run() error {
 	}
 }
 
+// handleHTTPRequest is the unified HTTP proxy handler. It always streams the
+// response back using response_start/response_data/response_end frames. This
+// eliminates all special-casing for SSE, chunked, or regular HTTP responses —
+// the agent just proxies raw bytes from the local service.
 func handleHTTPRequest(ctx context.Context, conn *websocket.Conn, req Frame) {
 	url := localAddr + req.Path
 	if req.Query != "" {
@@ -210,86 +218,53 @@ func handleHTTPRequest(ctx context.Context, conn *websocket.Conn, req Frame) {
 		httpReq.Header.Set(k, v)
 	}
 
-	// Check if this should be streamed (SSE)
-	isSSE := strings.Contains(req.Headers["Accept"], "text/event-stream") ||
-		strings.Contains(req.Path, "/stream") ||
-		strings.Contains(req.Path, "/events")
-
-	if isSSE {
-		handleStreamingHTTP(ctx, conn, req.ReqID, httpReq)
-		return
-	}
-
-	resp, err := httpClient.Do(httpReq)
+	resp, err := proxyClient.Do(httpReq)
 	if err != nil {
 		sendError(ctx, conn, req.ReqID, 502, "local service error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-
+	// Send response headers
 	headers := make(map[string]string)
 	for k, v := range resp.Header {
 		headers[k] = v[0]
 	}
 
-	frame := Frame{
-		Type:        "response",
+	startFrame := Frame{
+		Type:        "response_start",
 		ReqID:       req.ReqID,
 		Status:      resp.StatusCode,
 		RespHeaders: headers,
-		RespBody:    base64.StdEncoding.EncodeToString(respBody),
 	}
-	data, _ := json.Marshal(frame)
-	conn.Write(ctx, websocket.MessageText, data)
-}
-
-func handleStreamingHTTP(ctx context.Context, conn *websocket.Conn, reqID string, httpReq *http.Request) {
-	client := &http.Client{} // no timeout for streaming
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		sendError(ctx, conn, reqID, 502, "local service error: "+err.Error())
+	data, _ := json.Marshal(startFrame)
+	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
 		return
 	}
-	defer resp.Body.Close()
 
-	headers := make(map[string]string)
-	for k, v := range resp.Header {
-		headers[k] = v[0]
-	}
-
-	// Send streaming start
-	start := Frame{
-		Type:        "streaming_start",
-		ReqID:       reqID,
-		Status:      resp.StatusCode,
-		RespHeaders: headers,
-	}
-	data, _ := json.Marshal(start)
-	conn.Write(ctx, websocket.MessageText, data)
-
-	// Stream chunks
+	// Stream response body in chunks
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			chunk := Frame{
-				Type:  "streaming_chunk",
-				ReqID: reqID,
-				Data:  string(buf[:n]),
+			dataFrame := Frame{
+				Type:  "response_data",
+				ReqID: req.ReqID,
+				Data:  base64.StdEncoding.EncodeToString(buf[:n]),
 			}
-			data, _ := json.Marshal(chunk)
-			conn.Write(ctx, websocket.MessageText, data)
+			d, _ := json.Marshal(dataFrame)
+			if writeErr := conn.Write(ctx, websocket.MessageText, d); writeErr != nil {
+				return
+			}
 		}
 		if err != nil {
 			break
 		}
 	}
 
-	// Send streaming end
-	end := Frame{Type: "streaming_end", ReqID: reqID}
-	data, _ = json.Marshal(end)
+	// Signal response complete
+	endFrame := Frame{Type: "response_end", ReqID: req.ReqID}
+	data, _ = json.Marshal(endFrame)
 	conn.Write(ctx, websocket.MessageText, data)
 }
 
@@ -354,14 +329,26 @@ func handleWSOpen(ctx context.Context, agentConn *websocket.Conn, frame Frame, w
 }
 
 func sendError(ctx context.Context, conn *websocket.Conn, reqID string, status int, msg string) {
-	frame := Frame{
-		Type:        "response",
+	// Errors use the same unified protocol: response_start + response_data + response_end
+	startFrame := Frame{
+		Type:        "response_start",
 		ReqID:       reqID,
 		Status:      status,
 		RespHeaders: map[string]string{"Content-Type": "text/plain"},
-		RespBody:    base64.StdEncoding.EncodeToString([]byte(msg)),
 	}
-	data, _ := json.Marshal(frame)
+	data, _ := json.Marshal(startFrame)
+	conn.Write(ctx, websocket.MessageText, data)
+
+	dataFrame := Frame{
+		Type:  "response_data",
+		ReqID: reqID,
+		Data:  base64.StdEncoding.EncodeToString([]byte(msg)),
+	}
+	data, _ = json.Marshal(dataFrame)
+	conn.Write(ctx, websocket.MessageText, data)
+
+	endFrame := Frame{Type: "response_end", ReqID: reqID}
+	data, _ = json.Marshal(endFrame)
 	conn.Write(ctx, websocket.MessageText, data)
 }
 
